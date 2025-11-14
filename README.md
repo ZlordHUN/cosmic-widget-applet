@@ -13,7 +13,7 @@ A Conky-style system monitoring applet for the COSMIC desktop environment, featu
 - **Circular Temperature Gauges**: Color-changing hollow rings for temperature visualization (switchable to text mode)
 - **Transparent Background**: Fully transparent widget background for seamless desktop integration
 - **Visual Indicators**: CPU, RAM, and GPU icons with gradient progress bars that change color based on usage
-- **System Monitoring**: Real-time CPU, memory, GPU (placeholder), network, and disk I/O statistics
+- **System Monitoring**: Real-time CPU, memory, GPU (NVIDIA via nvidia-smi), network, and disk I/O statistics
 - **Customizable Position**: Precise X/Y positioning via settings window
 - **Configurable Display**: Toggle individual stats (CPU, RAM, GPU, clock, date, temperatures), show/hide percentage values
 - **Native COSMIC Integration**: Built with libcosmic and follows COSMIC design patterns

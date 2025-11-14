@@ -119,7 +119,9 @@ MonitorWidget struct
 - Uses `sysinfo::System` for CPU, memory, disk
 - CPU: Global CPU percentage
 - Memory: Used/Total bytes + percentage
-- GPU: Placeholder at 0% (needs nvtop/radeontop integration)
+- GPU: NVIDIA GPU utilization via `nvidia-smi --query-gpu=utilization.gpu`
+  - Checks for nvidia-smi availability on initialization
+  - Falls back to 0% if not available
 - Network: Placeholder (needs implementation)
 - Disk: Placeholder (needs implementation)
 

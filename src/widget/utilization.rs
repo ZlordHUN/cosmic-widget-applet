@@ -3,6 +3,7 @@
 //! Utilization monitoring (CPU, Memory, GPU)
 
 use sysinfo::System;
+use std::process::Command;
 
 pub struct UtilizationMonitor {
     sys: System,
@@ -10,16 +11,27 @@ pub struct UtilizationMonitor {
     pub memory_usage: f32,
     pub memory_total: u64,
     pub memory_used: u64,
+    pub gpu_usage: f32,
+    gpu_available: bool,
 }
 
 impl UtilizationMonitor {
     pub fn new() -> Self {
+        // Check if NVIDIA GPU is available
+        let gpu_available = Command::new("nvidia-smi")
+            .arg("--query-gpu=utilization.gpu")
+            .arg("--format=csv,noheader,nounits")
+            .output()
+            .is_ok();
+        
         Self {
             sys: System::new_all(),
             cpu_usage: 0.0,
             memory_usage: 0.0,
             memory_total: 0,
             memory_used: 0,
+            gpu_usage: 0.0,
+            gpu_available,
         }
     }
 
@@ -37,6 +49,27 @@ impl UtilizationMonitor {
         } else {
             0.0
         };
+        
+        // Update GPU usage (NVIDIA only for now)
+        if self.gpu_available {
+            self.gpu_usage = self.get_nvidia_gpu_usage();
+        }
+    }
+    
+    /// Get NVIDIA GPU utilization via nvidia-smi
+    fn get_nvidia_gpu_usage(&self) -> f32 {
+        let output = Command::new("nvidia-smi")
+            .arg("--query-gpu=utilization.gpu")
+            .arg("--format=csv,noheader,nounits")
+            .output();
+        
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.trim().parse::<f32>().unwrap_or(0.0)
+            }
+            _ => 0.0,
+        }
     }
 }
 
