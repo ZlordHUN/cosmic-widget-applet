@@ -433,6 +433,112 @@ impl MonitorWidget {
     }
 }
 
+/// Draw a CPU icon (simple chip representation)
+fn draw_cpu_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
+    // Draw chip body
+    cr.rectangle(x, y, size, size);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    
+    // Draw pins on sides
+    let pin_length = size * 0.2;
+    let pin_spacing = size / 3.0;
+    
+    // Left pins
+    for i in 0..3 {
+        let py = y + pin_spacing * (i as f64 + 0.5);
+        cr.move_to(x, py);
+        cr.line_to(x - pin_length, py);
+    }
+    
+    // Right pins
+    for i in 0..3 {
+        let py = y + pin_spacing * (i as f64 + 0.5);
+        cr.move_to(x + size, py);
+        cr.line_to(x + size + pin_length, py);
+    }
+    
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.stroke().expect("Failed to stroke");
+}
+
+/// Draw a RAM icon (simple memory chip representation)
+fn draw_ram_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
+    // Draw memory stick body
+    cr.rectangle(x, y + size * 0.2, size, size * 0.8);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    
+    // Draw notch at top
+    let notch_width = size * 0.3;
+    let notch_x = x + (size - notch_width) / 2.0;
+    cr.rectangle(notch_x, y, notch_width, size * 0.2);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    
+    // Draw chips on the body
+    let chip_size = size * 0.15;
+    for i in 0..3 {
+        let chip_y = y + size * 0.3 + i as f64 * size * 0.22;
+        cr.rectangle(x + size * 0.15, chip_y, chip_size, chip_size);
+        cr.rectangle(x + size * 0.55, chip_y, chip_size, chip_size);
+    }
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(1.5);
+    cr.stroke().expect("Failed to stroke");
+}
+
+/// Draw a horizontal progress bar
+fn draw_progress_bar(cr: &cairo::Context, x: f64, y: f64, width: f64, height: f64, percentage: f32) {
+    // Draw background
+    cr.rectangle(x, y, width, height);
+    cr.set_source_rgba(0.2, 0.2, 0.2, 0.7);
+    cr.fill().expect("Failed to fill");
+    
+    // Draw border
+    cr.rectangle(x, y, width, height);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_line_width(1.0);
+    cr.stroke().expect("Failed to stroke");
+    
+    // Draw filled portion
+    let fill_width = width * (percentage / 100.0).min(1.0) as f64;
+    if fill_width > 0.0 {
+        cr.rectangle(x + 1.0, y + 1.0, fill_width - 2.0, height - 2.0);
+        
+        // Gradient fill based on percentage
+        let pattern = cairo::LinearGradient::new(x, y, x + width, y);
+        if percentage < 50.0 {
+            pattern.add_color_stop_rgb(0.0, 0.2, 0.8, 0.2); // Green
+            pattern.add_color_stop_rgb(1.0, 0.4, 0.9, 0.4);
+        } else if percentage < 80.0 {
+            pattern.add_color_stop_rgb(0.0, 0.8, 0.8, 0.2); // Yellow
+            pattern.add_color_stop_rgb(1.0, 0.9, 0.9, 0.4);
+        } else {
+            pattern.add_color_stop_rgb(0.0, 0.9, 0.2, 0.2); // Red
+            pattern.add_color_stop_rgb(1.0, 1.0, 0.4, 0.4);
+        }
+        
+        cr.set_source(&pattern).expect("Failed to set source");
+        cr.fill().expect("Failed to fill");
+    }
+}
+
 fn render_widget(
     canvas: &mut [u8],
     cpu_usage: f32,
@@ -530,7 +636,10 @@ fn render_widget(
         cr.fill().expect("Failed to fill");
         
         // Start system stats below the clock
-        let mut y = 115.0;
+        let mut y = 135.0;
+        let icon_size = 20.0;
+        let bar_width = 200.0;
+        let bar_height = 12.0;
 
         // Draw stats with outline effect
         let font_desc = pango::FontDescription::from_string("Ubuntu 12");
@@ -538,32 +647,67 @@ fn render_widget(
         cr.set_line_width(2.0);
         
         if show_cpu {
-            layout.set_text(&format!("CPU: {:.1}%", cpu_usage));
-            cr.move_to(10.0, y);
+            // Draw CPU icon
+            draw_cpu_icon(&cr, 10.0, y - 2.0, icon_size);
+            
+            // Draw CPU label
+            layout.set_text("CPU:");
+            cr.move_to(10.0 + icon_size + 10.0, y);
             pangocairo::functions::layout_path(&cr, &layout);
             cr.set_source_rgb(0.0, 0.0, 0.0);
             cr.stroke_preserve().expect("Failed to stroke");
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.fill().expect("Failed to fill");
-            y += 25.0;
+            
+            // Draw CPU percentage
+            let cpu_text = format!("{:.1}%", cpu_usage);
+            layout.set_text(&cpu_text);
+            cr.move_to(80.0, y);
+            pangocairo::functions::layout_path(&cr, &layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+            
+            // Draw progress bar
+            draw_progress_bar(&cr, 140.0, y, bar_width, bar_height, cpu_usage);
+            
+            y += 30.0;
         }
 
         if show_memory {
-            let text = if show_percentages {
-                format!("Memory: {:.1}%", memory_usage)
-            } else {
-                let mem_gb_used = memory_used as f64 / (1024.0 * 1024.0 * 1024.0);
-                let mem_gb_total = memory_total as f64 / (1024.0 * 1024.0 * 1024.0);
-                format!("Memory: {:.1}/{:.1} GB", mem_gb_used, mem_gb_total)
-            };
-            layout.set_text(&text);
-            cr.move_to(10.0, y);
+            // Draw RAM icon
+            draw_ram_icon(&cr, 10.0, y - 2.0, icon_size);
+            
+            // Draw Memory label
+            layout.set_text("RAM:");
+            cr.move_to(10.0 + icon_size + 10.0, y);
             pangocairo::functions::layout_path(&cr, &layout);
             cr.set_source_rgb(0.0, 0.0, 0.0);
             cr.stroke_preserve().expect("Failed to stroke");
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.fill().expect("Failed to fill");
-            y += 25.0;
+            
+            // Draw memory percentage or size
+            let mem_text = if show_percentages {
+                format!("{:.1}%", memory_usage)
+            } else {
+                let mem_gb_used = memory_used as f64 / (1024.0 * 1024.0 * 1024.0);
+                let mem_gb_total = memory_total as f64 / (1024.0 * 1024.0 * 1024.0);
+                format!("{:.1}/{:.1}G", mem_gb_used, mem_gb_total)
+            };
+            layout.set_text(&mem_text);
+            cr.move_to(80.0, y);
+            pangocairo::functions::layout_path(&cr, &layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+            
+            // Draw progress bar
+            draw_progress_bar(&cr, 140.0, y, bar_width, bar_height, memory_usage);
+            
+            y += 30.0;
         }
 
         if show_network {
