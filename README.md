@@ -6,6 +6,8 @@ A Conky-style system monitoring applet for the COSMIC desktop environment, featu
 
 - **Panel Applet**: Integrates into COSMIC panel with a menu to toggle widget and open settings
 - **Borderless Widget**: Floating overlay widget using Wayland layer-shell protocol (no window borders!)
+- **Clock Display**: Large time (HH:MM:SS) and date display with Conky-style text outlines
+- **Transparent Background**: Fully transparent widget background for seamless desktop integration
 - **System Monitoring**: Real-time CPU, memory, network, and disk I/O statistics
 - **Customizable Position**: Precise X/Y positioning via settings window
 - **Configurable Display**: Toggle which stats to show and customize update intervals
@@ -83,7 +85,8 @@ Trade-offs:
 
 - **libcosmic**: For applet and settings UI
 - **smithay-client-toolkit**: Direct Wayland layer-shell access
-- **cairo-rs/pango**: Custom widget rendering
+- **cairo-rs/pango**: Custom widget rendering with text outlines
+- **chrono**: Date and time formatting
 - **sysinfo**: System statistics monitoring
 - **cosmic-config**: Configuration persistence
 
