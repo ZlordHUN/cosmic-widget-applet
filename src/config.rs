@@ -13,12 +13,16 @@ pub struct Config {
     pub show_network: bool,
     /// Enable disk I/O monitoring
     pub show_disk: bool,
+    /// Enable GPU monitoring
+    pub show_gpu: bool,
+    /// Show clock display
+    pub show_clock: bool,
+    /// Show date display
+    pub show_date: bool,
     /// Update interval in milliseconds
     pub update_interval_ms: u64,
     /// Show percentage values
     pub show_percentages: bool,
-    /// Show graph visualizations
-    pub show_graphs: bool,
     /// Widget X position on screen
     pub widget_x: i32,
     /// Widget Y position on screen
@@ -34,9 +38,11 @@ impl Default for Config {
             show_memory: true,
             show_network: false,
             show_disk: false,
+            show_gpu: false,
+            show_clock: true,
+            show_date: true,
             update_interval_ms: 1000,
             show_percentages: true,
-            show_graphs: false,
             widget_x: 50,
             widget_y: 50,
             widget_movable: false,

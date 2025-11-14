@@ -103,19 +103,23 @@ MonitorWidget struct
 - Smaller :SS display (Ubuntu Bold 28)
 - Full date below clock (Ubuntu 16)
 - White text with black outlines (Conky-style)
+- Can be individually toggled (show_clock, show_date)
 
 **Visual Indicators**:
 - CPU icon: Chip representation with pins
 - RAM icon: Memory stick with notch and chips
+- GPU icon: Graphics card with fan and PCIe connector
 - Progress bars: 200px wide with gradient fills
   - Green gradient (< 50% usage)
   - Yellow gradient (50-80% usage)
   - Red gradient (> 80% usage)
+- Layout: Icon + Label + Bar + Percentage (if enabled)
 
 **System Monitoring**:
 - Uses `sysinfo::System` for CPU, memory, disk
 - CPU: Global CPU percentage
 - Memory: Used/Total bytes + percentage
+- GPU: Placeholder at 0% (needs nvtop/radeontop integration)
 - Network: Placeholder (needs implementation)
 - Disk: Placeholder (needs implementation)
 
@@ -131,15 +135,18 @@ MonitorWidget struct
 
 **UI Structure**:
 ```
-Settings Window
+Settings Window (Scrollable)
 ├── Monitoring Options
 │   ├── Show CPU (toggle)
 │   ├── Show Memory (toggle)
+│   ├── Show GPU (toggle)
 │   ├── Show Network (toggle)
 │   └── Show Disk (toggle)
+├── Widget Display
+│   ├── Show Clock (toggle)
+│   └── Show Date (toggle)
 ├── Display Options
 │   ├── Show Percentages (toggle)
-│   ├── Show Graphs (toggle)
 │   └── Update Interval (text input)
 └── Widget Position
     ├── X Position (text input)

@@ -13,10 +13,13 @@ configure = Configure
 # Configuration UI
 monitoring-options = Monitoring Options
 display-options = Display Options
+widget-display = Widget Display
 show-cpu = Show CPU Usage
 show-memory = Show Memory Usage
 show-network = Show Network Activity
 show-disk = Show Disk I/O
+show-gpu = Show GPU Usage
+show-clock = Show Clock
+show-date = Show Date
 show-percentages = Show Percentages
-show-graphs = Show Graphs
 update-interval = Update Interval (ms)

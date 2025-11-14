@@ -398,6 +398,9 @@ impl MonitorWidget {
         let show_memory = self.config.show_memory;
         let show_network = self.config.show_network;
         let show_disk = self.config.show_disk;
+        let show_gpu = self.config.show_gpu;
+        let show_clock = self.config.show_clock;
+        let show_date = self.config.show_date;
         let show_percentages = self.config.show_percentages;
 
         let pool = self.pool.as_mut().unwrap();
@@ -419,6 +422,9 @@ impl MonitorWidget {
             show_memory,
             show_network,
             show_disk,
+            show_gpu,
+            show_clock,
+            show_date,
             show_percentages,
         );
 
@@ -500,6 +506,32 @@ fn draw_ram_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
     cr.stroke().expect("Failed to stroke");
 }
 
+/// Draw a GPU icon (graphics card representation)
+fn draw_gpu_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
+    // Draw GPU card body
+    cr.rectangle(x, y + size * 0.3, size * 1.3, size * 0.7);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    
+    // Draw fan (circle)
+    cr.arc(x + size * 0.65, y + size * 0.65, size * 0.25, 0.0, 2.0 * std::f64::consts::PI);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke().expect("Failed to stroke");
+    
+    // Draw PCIe connector
+    for i in 0..3 {
+        let connector_x = x + i as f64 * size * 0.15;
+        cr.rectangle(connector_x, y, size * 0.1, size * 0.25);
+    }
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(1.5);
+    cr.stroke().expect("Failed to stroke");
+}
+
 /// Draw a horizontal progress bar
 fn draw_progress_bar(cr: &cairo::Context, x: f64, y: f64, width: f64, height: f64, percentage: f32) {
     // Draw background
@@ -551,6 +583,9 @@ fn render_widget(
     show_memory: bool,
     show_network: bool,
     show_disk: bool,
+    show_gpu: bool,
+    show_clock: bool,
+    show_date: bool,
     show_percentages: bool,
 ) {
     // Use unsafe to extend the lifetime for Cairo
@@ -583,60 +618,78 @@ fn render_widget(
         // Set up Pango for text rendering
         let layout = pangocairo::functions::create_layout(&cr);
         
+        // Track vertical position
+        let mut y_pos = 10.0;
+        
         // Get current date/time
         let now = chrono::Local::now();
         
-        // Draw large time (HH:MM)
-        let time_str = now.format("%H:%M").to_string();
-        let font_desc = pango::FontDescription::from_string("Ubuntu Bold 48");
-        layout.set_font_description(Some(&font_desc));
-        layout.set_text(&time_str);
+        if show_clock {
+            // Draw large time (HH:MM)
+            let time_str = now.format("%H:%M").to_string();
+            let font_desc = pango::FontDescription::from_string("Ubuntu Bold 48");
+            layout.set_font_description(Some(&font_desc));
+            layout.set_text(&time_str);
+            
+            // White text with black outline
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.move_to(10.0, y_pos);
+            
+            // Draw outline
+            cr.set_line_width(3.0);
+            pangocairo::functions::layout_path(&cr, &layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            
+            // Fill with white
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+            
+            // Get width of the time text to position seconds correctly
+            let (time_width, _) = layout.pixel_size();
+            
+            // Draw seconds (:SS) slightly smaller and raised
+            let seconds_str = now.format(":%S").to_string();
+            let font_desc = pango::FontDescription::from_string("Ubuntu Bold 28");
+            layout.set_font_description(Some(&font_desc));
+            layout.set_text(&seconds_str);
+            
+            cr.move_to(10.0 + time_width as f64, y_pos + 5.0); // Position after HH:MM, slightly lower
+            pangocairo::functions::layout_path(&cr, &layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+            
+            y_pos += 70.0; // Move down after clock
+        }
         
-        // White text with black outline
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.move_to(10.0, 10.0);
+        if show_date {
+            // Draw date below with more spacing
+            let date_str = now.format("%A, %d %B %Y").to_string();
+            let font_desc = pango::FontDescription::from_string("Ubuntu 16");
+            layout.set_font_description(Some(&font_desc));
+            layout.set_text(&date_str);
+            
+            cr.move_to(10.0, y_pos);
+            pangocairo::functions::layout_path(&cr, &layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+            
+            y_pos += 35.0; // Move down after date
+        }
         
-        // Draw outline
-        cr.set_line_width(3.0);
-        pangocairo::functions::layout_path(&cr, &layout);
-        cr.set_source_rgb(0.0, 0.0, 0.0);
-        cr.stroke_preserve().expect("Failed to stroke");
+        // Add spacing before stats if we showed clock or date
+        if show_clock || show_date {
+            y_pos += 20.0;
+        } else {
+            y_pos = 10.0; // Start at top if no clock/date
+        }
         
-        // Fill with white
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.fill().expect("Failed to fill");
-        
-        // Get width of the time text to position seconds correctly
-        let (time_width, _) = layout.pixel_size();
-        
-        // Draw seconds (:SS) slightly smaller and raised
-        let seconds_str = now.format(":%S").to_string();
-        let font_desc = pango::FontDescription::from_string("Ubuntu Bold 28");
-        layout.set_font_description(Some(&font_desc));
-        layout.set_text(&seconds_str);
-        
-        cr.move_to(10.0 + time_width as f64, 15.0); // Position after HH:MM, slightly lower
-        pangocairo::functions::layout_path(&cr, &layout);
-        cr.set_source_rgb(0.0, 0.0, 0.0);
-        cr.stroke_preserve().expect("Failed to stroke");
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.fill().expect("Failed to fill");
-        
-        // Draw date below with more spacing
-        let date_str = now.format("%A, %d %B %Y").to_string();
-        let font_desc = pango::FontDescription::from_string("Ubuntu 16");
-        layout.set_font_description(Some(&font_desc));
-        layout.set_text(&date_str);
-        
-        cr.move_to(10.0, 80.0);
-        pangocairo::functions::layout_path(&cr, &layout);
-        cr.set_source_rgb(0.0, 0.0, 0.0);
-        cr.stroke_preserve().expect("Failed to stroke");
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.fill().expect("Failed to fill");
-        
-        // Start system stats below the clock
-        let mut y = 135.0;
+        // Start system stats
+        let mut y = y_pos;
         let icon_size = 20.0;
         let bar_width = 200.0;
         let bar_height = 12.0;
@@ -659,18 +712,20 @@ fn render_widget(
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.fill().expect("Failed to fill");
             
-            // Draw CPU percentage
-            let cpu_text = format!("{:.1}%", cpu_usage);
-            layout.set_text(&cpu_text);
-            cr.move_to(80.0, y);
-            pangocairo::functions::layout_path(&cr, &layout);
-            cr.set_source_rgb(0.0, 0.0, 0.0);
-            cr.stroke_preserve().expect("Failed to stroke");
-            cr.set_source_rgb(1.0, 1.0, 1.0);
-            cr.fill().expect("Failed to fill");
-            
             // Draw progress bar
-            draw_progress_bar(&cr, 140.0, y, bar_width, bar_height, cpu_usage);
+            draw_progress_bar(&cr, 90.0, y, bar_width, bar_height, cpu_usage);
+            
+            // Draw CPU percentage only if show_percentages is enabled
+            if show_percentages {
+                let cpu_text = format!("{:.1}%", cpu_usage);
+                layout.set_text(&cpu_text);
+                cr.move_to(300.0, y);
+                pangocairo::functions::layout_path(&cr, &layout);
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+                cr.stroke_preserve().expect("Failed to stroke");
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.fill().expect("Failed to fill");
+            }
             
             y += 30.0;
         }
@@ -688,16 +743,31 @@ fn render_widget(
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.fill().expect("Failed to fill");
             
-            // Draw memory percentage or size
-            let mem_text = if show_percentages {
-                format!("{:.1}%", memory_usage)
-            } else {
-                let mem_gb_used = memory_used as f64 / (1024.0 * 1024.0 * 1024.0);
-                let mem_gb_total = memory_total as f64 / (1024.0 * 1024.0 * 1024.0);
-                format!("{:.1}/{:.1}G", mem_gb_used, mem_gb_total)
-            };
-            layout.set_text(&mem_text);
-            cr.move_to(80.0, y);
+            // Draw progress bar first
+            draw_progress_bar(&cr, 90.0, y, bar_width, bar_height, memory_usage);
+            
+            // Draw memory percentage only if show_percentages is enabled
+            if show_percentages {
+                let mem_text = format!("{:.1}%", memory_usage);
+                layout.set_text(&mem_text);
+                cr.move_to(300.0, y); // Position after the bar
+                pangocairo::functions::layout_path(&cr, &layout);
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+                cr.stroke_preserve().expect("Failed to stroke");
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.fill().expect("Failed to fill");
+            }
+            
+            y += 30.0;
+        }
+
+        if show_gpu {
+            // Draw GPU icon
+            draw_gpu_icon(&cr, 10.0, y - 2.0, icon_size);
+            
+            // Draw GPU label
+            layout.set_text("GPU:");
+            cr.move_to(10.0 + icon_size + 10.0, y);
             pangocairo::functions::layout_path(&cr, &layout);
             cr.set_source_rgb(0.0, 0.0, 0.0);
             cr.stroke_preserve().expect("Failed to stroke");
@@ -705,7 +775,20 @@ fn render_widget(
             cr.fill().expect("Failed to fill");
             
             // Draw progress bar
-            draw_progress_bar(&cr, 140.0, y, bar_width, bar_height, memory_usage);
+            let gpu_usage = 0.0; // TODO: Implement actual GPU monitoring
+            draw_progress_bar(&cr, 90.0, y, bar_width, bar_height, gpu_usage);
+            
+            // Draw GPU percentage only if show_percentages is enabled (placeholder - needs nvtop/radeontop integration)
+            if show_percentages {
+                let gpu_text = format!("{:.1}%", gpu_usage);
+                layout.set_text(&gpu_text);
+                cr.move_to(300.0, y);
+                pangocairo::functions::layout_path(&cr, &layout);
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+                cr.stroke_preserve().expect("Failed to stroke");
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.fill().expect("Failed to fill");
+            }
             
             y += 30.0;
         }

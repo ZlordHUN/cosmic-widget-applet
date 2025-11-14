@@ -33,8 +33,10 @@ pub enum Message {
     ToggleMemory(bool),
     ToggleNetwork(bool),
     ToggleDisk(bool),
+    ToggleGpu(bool),
+    ToggleClock(bool),
+    ToggleDate(bool),
     TogglePercentages(bool),
-    ToggleGraphs(bool),
     UpdateInterval(String),
     UpdateX(String),
     UpdateY(String),
@@ -136,6 +138,10 @@ impl Application for SettingsApp {
                 widget::toggler(self.config.show_memory).on_toggle(Message::ToggleMemory),
             ))
             .push(widget::settings::item(
+                fl!("show-gpu"),
+                widget::toggler(self.config.show_gpu).on_toggle(Message::ToggleGpu),
+            ))
+            .push(widget::settings::item(
                 fl!("show-network"),
                 widget::toggler(self.config.show_network).on_toggle(Message::ToggleNetwork),
             ))
@@ -144,14 +150,20 @@ impl Application for SettingsApp {
                 widget::toggler(self.config.show_disk).on_toggle(Message::ToggleDisk),
             ))
             .push(widget::divider::horizontal::default())
+            .push(widget::text::heading(fl!("widget-display")))
+            .push(widget::settings::item(
+                fl!("show-clock"),
+                widget::toggler(self.config.show_clock).on_toggle(Message::ToggleClock),
+            ))
+            .push(widget::settings::item(
+                fl!("show-date"),
+                widget::toggler(self.config.show_date).on_toggle(Message::ToggleDate),
+            ))
+            .push(widget::divider::horizontal::default())
             .push(widget::text::heading(fl!("display-options")))
             .push(widget::settings::item(
                 fl!("show-percentages"),
                 widget::toggler(self.config.show_percentages).on_toggle(Message::TogglePercentages),
-            ))
-            .push(widget::settings::item(
-                fl!("show-graphs"),
-                widget::toggler(self.config.show_graphs).on_toggle(Message::ToggleGraphs),
             ))
             .push(widget::settings::item(
                 fl!("update-interval"),
@@ -178,7 +190,9 @@ impl Application for SettingsApp {
                     .push(widget::column().width(cosmic::iced::Length::Fill))
             );
 
-        widget::container(content)
+        let scrollable_content = widget::scrollable(content);
+
+        widget::container(scrollable_content)
             .width(cosmic::iced::Length::Fill)
             .height(cosmic::iced::Length::Fill)
             .into()
@@ -213,12 +227,20 @@ impl Application for SettingsApp {
                 self.config.show_disk = enabled;
                 self.save_config();
             }
-            Message::TogglePercentages(enabled) => {
-                self.config.show_percentages = enabled;
+            Message::ToggleGpu(enabled) => {
+                self.config.show_gpu = enabled;
                 self.save_config();
             }
-            Message::ToggleGraphs(enabled) => {
-                self.config.show_graphs = enabled;
+            Message::ToggleClock(enabled) => {
+                self.config.show_clock = enabled;
+                self.save_config();
+            }
+            Message::ToggleDate(enabled) => {
+                self.config.show_date = enabled;
+                self.save_config();
+            }
+            Message::TogglePercentages(enabled) => {
+                self.config.show_percentages = enabled;
                 self.save_config();
             }
             Message::UpdateInterval(value) => {
