@@ -46,9 +46,10 @@ cosmic-monitor-widget &
 
 The widget:
 - Renders as a borderless overlay (no window decorations)
-- Uses Wayland layer-shell protocol for true transparency
+- Uses Wayland layer-shell protocol with fully transparent background
+- Displays large clock with date (Conky-style with text outlines)
+- Shows real-time system statistics (CPU, memory, network placeholders)
 - Position is fixed at startup (set via settings)
-- Displays real-time system statistics
 
 ### Settings
 Open via the applet menu or launch directly:

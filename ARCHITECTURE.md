@@ -47,7 +47,8 @@ This separation allows the widget to run continuously while settings/applet can 
 **Implementation**:
 - Direct Wayland client (no libcosmic Application)
 - Uses `smithay-client-toolkit` 0.19.2 for layer-shell protocol
-- Custom rendering with Cairo/Pango
+- Custom rendering with Cairo/Pango (transparent background, text outlines)
+- Clock display with chrono (HH:MM:SS + full date)
 - System monitoring via `sysinfo` crate
 
 **Architecture**:
@@ -73,23 +74,33 @@ MonitorWidget struct
 **Layer Surface Configuration**:
 - **Layer**: `TOP` (above normal windows)
 - **Anchor**: `TOP | LEFT` (positioned from top-left corner)
-- **Size**: 300x300 pixels (configurable via constants)
+- **Size**: 350x300 pixels (configurable via constants)
 - **Margins**: `(widget_y, 0, 0, widget_x)` - positions the widget
 - **Exclusive Zone**: -1 (doesn't reserve space)
 - **Keyboard Interactivity**: None (click-through)
+- **Background**: Fully transparent using Cairo `Operator::Source`
 
 **Rendering Pipeline**:
 1. Request buffer from shared memory pool
 2. Create Cairo surface from buffer
-3. Render background, text, metrics with Cairo/Pango
-4. Flush Cairo surface
-5. Attach buffer to Wayland surface
-6. Damage and commit surface
+3. Set transparent background with `Operator::Source`
+4. Render clock with text outlines (stroke + fill)
+5. Render system metrics with Cairo/Pango
+6. Flush Cairo surface
+7. Attach buffer to Wayland surface
+8. Damage and commit surface
 
 **Config Watching**:
 - Polls config file every 500ms
 - Detects changes and redraws
 - Does NOT update margins (requires restart)
+
+**Clock Display**:
+- Uses `chrono::Local` for current date/time
+- Large HH:MM display (Ubuntu Bold 48)
+- Smaller :SS display (Ubuntu Bold 28)
+- Full date below clock (Ubuntu 16)
+- White text with black outlines (Conky-style)
 
 **System Monitoring**:
 - Uses `sysinfo::System` for CPU, memory, disk
@@ -213,9 +224,10 @@ pub struct Config {
 - `wayland-protocols` 0.32 - Protocol definitions
 
 ### Rendering
-- `cairo-rs` 0.20.1 - 2D graphics
+- `cairo-rs` 0.20.1 - 2D graphics with transparency
 - `pango` 0.20.1 - Text layout
 - `pangocairo` 0.20.1 - Cairo/Pango integration
+- `chrono` 0.4 - Date/time formatting for clock display
 
 ### System Monitoring
 - `sysinfo` 0.32 - CPU, memory, disk stats
