@@ -1,6 +1,27 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use cosmic::cosmic_config::{self, cosmic_config_derive::CosmicConfigEntry, CosmicConfigEntry};
+use serde::{Deserialize, Serialize};
+
+/// Widget sections that can be reordered
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WidgetSection {
+    Utilization,
+    Temperatures,
+    Storage,
+    Weather,
+}
+
+impl WidgetSection {
+    pub fn label(&self) -> &'static str {
+        match self {
+            WidgetSection::Utilization => "Utilization",
+            WidgetSection::Temperatures => "Temperatures",
+            WidgetSection::Storage => "Storage",
+            WidgetSection::Weather => "Weather",
+        }
+    }
+}
 
 #[derive(Debug, Clone, CosmicConfigEntry, Eq, PartialEq)]
 #[version = 1]
@@ -45,6 +66,8 @@ pub struct Config {
     pub widget_y: i32,
     /// Allow widget to be moved (when settings is open)
     pub widget_movable: bool,
+    /// Order of widget sections
+    pub section_order: Vec<WidgetSection>,
 }
 
 impl Default for Config {
@@ -70,6 +93,12 @@ impl Default for Config {
             widget_x: 50,
             widget_y: 50,
             widget_movable: false,
+            section_order: vec![
+                WidgetSection::Utilization,
+                WidgetSection::Temperatures,
+                WidgetSection::Storage,
+                WidgetSection::Weather,
+            ],
         }
     }
 }

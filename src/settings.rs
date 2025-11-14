@@ -2,7 +2,7 @@
 
 //! Settings application for the system monitor
 
-use crate::config::Config;
+use crate::config::{Config, WidgetSection};
 use crate::fl;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::prelude::*;
@@ -52,6 +52,8 @@ pub enum Message {
     ToggleWeather(bool),
     UpdateWeatherApiKey(String),
     UpdateWeatherLocation(String),
+    MoveSectionUp(usize),
+    MoveSectionDown(usize),
     SaveAndApply,
     CloseRequested,
 }
@@ -138,8 +140,8 @@ impl Application for SettingsApp {
     }
 
     /// Displays the application's interface.
-    fn view(&self) -> Element<'_, Self::Message> {
-        let content = widget::column()
+    fn view(&self) -> Element<Self::Message> {
+        let mut content = widget::column()
             .spacing(12)
             .padding(24)
             .push(widget::text::title1(fl!("app-title")))
@@ -226,6 +228,42 @@ impl Application for SettingsApp {
                 widget::text_input("", &self.weather_location_input)
                     .on_input(Message::UpdateWeatherLocation),
             ))
+            .push(widget::divider::horizontal::default())
+            .push(widget::text::heading(fl!("layout-order")))
+            .push(widget::text::body(fl!("layout-order-description")));
+        
+        // Add section order list with up/down buttons
+        for (index, section) in self.config.section_order.iter().enumerate() {
+            let up_button = if index > 0 {
+                widget::button::icon(widget::icon::from_name("go-up-symbolic"))
+                    .on_press(Message::MoveSectionUp(index))
+                    .padding(4)
+            } else {
+                widget::button::icon(widget::icon::from_name("go-up-symbolic"))
+                    .padding(4)
+            };
+            
+            let down_button = if index < self.config.section_order.len() - 1 {
+                widget::button::icon(widget::icon::from_name("go-down-symbolic"))
+                    .on_press(Message::MoveSectionDown(index))
+                    .padding(4)
+            } else {
+                widget::button::icon(widget::icon::from_name("go-down-symbolic"))
+                    .padding(4)
+            };
+            
+            content = content.push(
+                widget::row()
+                    .spacing(8)
+                    .padding([4, 8])
+                    .push(up_button)
+                    .push(down_button)
+                    .push(widget::text::body(section.label()))
+                    .push(widget::horizontal_space())
+            );
+        }
+        
+        content = content
             .push(widget::divider::horizontal::default())
             .push(widget::text::heading("Widget Position"))
             .push(widget::settings::item(
@@ -356,6 +394,18 @@ impl Application for SettingsApp {
                 self.weather_location_input = value.clone();
                 self.config.weather_location = value;
                 self.save_config();
+            }
+            Message::MoveSectionUp(index) => {
+                if index > 0 && index < self.config.section_order.len() {
+                    self.config.section_order.swap(index, index - 1);
+                    self.save_config();
+                }
+            }
+            Message::MoveSectionDown(index) => {
+                if index < self.config.section_order.len() - 1 {
+                    self.config.section_order.swap(index, index + 1);
+                    self.save_config();
+                }
             }
             Message::SaveAndApply => {
                 // Save all current settings to ensure they're persisted

@@ -11,6 +11,7 @@ use super::utilization::{draw_cpu_icon, draw_ram_icon, draw_gpu_icon, draw_progr
 use super::temperature::draw_temp_circle;
 use super::weather::draw_weather_icon;
 use super::storage::DiskInfo;
+use crate::config::WidgetSection;
 
 /// Parameters for rendering the widget
 pub struct RenderParams<'a> {
@@ -42,6 +43,7 @@ pub struct RenderParams<'a> {
     pub weather_location: &'a str,
     pub weather_icon: &'a str,
     pub disk_info: &'a [DiskInfo],
+    pub section_order: &'a [WidgetSection],
 }
 
 /// Main rendering function for the widget
@@ -87,31 +89,42 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
             y_pos = 10.0; // Start at top if no clock/date
         }
         
-        if params.show_cpu || params.show_memory || params.show_gpu {
-            y_pos = render_utilization(&cr, &layout, y_pos, &params);
+        // Render sections in the configured order
+        for section in params.section_order {
+            match section {
+                WidgetSection::Utilization => {
+                    if params.show_cpu || params.show_memory || params.show_gpu {
+                        y_pos = render_utilization(&cr, &layout, y_pos, &params);
+                    }
+                }
+                WidgetSection::Temperatures => {
+                    if params.show_cpu_temp || params.show_gpu_temp {
+                        y_pos += 10.0; // Spacing before temperature section
+                        y_pos = render_temperatures(&cr, &layout, y_pos, &params);
+                    }
+                }
+                WidgetSection::Storage => {
+                    if params.show_storage {
+                        y_pos += 10.0; // Spacing before storage section
+                        y_pos = render_storage(&cr, &layout, y_pos, params.disk_info, params.show_percentages);
+                    }
+                }
+                WidgetSection::Weather => {
+                    if params.show_weather {
+                        y_pos += 10.0; // Spacing before weather section
+                        y_pos = render_weather(&cr, &layout, y_pos, &params);
+                    }
+                }
+            }
         }
         
-        if params.show_cpu_temp || params.show_gpu_temp {
-            y_pos += 10.0; // Spacing before temperature section
-            y_pos = render_temperatures(&cr, &layout, y_pos, &params);
-        }
-        
+        // Render network and disk (not yet in reorderable sections)
         if params.show_network {
             y_pos = render_network(&cr, &layout, y_pos, params.network_rx_rate, params.network_tx_rate);
         }
         
-        if params.show_storage {
-            y_pos += 10.0; // Spacing before storage section
-            y_pos = render_storage(&cr, &layout, y_pos, params.disk_info, params.show_percentages);
-        }
-        
         if params.show_disk {
             y_pos = render_disk(&cr, &layout, y_pos);
-        }
-        
-        if params.show_weather {
-            y_pos += 10.0; // Spacing before weather section
-            render_weather(&cr, &layout, y_pos, &params);
         }
     }
     
@@ -562,7 +575,7 @@ fn render_weather(
     layout: &pango::Layout,
     y_start: f64,
     params: &RenderParams,
-) {
+) -> f64 {
     let mut y = y_start;
     
     // Section header
@@ -619,6 +632,8 @@ fn render_weather(
     cr.stroke_preserve().expect("Failed to stroke");
     cr.set_source_rgb(0.7, 0.7, 0.7);
     cr.fill().expect("Failed to fill");
+    
+    y + 70.0 // Return updated y position
 }
 
 /// Render storage/disk usage section

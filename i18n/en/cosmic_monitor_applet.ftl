@@ -36,3 +36,8 @@ weather-display = Weather Display
 show-weather = Show Weather
 weather-api-key = OpenWeatherMap API Key
 weather-location = Location (e.g., London, New York)
+
+# Layout
+layout-order = Layout Order
+layout-order-description = Use the arrow buttons to change the order sections appear in the widget
+

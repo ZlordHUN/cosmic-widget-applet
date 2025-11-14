@@ -44,14 +44,24 @@ cargo build --release --bin cosmic-monitor-settings
 ## Installation
 
 ```bash
-# Install binaries
+# Build all binaries
+cargo build --release
+
+# Install using just (recommended)
+sudo just install
+
+# Or install manually
 sudo install -Dm755 target/release/cosmic-monitor-applet /usr/bin/cosmic-monitor-applet
 sudo install -Dm755 target/release/cosmic-monitor-widget /usr/bin/cosmic-monitor-widget
 sudo install -Dm755 target/release/cosmic-monitor-settings /usr/local/bin/cosmic-monitor-settings
 
-# Install desktop files
+# Install desktop files and icon
 sudo install -Dm644 resources/app.desktop /usr/share/applications/com.github.zoliviragh.CosmicMonitor.desktop
 sudo install -Dm644 resources/settings.desktop /usr/share/applications/com.github.zoliviragh.CosmicMonitor.Settings.desktop
+sudo install -Dm644 resources/icon.svg /usr/share/icons/hicolor/scalable/apps/com.github.zoliviragh.CosmicMonitor.svg
+
+# Update icon cache
+sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor
 ```
 
 ## Usage
@@ -74,6 +84,11 @@ Available options:
 - **Storage Display**: Toggle storage/disk usage monitoring with per-drive usage bars
 - **Temperature Display**: Toggle CPU and GPU temperature monitoring independently, switch between circular gauges and text display
 - **Widget Display**: Toggle clock (12/24-hour format) and date displays independently
+- **Weather Display**: Toggle weather information, configure OpenWeatherMap API key and location
+- **Layout Order**: Customize the order in which sections appear in the widget (Utilization, Temperatures, Storage, Weather)
+- **Display Options**: Show/hide percentage values next to progress bars
+- **Update Interval**: 100-10000ms refresh rate
+- **Widget Position**: Precise X/Y coordinates (requires restart to apply)
 - **Weather Display**: Toggle weather information, configure OpenWeatherMap API key and location
 - **Display Options**: Show/hide percentage values next to progress bars
 - **Update Interval**: 100-10000ms refresh rate

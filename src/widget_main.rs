@@ -445,6 +445,7 @@ impl MonitorWidget {
             weather_location,
             weather_icon,
             disk_info: &self.storage.disk_info,
+            section_order: &self.config.section_order,
         };
         
         render_widget(canvas, params);

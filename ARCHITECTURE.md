@@ -155,6 +155,25 @@ Settings Window (Scrollable)
 ├── Widget Display
 │   ├── Show Clock (toggle)
 │   └── Show Date (toggle)
+├── Temperature Display
+│   ├── Show CPU Temperature (toggle)
+│   ├── Show GPU Temperature (toggle)
+│   └── Use Circular Temperature Display (toggle)
+├── Display Options
+│   ├── Show Percentages (toggle)
+│   └── Update Interval (text input)
+├── Weather Display
+│   ├── Show Weather (toggle)
+│   ├── Weather API Key (text input)
+│   └── Weather Location (text input)
+├── Layout Order
+│   ├── Section ordering with up/down arrow buttons
+│   └── Reorderable list: Utilization, Temperatures, Storage, Weather
+└── Widget Position
+    ├── X Position (text input)
+    ├── Y Position (text input)
+    └── Apply Position (button → restart widget)
+```
 ├── Display Options
 │   ├── Show Percentages (toggle)
 │   └── Update Interval (text input)
@@ -199,6 +218,14 @@ pub struct Config {
     widget_x: i32,         // X position from left
     widget_y: i32,         // Y position from top
     widget_movable: bool,  // Internal (for future drag mode)
+    section_order: Vec<WidgetSection>, // Customizable section ordering
+}
+
+pub enum WidgetSection {
+    Utilization,   // CPU, RAM, GPU usage
+    Temperatures,  // CPU and GPU temperature displays
+    Storage,       // Disk usage information
+    Weather,       // Weather information display
 }
 ```
 
