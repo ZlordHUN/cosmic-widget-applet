@@ -104,13 +104,17 @@ impl cosmic::Application for AppModel {
         // Check if widget should auto-start
         let widget_running = if config.widget_autostart {
             // Try to launch the widget
+            log::info!("Auto-start enabled, launching widget");
             if let Ok(_) = std::process::Command::new("cosmic-monitor-widget").spawn() {
+                log::info!("Widget auto-started successfully");
                 true
             } else {
+                log::error!("Failed to auto-start widget");
                 false
             }
         } else {
             // Check if widget is already running even if autostart is disabled
+            log::info!("Auto-start disabled, checking if widget is already running");
             Self::check_widget_running()
         };
 
@@ -219,6 +223,7 @@ impl cosmic::Application for AppModel {
                 // Toggle widget visibility
                 if self.widget_running {
                     // Try to kill widget (TODO: track PID properly)
+                    log::info!("Stopping widget via pkill");
                     let _ = std::process::Command::new("pkill")
                         .arg("-f")
                         .arg("cosmic-monitor-widget")
@@ -229,11 +234,15 @@ impl cosmic::Application for AppModel {
                     self.save_config();
                 } else {
                     // Launch the widget
+                    log::info!("Launching widget");
                     if let Ok(_) = std::process::Command::new("cosmic-monitor-widget").spawn() {
                         self.widget_running = true;
                         // Update config to auto-start
                         self.config.widget_autostart = true;
                         self.save_config();
+                        log::info!("Widget launched successfully");
+                    } else {
+                        log::error!("Failed to launch widget");
                     }
                 }
             }

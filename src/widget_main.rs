@@ -529,8 +529,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN); 
     }
     
-    // Initialize logger
+    // Initialize logger to write to /tmp/cosmic-monitor.log (shared with applet)
+    use std::fs::OpenOptions;
+    
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/cosmic-monitor.log")
+        .expect("Failed to open log file");
+    
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
     
     log::info!("Starting COSMIC Monitor Widget");
@@ -633,23 +642,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             log::trace!("Events dispatched");
             
-            // Aggressive heartbeat: send sync request every 10 seconds to prevent compositor timeout
-            // This keeps the connection alive without the widget disappearing
-            if now.duration_since(last_heartbeat) >= Duration::from_secs(10) {
-                log::info!("Sending heartbeat to compositor (keeping connection alive)");
-                if let Some(layer_surface) = &widget.layer_surface {
-                    let _ = conn.display().sync(&qh, layer_surface.wl_surface().clone());
+            // Aggressive heartbeat: force a roundtrip every 5 seconds to keep compositor connection alive
+            // This actually waits for the compositor response, proving the connection works
+            if now.duration_since(last_heartbeat) >= Duration::from_secs(5) {
+                log::info!("Sending heartbeat roundtrip to compositor");
+                if let Err(e) = event_queue.roundtrip(&mut widget) {
+                    log::error!("Heartbeat roundtrip failed: {}", e);
+                    
+                    // Check for broken pipe - reconnect if so
+                    let error_str = e.to_string();
+                    if error_str.contains("Broken pipe") || error_str.contains("os error 32") {
+                        log::warn!("Broken pipe on heartbeat → reconnecting");
+                        break 'session;
+                    }
+                    
+                    return Err(e.into());
                 }
                 last_heartbeat = now;
             }
             
-            // Flush the event queue first
-            if let Err(e) = event_queue.flush() {
-                log::error!("Error flushing event queue: {}", e);
-                return Err(e.into());
-            }
-            
-            // Flush the connection to send any outgoing messages
+            // CRITICAL: Always flush the connection to keep it alive
+            // Must call flush at least a few times per second according to Wayland best practices
             log::trace!("Flushing connection");
             if let Err(e) = conn.flush() {
                 log::error!("Error flushing connection: {}", e);
@@ -665,8 +678,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             log::trace!("Flush complete");
             
-            // Sleep to avoid busy-waiting
-            thread::sleep(Duration::from_millis(100));
+            // Small sleep to avoid busy-waiting while staying responsive
+            thread::sleep(Duration::from_millis(16)); // ~60 FPS responsiveness
 
             if widget.exit {
                 log::info!("Exit requested, shutting down");
