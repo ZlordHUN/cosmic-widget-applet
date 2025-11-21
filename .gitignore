@@ -12,3 +12,4 @@ debian/*
 !debian/install
 !debian/rules
 !debian/sourcecosmic-monitor-applet-aftercrashfix/
+Solaar-master/
