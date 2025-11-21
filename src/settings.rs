@@ -7,7 +7,53 @@ use crate::fl;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::prelude::*;
 use cosmic::widget;
-use cosmic::{app, Application, Element};
+use cosmic::Application;
+use cosmic::Element;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CachedBatteryDevice {
+    pub name: String,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WidgetCache {
+    pub disks: Vec<CachedDiskInfo>,
+    pub battery_devices: Vec<CachedBatteryDevice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CachedDiskInfo {
+    pub name: String,
+    pub mount_point: String,
+}
+
+impl WidgetCache {
+    fn cache_path() -> std::path::PathBuf {
+        let mut path = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        path.push("cosmic-monitor-applet");
+        std::fs::create_dir_all(&path).ok();
+        path.push("widget_cache.json");
+        path
+    }
+
+    fn load() -> Self {
+        let path = Self::cache_path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    fn save(&self) {
+        let path = Self::cache_path();
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            std::fs::write(&path, json).ok();
+        }
+    }
+}
 
 /// The settings model
 pub struct SettingsApp {
@@ -27,6 +73,8 @@ pub struct SettingsApp {
     weather_api_key_input: String,
     /// Temporary state for weather location
     weather_location_input: String,
+    /// Cached battery devices
+    cached_devices: Vec<CachedBatteryDevice>,
 }
 
 /// Messages emitted by the settings app
@@ -48,6 +96,7 @@ pub enum Message {
     TogglePercentages(bool),
     ToggleBatterySection(bool),
     ToggleSolaarIntegration(bool),
+    RemoveCachedDevice(usize),
     UpdateInterval(String),
     UpdateX(String),
     UpdateY(String),
@@ -116,6 +165,18 @@ impl Application for SettingsApp {
             })
             .unwrap_or_default();
 
+        // Migrate old configs: add Battery to section_order if missing
+        if !config.section_order.iter().any(|s| matches!(s, WidgetSection::Battery)) {
+            // Find position after Storage or before Weather
+            if let Some(storage_pos) = config.section_order.iter().position(|s| matches!(s, WidgetSection::Storage)) {
+                config.section_order.insert(storage_pos + 1, WidgetSection::Battery);
+            } else if let Some(weather_pos) = config.section_order.iter().position(|s| matches!(s, WidgetSection::Weather)) {
+                config.section_order.insert(weather_pos, WidgetSection::Battery);
+            } else {
+                config.section_order.push(WidgetSection::Battery);
+            }
+        }
+
         // Enable widget movement when settings window is open
         config.widget_movable = true;
         if let Some(ref handler) = config_handler {
@@ -127,6 +188,10 @@ impl Application for SettingsApp {
         let y_input = format!("{}", config.widget_y);
         let weather_api_key_input = config.weather_api_key.clone();
         let weather_location_input = config.weather_location.clone();
+        
+        // Load cached battery devices
+        let cache = WidgetCache::load();
+        let cached_devices = cache.battery_devices.clone();
 
         let app = SettingsApp {
             core,
@@ -137,6 +202,7 @@ impl Application for SettingsApp {
             y_input,
             weather_api_key_input,
             weather_location_input,
+            cached_devices,
         };
 
         (app, Task::none())
@@ -221,7 +287,32 @@ impl Application for SettingsApp {
                 "Enable Solaar integration",
                 widget::toggler(self.config.enable_solaar_integration)
                     .on_toggle(Message::ToggleSolaarIntegration),
-            ))
+            ));
+        
+        // Add cached battery devices list
+        if !self.cached_devices.is_empty() {
+            content = content.push(widget::text::body("Cached Devices:"));
+            
+            for (index, device) in self.cached_devices.iter().enumerate() {
+                let device_kind = device.kind.as_deref().unwrap_or("device");
+                let device_label = format!("{} ({})", device.name, device_kind);
+                
+                content = content.push(
+                    widget::row()
+                        .spacing(8)
+                        .padding([4, 16])
+                        .push(widget::text::body(device_label))
+                        .push(widget::horizontal_space())
+                        .push(
+                            widget::button::icon(widget::icon::from_name("user-trash-symbolic"))
+                                .on_press(Message::RemoveCachedDevice(index))
+                                .padding(4)
+                        )
+                );
+            }
+        }
+        
+        content = content
             .push(widget::settings::item(
                 fl!("update-interval"),
                 widget::text_input("", &self.interval_input).on_input(Message::UpdateInterval),
@@ -386,6 +477,16 @@ impl Application for SettingsApp {
                 self.config.enable_solaar_integration = enabled;
                 self.save_config();
             }
+            Message::RemoveCachedDevice(index) => {
+                if index < self.cached_devices.len() {
+                    self.cached_devices.remove(index);
+                    
+                    // Update the cache file
+                    let mut cache = WidgetCache::load();
+                    cache.battery_devices = self.cached_devices.clone();
+                    cache.save();
+                }
+            }
             Message::UpdateInterval(value) => {
                 self.interval_input = value.clone();
                 if let Ok(interval) = value.parse::<u64>() {
@@ -456,7 +557,7 @@ impl Application for SettingsApp {
                 
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 
-                match std::process::Command::new("/usr/bin/cosmic-monitor-widget")
+                match std::process::Command::new("./target/release/cosmic-monitor-widget")
                     .spawn() {
                     Ok(child) => eprintln!("Widget spawned with PID: {:?}", child.id()),
                     Err(e) => eprintln!("Spawn error: {:?}", e),

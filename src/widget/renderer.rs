@@ -113,6 +113,18 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
                         y_pos = render_storage(&cr, &layout, y_pos, params.disk_info, params.show_percentages);
                     }
                 }
+                WidgetSection::Battery => {
+                    if params.show_battery {
+                        y_pos += 10.0; // Spacing before battery section
+                        y_pos = render_battery_section(
+                            &cr,
+                            &layout,
+                            y_pos,
+                            params.battery_devices,
+                            params.enable_solaar_integration,
+                        );
+                    }
+                }
                 WidgetSection::Weather => {
                     if params.show_weather {
                         y_pos += 10.0; // Spacing before weather section
@@ -129,18 +141,6 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
         
         if params.show_disk {
             y_pos = render_disk(&cr, &layout, y_pos);
-        }
-
-        // Battery section using Solaar data
-        if params.show_battery {
-            y_pos += 10.0; // Spacing before battery section
-            y_pos = render_battery_section(
-                &cr,
-                &layout,
-                y_pos,
-                params.battery_devices,
-                params.enable_solaar_integration,
-            );
         }
     }
     

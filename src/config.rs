@@ -9,6 +9,7 @@ pub enum WidgetSection {
     Utilization,
     Temperatures,
     Storage,
+    Battery,
     Weather,
 }
 
@@ -18,6 +19,7 @@ impl WidgetSection {
             WidgetSection::Utilization => "Utilization",
             WidgetSection::Temperatures => "Temperatures",
             WidgetSection::Storage => "Storage",
+            WidgetSection::Battery => "Battery",
             WidgetSection::Weather => "Weather",
         }
     }
@@ -103,6 +105,7 @@ impl Default for Config {
                 WidgetSection::Utilization,
                 WidgetSection::Temperatures,
                 WidgetSection::Storage,
+                WidgetSection::Battery,
                 WidgetSection::Weather,
             ],
             widget_autostart: true,
