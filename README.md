@@ -28,6 +28,8 @@ A borderless floating widget that displays real-time system statistics for the C
 - **System Monitoring**: Real-time CPU, memory, GPU (NVIDIA, AMD, Intel auto-detected), storage usage, network, and disk I/O statistics
 - **Multi-Vendor GPU Support**: Automatic detection and monitoring for NVIDIA (nvidia-smi), AMD (sysfs/radeontop), and Intel (sysfs/intel_gpu_top) GPUs
 - **Storage Monitoring**: Displays disk usage for system drives and external media with intelligent labeling (vendor + model names)
+- **Battery Monitoring**: Shows battery status for Logitech wireless devices via Solaar integration with color-coded vertical battery icons
+- **Persistent Cache**: Remembers drives and peripherals to instantly display placeholders while loading fresh data
 - **Customizable Position**: Precise X/Y positioning via settings window
 - **Configurable Display**: Toggle individual stats (CPU, RAM, GPU, clock, date, temperatures), show/hide percentage values
 - **Native COSMIC Integration**: Built with libcosmic and follows COSMIC design patterns
@@ -95,6 +97,7 @@ Settings are stored using cosmic-config at:
 Available options:
 - **Monitoring**: Toggle CPU, memory, GPU, network, disk stats individually
 - **Storage Display**: Toggle storage/disk usage monitoring with per-drive usage bars
+- **Battery Display**: Toggle battery section and enable Solaar integration for Logitech wireless devices
 - **Temperature Display**: Toggle CPU and GPU temperature monitoring independently, switch between circular gauges and text display
 - **Widget Display**: Toggle clock (12/24-hour format) and date displays independently
 - **Weather Display**: Toggle weather information, configure OpenWeatherMap API key and location
@@ -122,6 +125,7 @@ Trade-offs:
 - **cairo-rs/pango**: Custom widget rendering with text outlines
 - **chrono**: Date and time formatting
 - **sysinfo**: System statistics monitoring
+- **solaar**: (Optional) For battery monitoring of Logitech wireless devices
 - **cosmic-config**: Configuration persistence
 - **reqwest**: HTTP client for weather API requests
 - **serde/serde_json**: JSON parsing for weather data
@@ -141,6 +145,38 @@ Weather updates every 10 minutes and displays:
 - Weather description
 - Location name
 - Dynamic icon based on conditions (clear sky, clouds, rain, snow, fog, thunderstorm) with day/night variants
+
+## Battery Monitoring Setup
+
+To enable battery monitoring for Logitech wireless devices:
+
+1. Install [Solaar](https://github.com/pwr-Solaar/Solaar) if not already installed:
+   ```bash
+   sudo apt install solaar  # Debian/Ubuntu
+   sudo dnf install solaar  # Fedora
+   ```
+2. Open Settings from the applet menu
+3. Navigate to the Battery section
+4. Enable "Show Battery Section"
+5. Enable "Enable Solaar Integration"
+
+The widget will display:
+- Device names (e.g., "G309 LIGHTSPEED", "MX Mechanical Mini")
+- Color-coded vertical battery icons (green > 60%, yellow > 30%, orange > 15%, red ≤ 15%)
+- Battery percentage next to each device
+- Disconnected icon while loading or if device is not available
+- Cached device information for instant display on startup
+
+Supported devices: Any Logitech wireless device that Solaar can detect (mice, keyboards, headsets, etc.)
+
+## Cache
+
+The widget caches drive and peripheral information at:
+```
+~/.cache/cosmic-monitor-applet/widget_cache.json
+```
+
+This allows the widget to instantly display disk names and battery devices on startup while loading fresh data in the background. Storage drives show empty bars with "Loading..." and battery devices show a disconnected icon with "Connecting..." until data is refreshed.
 
 ## Development
 

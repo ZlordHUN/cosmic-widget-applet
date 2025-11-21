@@ -7,9 +7,9 @@ mod config;
 mod widget;
 
 use config::Config;
-use widget::{UtilizationMonitor, TemperatureMonitor, NetworkMonitor, WeatherMonitor, StorageMonitor};
+use widget::{UtilizationMonitor, TemperatureMonitor, NetworkMonitor, WeatherMonitor, StorageMonitor, BatteryMonitor};
 use widget::renderer::{render_widget, RenderParams};
-use widget::layout::calculate_widget_height;
+use widget::layout::calculate_widget_height_with_batteries;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -63,6 +63,7 @@ struct MonitorWidget {
     network: NetworkMonitor,
     weather: WeatherMonitor,
     storage: StorageMonitor,
+    battery: BatteryMonitor,
     last_update: Instant,
     
     /// Memory pool for rendering
@@ -293,6 +294,7 @@ impl MonitorWidget {
             network: NetworkMonitor::new(),
             weather: WeatherMonitor::new(weather_api_key, weather_location),
             storage: StorageMonitor::new(),
+            battery: BatteryMonitor::new(),
             last_update: Instant::now(),
             pool: None,
             last_height: WIDGET_HEIGHT,
@@ -363,6 +365,12 @@ impl MonitorWidget {
             self.storage.update();
             log::trace!("Storage updated, {} disks found", self.storage.disk_info.len());
         }
+
+        // Update battery info only when the section and Solaar integration are enabled
+        if self.config.show_battery && self.config.enable_solaar_integration {
+            log::trace!("Updating battery info from Solaar");
+            self.battery.update();
+        }
         
         // Update weather (has its own rate limiting - every 10 minutes)
         if self.config.show_weather {
@@ -386,8 +394,9 @@ impl MonitorWidget {
         
         // Calculate dynamic height based on enabled components
         let disk_count = if self.config.show_storage { self.storage.disk_info.len() } else { 0 };
+        let battery_count = if self.config.show_battery { self.battery.devices().len() } else { 0 };
         let width = WIDGET_WIDTH as i32;
-        let height = calculate_widget_height(&self.config, disk_count) as i32;
+        let height = calculate_widget_height_with_batteries(&self.config, disk_count, battery_count) as i32;
         let stride = width * 4;
 
         log::trace!("Drawing widget: {}x{} (disks: {})", width, height, disk_count);
@@ -426,6 +435,8 @@ impl MonitorWidget {
         let use_24hour_time = self.config.use_24hour_time;
         let use_circular_temp_display = self.config.use_circular_temp_display;
         let show_weather = self.config.show_weather;
+        let show_battery = self.config.show_battery;
+        let enable_solaar_integration = self.config.enable_solaar_integration;
         
         // Extract weather data
         let (weather_temp, weather_desc, weather_location, weather_icon) = {
@@ -440,6 +451,9 @@ impl MonitorWidget {
         let weather_desc = weather_desc.as_str();
         let weather_location = weather_location.as_str();
         let weather_icon = weather_icon.as_str();
+
+        // Snapshot battery devices for this frame
+        let battery_devices = self.battery.devices().to_vec();
 
         let pool = self.pool.as_mut().unwrap();
 
@@ -472,11 +486,14 @@ impl MonitorWidget {
             use_24hour_time,
             use_circular_temp_display,
             show_weather,
+            show_battery,
+            enable_solaar_integration,
             weather_temp,
             weather_desc,
             weather_location,
             weather_icon,
             disk_info: &self.storage.disk_info,
+            battery_devices: &battery_devices,
             section_order: &self.config.section_order,
         };
         

@@ -14,17 +14,34 @@ pub struct DiskInfo {
     pub used_percentage: f32,
     pub total_space: u64,
     pub available_space: u64,
+    pub is_loading: bool, // True if showing cached data while loading
 }
 
 pub struct StorageMonitor {
     disks: Disks,
     pub disk_info: Vec<DiskInfo>,
     disk_models: Arc<Mutex<HashMap<String, String>>>,
+    is_first_update: bool,
 }
 
 impl StorageMonitor {
     pub fn new() -> Self {
         let disk_models = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Load cached disk info to show immediately
+        let cache = super::cache::WidgetCache::load();
+        let disk_info: Vec<DiskInfo> = cache
+            .disks
+            .iter()
+            .map(|d| DiskInfo {
+                name: d.name.clone(),
+                mount_point: d.mount_point.clone(),
+                used_percentage: 0.0,
+                total_space: 0,
+                available_space: 0,
+                is_loading: true,
+            })
+            .collect();
         
         // Spawn background thread to update disk models
         let disk_models_clone = Arc::clone(&disk_models);
@@ -42,8 +59,9 @@ impl StorageMonitor {
         
         Self {
             disks: Disks::new_with_refreshed_list(),
-            disk_info: Vec::new(),
+            disk_info,
             disk_models,
+            is_first_update: true,
         }
     }
     
@@ -162,7 +180,15 @@ impl StorageMonitor {
                 used_percentage,
                 total_space: total,
                 available_space: available,
+                is_loading: false,
             });
+        }
+        
+        // Update cache after first successful update
+        if self.is_first_update && !self.disk_info.is_empty() {
+            let mut cache = super::cache::WidgetCache::load();
+            cache.update_disks(&self.disk_info);
+            self.is_first_update = false;
         }
     }
 }

@@ -70,6 +70,10 @@ pub struct Config {
     pub section_order: Vec<WidgetSection>,
     /// Auto-start widget when applet loads
     pub widget_autostart: bool,
+    /// Enable battery section in widget
+    pub show_battery: bool,
+    /// Enable Solaar integration for battery data
+    pub enable_solaar_integration: bool,
 }
 
 impl Default for Config {
@@ -102,6 +106,8 @@ impl Default for Config {
                 WidgetSection::Weather,
             ],
             widget_autostart: true,
+            show_battery: false,
+            enable_solaar_integration: false,
         }
     }
 }

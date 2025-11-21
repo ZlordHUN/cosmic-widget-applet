@@ -11,6 +11,7 @@ use super::utilization::{draw_cpu_icon, draw_ram_icon, draw_gpu_icon, draw_progr
 use super::temperature::draw_temp_circle;
 use super::weather::draw_weather_icon;
 use super::storage::DiskInfo;
+use super::battery::BatteryDevice;
 use crate::config::WidgetSection;
 
 /// Parameters for rendering the widget
@@ -38,11 +39,14 @@ pub struct RenderParams<'a> {
     pub use_24hour_time: bool,
     pub use_circular_temp_display: bool,
     pub show_weather: bool,
+    pub show_battery: bool,
+    pub enable_solaar_integration: bool,
     pub weather_temp: f32,
     pub weather_desc: &'a str,
     pub weather_location: &'a str,
     pub weather_icon: &'a str,
     pub disk_info: &'a [DiskInfo],
+    pub battery_devices: &'a [BatteryDevice],
     pub section_order: &'a [WidgetSection],
 }
 
@@ -125,6 +129,18 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
         
         if params.show_disk {
             y_pos = render_disk(&cr, &layout, y_pos);
+        }
+
+        // Battery section using Solaar data
+        if params.show_battery {
+            y_pos += 10.0; // Spacing before battery section
+            y_pos = render_battery_section(
+                &cr,
+                &layout,
+                y_pos,
+                params.battery_devices,
+                params.enable_solaar_integration,
+            );
         }
     }
     
@@ -569,6 +585,195 @@ fn render_disk(
     y
 }
 
+/// Temporary battery section placeholder until Solaar integration is implemented
+fn render_battery_section(
+    cr: &cairo::Context,
+    layout: &pango::Layout,
+    y_start: f64,
+    devices: &[BatteryDevice],
+    enable_solaar_integration: bool,
+) -> f64 {
+    let mut y = y_start;
+
+    // Section header
+    let header_font = pango::FontDescription::from_string("Ubuntu Bold 14");
+    layout.set_font_description(Some(&header_font));
+    layout.set_text("Battery");
+    cr.move_to(10.0, y);
+    pangocairo::functions::layout_path(cr, layout);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    y += 35.0;
+
+    // Simple text to indicate Solaar integration state
+    let font_desc = pango::FontDescription::from_string("Ubuntu 12");
+    layout.set_font_description(Some(&font_desc));
+
+    if !enable_solaar_integration {
+        layout.set_text("Solaar integration disabled");
+        cr.move_to(10.0, y);
+        pangocairo::functions::layout_path(cr, layout);
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+        cr.stroke_preserve().expect("Failed to stroke");
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+        y += 25.0;
+        return y;
+    }
+
+    if devices.is_empty() {
+        layout.set_text("No Solaar devices detected");
+        cr.move_to(10.0, y);
+        pangocairo::functions::layout_path(cr, layout);
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+        cr.stroke_preserve().expect("Failed to stroke");
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+        y += 25.0;
+        return y;
+    }
+
+    let icon_size = 24.0;
+
+    for device in devices {
+        // Draw device name
+        layout.set_text(&device.name);
+        cr.move_to(10.0, y);
+        pangocairo::functions::layout_path(cr, layout);
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+        cr.stroke_preserve().expect("Failed to stroke");
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+        y += 28.0;
+
+        if let Some(level) = device.level {
+            // Draw vertical battery icon
+            draw_battery_icon(cr, 10.0, y - 2.0, icon_size, level);
+
+            // Draw percentage text next to battery
+            let percentage_text = format!("{}%", level);
+            layout.set_text(&percentage_text);
+            cr.move_to(10.0 + icon_size + 8.0, y - 2.0);
+            pangocairo::functions::layout_path(cr, layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+
+            y += 38.0; // Increased spacing between devices
+        } else if device.is_loading {
+            // Show disconnected icon while loading
+            draw_disconnected_icon(cr, 10.0, y - 2.0, icon_size);
+            
+            layout.set_text("Connecting...");
+            cr.move_to(10.0 + icon_size + 8.0, y - 2.0);
+            pangocairo::functions::layout_path(cr, layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(0.7, 0.7, 0.7);
+            cr.fill().expect("Failed to fill");
+            
+            y += 38.0;
+        } else {
+            // No battery level available
+            layout.set_text("  Battery: N/A");
+            cr.move_to(10.0, y);
+            pangocairo::functions::layout_path(cr, layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+            y += 38.0; // Increased spacing between devices
+        }
+    }
+
+    y
+}
+
+/// Draw a vertical battery icon with fill level
+fn draw_battery_icon(cr: &cairo::Context, x: f64, y: f64, size: f64, level: u8) {
+    let (r, g, b) = get_battery_color(level);
+    let body_height = size;
+    let body_width = size * 0.6;
+    let terminal_height = size * 0.1;
+    let terminal_width = body_width * 0.4;
+    
+    // Battery terminal (small rectangle on top)
+    let terminal_x = x + (body_width - terminal_width) / 2.0;
+    cr.rectangle(terminal_x, y, terminal_width, terminal_height);
+    cr.set_source_rgb(0.6, 0.6, 0.6);
+    cr.fill_preserve().expect("Failed to fill");
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(1.0);
+    cr.stroke().expect("Failed to stroke");
+    
+    // Battery body (vertical rectangle)
+    let body_y = y + terminal_height;
+    cr.rectangle(x, body_y, body_width, body_height);
+    cr.set_source_rgb(0.2, 0.2, 0.2);
+    cr.fill_preserve().expect("Failed to fill");
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(1.5);
+    cr.stroke().expect("Failed to stroke");
+    
+    // Fill level indicator inside battery (from bottom up)
+    if level > 0 {
+        let fill_height = (body_height - 4.0) * (level as f64 / 100.0);
+        let fill_y = body_y + body_height - 2.0 - fill_height;
+        cr.rectangle(x + 2.0, fill_y, body_width - 4.0, fill_height);
+        cr.set_source_rgb(r, g, b);
+        cr.fill().expect("Failed to fill");
+    }
+}
+
+/// Draw a disconnected/loading icon for battery devices
+fn draw_disconnected_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
+    // Draw a battery outline in gray with a slash through it
+    let body_height = size;
+    let body_width = size * 0.6;
+    let terminal_height = size * 0.1;
+    let terminal_width = body_width * 0.4;
+    
+    // Battery terminal (gray)
+    let terminal_x = x + (body_width - terminal_width) / 2.0;
+    cr.rectangle(terminal_x, y, terminal_width, terminal_height);
+    cr.set_source_rgb(0.5, 0.5, 0.5);
+    cr.fill_preserve().expect("Failed to fill");
+    cr.set_source_rgb(0.3, 0.3, 0.3);
+    cr.set_line_width(1.0);
+    cr.stroke().expect("Failed to stroke");
+    
+    // Battery body (gray outline, no fill)
+    let body_y = y + terminal_height;
+    cr.rectangle(x, body_y, body_width, body_height);
+    cr.set_source_rgb(0.5, 0.5, 0.5);
+    cr.set_line_width(1.5);
+    cr.stroke().expect("Failed to stroke");
+    
+    // Draw diagonal slash to indicate disconnected
+    cr.move_to(x, body_y);
+    cr.line_to(x + body_width, body_y + body_height);
+    cr.set_source_rgb(0.8, 0.3, 0.3);
+    cr.set_line_width(2.0);
+    cr.stroke().expect("Failed to stroke");
+}
+
+/// Get RGB color based on battery level
+fn get_battery_color(level: u8) -> (f64, f64, f64) {
+    if level > 60 {
+        (0.0, 0.8, 0.0) // Green
+    } else if level > 30 {
+        (1.0, 0.8, 0.0) // Yellow/Orange
+    } else if level > 15 {
+        (1.0, 0.5, 0.0) // Orange
+    } else {
+        (1.0, 0.0, 0.0) // Red
+    }
+}
+
 /// Render weather section
 fn render_weather(
     cr: &cairo::Context,
@@ -671,12 +876,17 @@ fn render_storage(cr: &cairo::Context, layout: &pango::Layout, y: f64, disk_info
         cr.fill().expect("Failed to fill");
         y += 20.0; // Space between name and bar
         
-        // Draw progress bar
-        draw_progress_bar(cr, 10.0, y, bar_width, bar_height, disk.used_percentage);
+        // Draw progress bar (empty if loading, normal if ready)
+        let percentage = if disk.is_loading { 0.0 } else { disk.used_percentage };
+        draw_progress_bar(cr, 10.0, y, bar_width, bar_height, percentage);
         
         // Draw percentage if enabled
         if show_percentages {
-            let percentage_text = format!("{:.1}%", disk.used_percentage);
+            let percentage_text = if disk.is_loading {
+                "Loading...".to_string()
+            } else {
+                format!("{:.1}%", disk.used_percentage)
+            };
             layout.set_text(&percentage_text);
             cr.move_to(220.0, y);
             pangocairo::functions::layout_path(cr, layout);

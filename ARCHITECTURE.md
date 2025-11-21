@@ -128,6 +128,16 @@ MonitorWidget struct
   - Uses `lsblk -ndo NAME,VENDOR,MODEL` for hardware identification
   - Display names: "System" for /, "Home" for /home, vendor+model for external drives
   - Shows usage percentage and capacity for each drive
+  - Cached disk information loads instantly on startup with empty bars while refreshing
+- Battery: Logitech wireless device monitoring via Solaar CLI integration
+  - Shells out to `solaar show` command
+  - Parses device names from numbered lines (e.g., "1: G309 LIGHTSPEED")
+  - Extracts battery level and status from "Battery: 35%, discharging" format
+  - Identifies device kind (mouse, keyboard, headset) from "Kind: mouse" lines
+  - Color-coded vertical battery icons (green > 60%, yellow > 30%, orange > 15%, red ≤ 15%)
+  - Refreshes every 30 seconds (battery data doesn't change rapidly)
+  - Cached device information shows instantly with disconnected icon while loading
+  - Falls back gracefully if Solaar is not installed
 - Network: Placeholder (needs implementation)
 - Disk I/O: Placeholder (needs implementation)
 
@@ -152,6 +162,9 @@ Settings Window (Scrollable)
 │   └── Show Disk (toggle)
 ├── Storage Display
 │   └── Show Storage (toggle)
+├── Battery Display
+│   ├── Show Battery Section (toggle)
+│   └── Enable Solaar Integration (toggle)
 ├── Widget Display
 │   ├── Show Clock (toggle)
 │   └── Show Date (toggle)
@@ -169,14 +182,6 @@ Settings Window (Scrollable)
 ├── Layout Order
 │   ├── Section ordering with up/down arrow buttons
 │   └── Reorderable list: Utilization, Temperatures, Storage, Weather
-└── Widget Position
-    ├── X Position (text input)
-    ├── Y Position (text input)
-    └── Apply Position (button → restart widget)
-```
-├── Display Options
-│   ├── Show Percentages (toggle)
-│   └── Update Interval (text input)
 └── Widget Position
     ├── X Position (text input)
     ├── Y Position (text input)
@@ -212,6 +217,8 @@ pub struct Config {
     show_network: bool,
     show_disk: bool,
     show_storage: bool,     // Storage/disk usage monitoring
+    show_battery: bool,     // Battery section display
+    enable_solaar_integration: bool,  // Enable Solaar for battery data
     update_interval_ms: u64,
     show_percentages: bool,
     show_graphs: bool,
@@ -230,6 +237,14 @@ pub enum WidgetSection {
 ```
 
 **Storage**: `~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config`
+
+**Cache**: `~/.cache/cosmic-monitor-applet/widget_cache.json`
+- Stores disk names and mount points
+- Stores battery device names and kinds
+- Enables instant display of placeholders on startup:
+  - Disks show empty bars with "Loading..." text
+  - Battery devices show disconnected icon with "Connecting..." text
+- Updated after first successful data fetch
 
 ## Technical Challenges & Solutions
 
@@ -287,9 +302,12 @@ pub enum WidgetSection {
 
 ### System Monitoring
 - `sysinfo` 0.32 - CPU, memory, disk stats
+- `solaar` (external) - Optional CLI tool for Logitech device battery monitoring
 
-### Configuration
+### Configuration & Storage
 - `cosmic-config` (from libcosmic) - Settings persistence
+- `serde`/`serde_json` 1.0 - JSON serialization for cache
+- `dirs` 5.0 - Standard cache directory locations
 
 ## Build Targets
 
@@ -371,6 +389,8 @@ watch -n 0.5 cat ~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config
 - `src/widget/renderer.rs` - Modular rendering system (extracted from widget_main.rs)
 - `src/widget/layout.rs` - Dynamic height calculation logic
 - `src/widget/storage.rs` - Storage/disk usage monitoring with lsblk integration
+- `src/widget/battery.rs` - Battery monitoring via Solaar CLI integration
+- `src/widget/cache.rs` - Persistent cache for drives and peripherals
 - `src/widget/utilization.rs` - CPU, RAM, GPU monitoring with icon rendering
 - `src/config.rs` - Shared configuration structure
 - `src/i18n.rs` - Localization support

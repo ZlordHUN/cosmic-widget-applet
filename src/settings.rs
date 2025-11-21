@@ -46,6 +46,8 @@ pub enum Message {
     ToggleDate(bool),
     Toggle24HourTime(bool),
     TogglePercentages(bool),
+    ToggleBatterySection(bool),
+    ToggleSolaarIntegration(bool),
     UpdateInterval(String),
     UpdateX(String),
     UpdateY(String),
@@ -208,6 +210,18 @@ impl Application for SettingsApp {
                 fl!("show-percentages"),
                 widget::toggler(self.config.show_percentages).on_toggle(Message::TogglePercentages),
             ))
+            .push(widget::divider::horizontal::default())
+            .push(widget::text::heading("Battery"))
+            .push(widget::settings::item(
+                "Show battery section",
+                widget::toggler(self.config.show_battery)
+                    .on_toggle(Message::ToggleBatterySection),
+            ))
+            .push(widget::settings::item(
+                "Enable Solaar integration",
+                widget::toggler(self.config.enable_solaar_integration)
+                    .on_toggle(Message::ToggleSolaarIntegration),
+            ))
             .push(widget::settings::item(
                 fl!("update-interval"),
                 widget::text_input("", &self.interval_input).on_input(Message::UpdateInterval),
@@ -362,6 +376,14 @@ impl Application for SettingsApp {
             }
             Message::TogglePercentages(enabled) => {
                 self.config.show_percentages = enabled;
+                self.save_config();
+            }
+            Message::ToggleBatterySection(enabled) => {
+                self.config.show_battery = enabled;
+                self.save_config();
+            }
+            Message::ToggleSolaarIntegration(enabled) => {
+                self.config.enable_solaar_integration = enabled;
                 self.save_config();
             }
             Message::UpdateInterval(value) => {
