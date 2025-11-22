@@ -359,6 +359,7 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
 fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
     // Example formats:
     //   "90% (discharging)"
+    //   "55%, recharging."
     //   "charged" or "good"
 
     let mut level: Option<u8> = None;
@@ -372,7 +373,8 @@ fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
         }
         let rest = rest.trim_start_matches('%').trim();
         if !rest.is_empty() {
-            status = Some(rest.trim_matches(['(', ')']).trim().to_string());
+            // Trim commas, parentheses, and periods from the status string
+            status = Some(rest.trim_matches([',', '(', ')', '.']).trim().to_string());
         }
     } else {
         // No explicit percentage; treat the whole text as status

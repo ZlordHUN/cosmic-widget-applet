@@ -661,6 +661,8 @@ fn render_battery_section(
             cr.stroke_preserve().expect("Failed to stroke");
             cr.set_source_rgb(0.7, 0.7, 0.7);
             cr.fill().expect("Failed to fill");
+            
+            y += 38.0;
         } else if device.is_loading {
             // Device is connected but loading - show disconnected icon with "Connecting..." text
             draw_disconnected_icon(cr, 10.0, y - 2.0, icon_size);
@@ -673,12 +675,31 @@ fn render_battery_section(
             cr.stroke_preserve().expect("Failed to stroke");
             cr.set_source_rgb(0.7, 0.7, 0.7);
             cr.fill().expect("Failed to fill");
+            
+            y += 38.0;
         } else if let Some(level) = device.level {
+            // Check if device is charging (use lowercase and check for "recharging" or starts with "charging")
+            let is_charging = device.status.as_deref()
+                .map(|s| {
+                    let lower = s.to_lowercase();
+                    lower.starts_with("charging") || lower.starts_with("recharging")
+                })
+                .unwrap_or(false);
+            
             // Draw vertical battery icon
             draw_battery_icon(cr, 10.0, y - 2.0, icon_size, level);
+            
+            // If charging, draw a lightning bolt overlay
+            if is_charging {
+                draw_charging_indicator(cr, 10.0, y - 2.0, icon_size);
+            }
 
-            // Draw percentage text next to battery
-            let percentage_text = format!("{}%", level);
+            // Draw percentage text next to battery with charging indicator
+            let percentage_text = if is_charging {
+                format!("{}% ⚡", level)
+            } else {
+                format!("{}%", level)
+            };
             layout.set_text(&percentage_text);
             cr.move_to(10.0 + icon_size + 8.0, y - 2.0);
             pangocairo::functions::layout_path(cr, layout);
@@ -688,19 +709,6 @@ fn render_battery_section(
             cr.fill().expect("Failed to fill");
 
             y += 38.0; // Increased spacing between devices
-        } else if device.is_loading {
-            // Show disconnected icon while loading
-            draw_disconnected_icon(cr, 10.0, y - 2.0, icon_size);
-            
-            layout.set_text("Connecting...");
-            cr.move_to(10.0 + icon_size + 8.0, y - 2.0);
-            pangocairo::functions::layout_path(cr, layout);
-            cr.set_source_rgb(0.0, 0.0, 0.0);
-            cr.stroke_preserve().expect("Failed to stroke");
-            cr.set_source_rgb(0.7, 0.7, 0.7);
-            cr.fill().expect("Failed to fill");
-            
-            y += 38.0;
         } else {
             // No battery level available
             layout.set_text("  Battery: N/A");
@@ -783,6 +791,37 @@ fn draw_disconnected_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
     cr.set_source_rgb(0.8, 0.3, 0.3);
     cr.set_line_width(2.0);
     cr.stroke().expect("Failed to stroke");
+}
+
+/// Draw a charging indicator (lightning bolt) overlay on battery icon
+fn draw_charging_indicator(cr: &cairo::Context, x: f64, y: f64, size: f64) {
+    let body_width = size * 0.6;
+    let body_height = size;
+    let terminal_height = size * 0.1;
+    let body_y = y + terminal_height;
+    
+    // Draw lightning bolt in center of battery
+    let bolt_x = x + body_width / 2.0;
+    let bolt_y = body_y + body_height * 0.2;
+    let bolt_height = body_height * 0.6;
+    let bolt_width = body_width * 0.4;
+    
+    cr.save().expect("Failed to save");
+    cr.set_source_rgba(1.0, 1.0, 0.0, 0.9); // Yellow with slight transparency
+    cr.set_line_width(2.0);
+    
+    // Draw lightning bolt shape
+    cr.move_to(bolt_x, bolt_y);
+    cr.line_to(bolt_x - bolt_width / 3.0, bolt_y + bolt_height / 2.0);
+    cr.line_to(bolt_x, bolt_y + bolt_height / 2.0);
+    cr.line_to(bolt_x - bolt_width / 3.0, bolt_y + bolt_height);
+    cr.stroke().expect("Failed to stroke");
+    
+    cr.move_to(bolt_x, bolt_y + bolt_height / 2.0);
+    cr.line_to(bolt_x + bolt_width / 3.0, bolt_y);
+    cr.stroke().expect("Failed to stroke");
+    
+    cr.restore().expect("Failed to restore");
 }
 
 /// Get RGB color based on battery level
