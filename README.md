@@ -28,7 +28,7 @@ A borderless floating widget that displays real-time system statistics for the C
 - **System Monitoring**: Real-time CPU, memory, GPU (NVIDIA, AMD, Intel auto-detected), storage usage, network, and disk I/O statistics
 - **Multi-Vendor GPU Support**: Automatic detection and monitoring for NVIDIA (nvidia-smi), AMD (sysfs/radeontop), and Intel (sysfs/intel_gpu_top) GPUs
 - **Storage Monitoring**: Displays disk usage for system drives and external media with intelligent labeling (vendor + model names)
-- **Battery Monitoring**: Shows battery status for Logitech wireless devices via Solaar integration with color-coded vertical battery icons
+- **Battery Monitoring**: Shows battery status for Logitech wireless devices (via Solaar) and gaming headsets (via HeadsetControl) with color-coded vertical battery icons and connection status
 - **Persistent Cache**: Remembers drives and peripherals to instantly display placeholders while loading fresh data
 - **Customizable Position**: Precise X/Y positioning via settings window
 - **Configurable Display**: Toggle individual stats (CPU, RAM, GPU, clock, date, temperatures), show/hide percentage values
@@ -126,6 +126,7 @@ Trade-offs:
 - **chrono**: Date and time formatting
 - **sysinfo**: System statistics monitoring
 - **solaar**: (Optional) For battery monitoring of Logitech wireless devices
+- **headsetcontrol**: (Optional) For battery monitoring of gaming headsets (Audeze, SteelSeries, Logitech, HyperX, etc.)
 - **cosmic-config**: Configuration persistence
 - **reqwest**: HTTP client for weather API requests
 - **serde/serde_json**: JSON parsing for weather data
@@ -148,26 +149,56 @@ Weather updates every 10 minutes and displays:
 
 ## Battery Monitoring Setup
 
-To enable battery monitoring for Logitech wireless devices:
+To enable battery monitoring for wireless peripherals:
+
+### Logitech Devices (via Solaar)
 
 1. Install [Solaar](https://github.com/pwr-Solaar/Solaar) if not already installed:
    ```bash
    sudo apt install solaar  # Debian/Ubuntu
    sudo dnf install solaar  # Fedora
    ```
-2. Open Settings from the applet menu
-3. Navigate to the Battery section
-4. Enable "Show Battery Section"
-5. Enable "Enable Solaar Integration"
+
+### Gaming Headsets (via HeadsetControl)
+
+1. Install [HeadsetControl](https://github.com/Sapd/HeadsetControl) if not already installed:
+   ```bash
+   sudo apt install headsetcontrol  # Debian/Ubuntu
+   # Or build from source for latest device support
+   ```
+
+### Enable in Settings
+
+1. Open Settings from the applet menu
+2. Navigate to the Battery section
+3. Enable "Show Battery Section"
+4. Enable "Enable Solaar Integration" (monitors both Solaar and HeadsetControl)
 
 The widget will display:
-- Device names (e.g., "G309 LIGHTSPEED", "MX Mechanical Mini")
+- Device names (e.g., "G309 LIGHTSPEED", "MX Mechanical Mini", "Audeze Maxwell")
+- Device type icons based on kind (mouse, keyboard, headset)
 - Color-coded vertical battery icons (green > 60%, yellow > 30%, orange > 15%, red ≤ 15%)
 - Battery percentage next to each device
-- Disconnected icon while loading or if device is not available
+- "Disconnected" status for offline devices (e.g., mouse in sleep mode)
+- "Connecting..." status while retrieving battery data
 - Cached device information for instant display on startup
 
-Supported devices: Any Logitech wireless device that Solaar can detect (mice, keyboards, headsets, etc.)
+### Supported Devices
+
+**Logitech** (via Solaar): Any wireless device that Solaar can detect (mice, keyboards, trackballs, etc.)
+
+**Headsets** (via HeadsetControl):
+- Audeze Maxwell (PC & Xbox variants)
+- SteelSeries Arctis series (7, 9, Nova, Pro Wireless)
+- Logitech G series headsets (G533, G733, G935, PRO X, etc.)
+- HyperX Cloud series
+- Corsair VOID series
+- Roccat Elo 7.1 Air
+- And many more - see [HeadsetControl device list](https://github.com/Sapd/HeadsetControl#supported-headsets)
+
+### Managing Cached Devices
+
+The Settings app includes a device list in the Battery section where you can remove cached devices you no longer use. Each device has a trash icon button to delete it from the cache.
 
 ## Cache
 
@@ -176,7 +207,7 @@ The widget caches drive and peripheral information at:
 ~/.cache/cosmic-monitor-applet/widget_cache.json
 ```
 
-This allows the widget to instantly display disk names and battery devices on startup while loading fresh data in the background. Storage drives show empty bars with "Loading..." and battery devices show a disconnected icon with "Connecting..." until data is refreshed.
+This allows the widget to instantly display disk names and battery devices on startup while loading fresh data in the background. Storage drives show empty bars with "Loading..." and battery devices show a "Disconnected" icon until data is refreshed or device comes online.
 
 ## Development
 

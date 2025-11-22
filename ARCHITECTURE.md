@@ -181,7 +181,7 @@ Settings Window (Scrollable)
 │   └── Weather Location (text input)
 ├── Layout Order
 │   ├── Section ordering with up/down arrow buttons
-│   └── Reorderable list: Utilization, Temperatures, Storage, Weather
+│   └── Reorderable list: Utilization, Temperatures, Storage, Battery, Weather
 └── Widget Position
     ├── X Position (text input)
     ├── Y Position (text input)
@@ -302,7 +302,8 @@ pub enum WidgetSection {
 
 ### System Monitoring
 - `sysinfo` 0.32 - CPU, memory, disk stats
-- `solaar` (external) - Optional CLI tool for Logitech device battery monitoring
+- `solaar` (external) - Optional CLI tool for Logitech wireless device battery monitoring
+- `headsetcontrol` (external) - Optional CLI tool for gaming headset battery monitoring
 
 ### Configuration & Storage
 - `cosmic-config` (from libcosmic) - Settings persistence
@@ -389,7 +390,7 @@ watch -n 0.5 cat ~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config
 - `src/widget/renderer.rs` - Modular rendering system (extracted from widget_main.rs)
 - `src/widget/layout.rs` - Dynamic height calculation logic
 - `src/widget/storage.rs` - Storage/disk usage monitoring with lsblk integration
-- `src/widget/battery.rs` - Battery monitoring via Solaar CLI integration
+- `src/widget/battery.rs` - Battery monitoring via Solaar (Logitech) and HeadsetControl (headsets) CLI integration
 - `src/widget/cache.rs` - Persistent cache for drives and peripherals
 - `src/widget/utilization.rs` - CPU, RAM, GPU monitoring with icon rendering
 - `src/config.rs` - Shared configuration structure

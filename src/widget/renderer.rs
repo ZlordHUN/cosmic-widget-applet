@@ -649,7 +649,31 @@ fn render_battery_section(
         cr.fill().expect("Failed to fill");
         y += 28.0;
 
-        if let Some(level) = device.level {
+        if !device.is_connected {
+            // Device is disconnected - show disconnected icon
+            draw_disconnected_icon(cr, 10.0, y - 2.0, icon_size);
+            
+            // Draw "Disconnected" text
+            layout.set_text("Disconnected");
+            cr.move_to(10.0 + icon_size + 8.0, y - 2.0);
+            pangocairo::functions::layout_path(cr, layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(0.7, 0.7, 0.7);
+            cr.fill().expect("Failed to fill");
+        } else if device.is_loading {
+            // Device is connected but loading - show disconnected icon with "Connecting..." text
+            draw_disconnected_icon(cr, 10.0, y - 2.0, icon_size);
+            
+            // Draw "Connecting..." text
+            layout.set_text("Connecting...");
+            cr.move_to(10.0 + icon_size + 8.0, y - 2.0);
+            pangocairo::functions::layout_path(cr, layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(0.7, 0.7, 0.7);
+            cr.fill().expect("Failed to fill");
+        } else if let Some(level) = device.level {
             // Draw vertical battery icon
             draw_battery_icon(cr, 10.0, y - 2.0, icon_size, level);
 

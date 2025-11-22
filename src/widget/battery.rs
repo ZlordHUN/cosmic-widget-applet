@@ -23,6 +23,8 @@ pub struct BatteryDevice {
     pub kind: Option<String>,
     /// True if showing cached data while loading
     pub is_loading: bool,
+    /// True if device is currently connected (Device path != None)
+    pub is_connected: bool,
 }
 
 /// Simple battery monitor that periodically queries Solaar
@@ -48,7 +50,8 @@ impl BatteryMonitor {
                 level: None,
                 status: None,
                 kind: d.kind.clone(),
-                is_loading: true,
+                is_loading: false,
+                is_connected: false,
             })
             .collect();
             
@@ -98,30 +101,45 @@ impl BatteryMonitor {
     }
 }
 
-/// Invoke the `solaar` CLI and parse battery information.
-///
-/// We first try a JSON-based invocation; if that is unavailable, we
-/// fall back to parsing the plain-text `solaar show` output.
+/// Invoke the `solaar` CLI and parse battery information, plus HeadsetControl for headsets
 fn query_solaar() -> Result<Vec<BatteryDevice>, String> {
+    let mut all_devices = Vec::new();
+    
+    // Query Solaar for Logitech devices
     // Try JSON output if available (newer Solaar versions)
     if let Ok(output) = Command::new("solaar").arg("show").arg("--json").output() {
         if output.status.success() {
             if let Ok(text) = String::from_utf8(output.stdout) {
                 if let Ok(devices) = parse_solaar_json(&text) {
-                    return Ok(devices);
+                    all_devices.extend(devices);
                 }
             }
         }
     }
 
-    // Fallback: plain-text `solaar show`
-    let output = Command::new("solaar").arg("show").output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(format!("solaar exited with status: {:?}", output.status.code()));
+    // Fallback: plain-text `solaar show` if JSON didn't give us devices
+    if all_devices.is_empty() {
+        if let Ok(output) = Command::new("solaar").arg("show").output() {
+            if output.status.success() {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    all_devices.extend(parse_solaar_text(&text));
+                }
+            }
+        }
     }
-
-    let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    Ok(parse_solaar_text(&text))
+    
+    // Query HeadsetControl for headset devices
+    if let Ok(output) = Command::new("headsetcontrol").arg("-b").arg("-o").arg("json").output() {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                if let Ok(headset_devices) = parse_headsetcontrol_json(&text) {
+                    all_devices.extend(headset_devices);
+                }
+            }
+        }
+    }
+    
+    Ok(all_devices)
 }
 
 /// Parse a very small subset of Solaar's JSON output.
@@ -180,7 +198,7 @@ fn extract_device_from_json(value: &serde_json::Value) -> Option<BatteryDevice> 
         (None, None)
     };
 
-    Some(BatteryDevice { name, level, status, kind, is_loading: false })
+    Some(BatteryDevice { name, level, status, kind, is_loading: false, is_connected: true })
 }
 
 fn extract_battery_fields(value: &serde_json::Value) -> (Option<u8>, Option<String>) {
@@ -196,6 +214,66 @@ fn extract_battery_fields(value: &serde_json::Value) -> (Option<u8>, Option<Stri
         .map(|s| s.to_string());
 
     (level, status)
+}
+
+/// Parse HeadsetControl JSON output
+fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    
+    let mut devices = Vec::new();
+    
+    if let Some(device_list) = value.get("devices").and_then(|v| v.as_array()) {
+        for device_obj in device_list {
+            // Check if device query was successful
+            if let Some(status) = device_obj.get("status").and_then(|v| v.as_str()) {
+                if status != "success" {
+                    continue;
+                }
+            }
+            
+            // Extract device name
+            let name = device_obj
+                .get("device")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown Headset")
+                .to_string();
+            
+            // All headsets are kind "headset"
+            let kind = Some("headset".to_string());
+            
+            // Extract battery information
+            let (level, battery_status) = if let Some(battery) = device_obj.get("battery") {
+                let status = battery.get("status").and_then(|v| v.as_str());
+                let level = battery.get("level").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok());
+                
+                let is_available = status == Some("BATTERY_AVAILABLE");
+                let status_text = if is_available {
+                    Some("available".to_string())
+                } else {
+                    Some("unavailable".to_string())
+                };
+                
+                (level, status_text)
+            } else {
+                (None, None)
+            };
+            
+            // HeadsetControl doesn't provide device path info, so we assume connected if we got data
+            let is_connected = true;
+            let is_loading = is_connected && level.is_none();
+            
+            devices.push(BatteryDevice {
+                name,
+                level,
+                status: battery_status,
+                kind,
+                is_loading,
+                is_connected,
+            });
+        }
+    }
+    
+    Ok(devices)
 }
 
 /// Very small text parser for `solaar show` plain-text output.
@@ -260,6 +338,7 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
                             status,
                             kind: current_kind.clone(),
                             is_loading: false,
+                            is_connected: true,
                         });
                     }
                 }
