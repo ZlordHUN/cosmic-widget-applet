@@ -31,6 +31,7 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 log = "0.4"
 env_logger = "0.11"
 dirs = "5.0"
+zbus = "4.0"
 
 # Wayland layer-shell dependencies for widget
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }

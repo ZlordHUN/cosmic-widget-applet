@@ -20,7 +20,8 @@ A borderless floating widget that displays real-time system statistics for the C
 - **Borderless Widget**: Floating overlay widget using Wayland layer-shell protocol (no window borders!)
 - **Dynamic Sizing**: Widget automatically adjusts height based on enabled features
 - **Clock Display**: Large time display with 12/24-hour format toggle and date with Conky-style text outlines (toggleable)
-- **Weather Integration**: Real-time weather data with dynamic icons (sun, moon, clouds, rain, snow, fog, thunderstorm) from OpenWeatherMap API
+- **Weather Integration**: Real-time weather data with dynamic icons (sun, moon, clouds, rain, snow, fog, thunderstorm) from OpenWeatherMap API with day/night variants for all conditions
+- **Notification Monitor**: Real-time desktop notification capture via D-Bus with smart grouping by application, expand/collapse groups, and visual containers
 - **Temperature Monitoring**: Individual CPU and GPU temperature displays with sensor detection
 - **Circular Temperature Gauges**: Color-changing hollow rings for temperature visualization (switchable to text mode)
 - **Transparent Background**: Fully transparent widget background for seamless desktop integration
@@ -28,10 +29,10 @@ A borderless floating widget that displays real-time system statistics for the C
 - **System Monitoring**: Real-time CPU, memory, GPU (NVIDIA, AMD, Intel auto-detected), storage usage, network, and disk I/O statistics
 - **Multi-Vendor GPU Support**: Automatic detection and monitoring for NVIDIA (nvidia-smi), AMD (sysfs/radeontop), and Intel (sysfs/intel_gpu_top) GPUs
 - **Storage Monitoring**: Displays disk usage for system drives and external media with intelligent labeling (vendor + model names)
-- **Battery Monitoring**: Shows battery status for Logitech wireless devices (via Solaar) and gaming headsets (via HeadsetControl) with color-coded vertical battery icons and connection status
+- **Battery Monitoring**: Shows battery status for Logitech wireless devices (via Solaar) and gaming headsets (via HeadsetControl) with color-coded vertical battery icons, connection status, and immediate startup rendering
 - **Persistent Cache**: Remembers drives and peripherals to instantly display placeholders while loading fresh data
 - **Customizable Position**: Precise X/Y positioning via settings window
-- **Configurable Display**: Toggle individual stats (CPU, RAM, GPU, clock, date, temperatures), show/hide percentage values
+- **Configurable Display**: Toggle individual stats (CPU, RAM, GPU, clock, date, temperatures, notifications), show/hide percentage values
 - **Native COSMIC Integration**: Built with libcosmic and follows COSMIC design patterns
 
 ## Architecture
@@ -100,8 +101,9 @@ Available options:
 - **Battery Display**: Toggle battery section and enable Solaar integration for Logitech wireless devices
 - **Temperature Display**: Toggle CPU and GPU temperature monitoring independently, switch between circular gauges and text display
 - **Widget Display**: Toggle clock (12/24-hour format) and date displays independently
-- **Weather Display**: Toggle weather information, configure OpenWeatherMap API key and location
-- **Layout Order**: Customize the order in which sections appear in the widget (Utilization, Temperatures, Storage, Weather)
+- **Weather Display**: Toggle weather information, configure OpenWeatherMap API key and location (includes day/night icon variants)
+- **Notification Display**: Toggle notification monitoring with grouped display by application
+- **Layout Order**: Customize the order in which sections appear in the widget (Utilization, Temperatures, Storage, Battery, Weather, Notifications)
 - **Display Options**: Show/hide percentage values next to progress bars
 - **Update Interval**: 100-10000ms refresh rate
 - **Widget Position**: Precise X/Y coordinates, auto-start widget on login toggle
@@ -125,6 +127,7 @@ Trade-offs:
 - **cairo-rs/pango**: Custom widget rendering with text outlines
 - **chrono**: Date and time formatting
 - **sysinfo**: System statistics monitoring
+- **busctl**: System tool for D-Bus monitoring (notification capture)
 - **solaar**: (Optional) For battery monitoring of Logitech wireless devices
 - **headsetcontrol**: (Optional) For battery monitoring of gaming headsets (Audeze, SteelSeries, Logitech, HyperX, etc.)
 - **cosmic-config**: Configuration persistence
@@ -145,7 +148,14 @@ Weather updates every 10 minutes and displays:
 - Current temperature
 - Weather description
 - Location name
-- Dynamic icon based on conditions (clear sky, clouds, rain, snow, fog, thunderstorm) with day/night variants
+- Dynamic icon based on conditions with full day/night variants:
+  - Clear sky: ☀ (day) / 🌙 (night)
+  - Few clouds: 🌤 (day) / 🌙☁ (night)
+  - Scattered clouds: ☁ (day) / ☁🌙 (night)
+  - Rain: 🌦 (day) / 🌧🌙 (night)
+  - Thunderstorm: ⛈ (day) / ⛈🌙 (night)
+  - Snow: ❄ (day) / ❄🌙 (night)
+  - Fog: 🌫 (day) / 🌫🌙 (night)
 
 ## Battery Monitoring Setup
 
@@ -199,6 +209,37 @@ The widget will display:
 ### Managing Cached Devices
 
 The Settings app includes a device list in the Battery section where you can remove cached devices you no longer use. Each device has a trash icon button to delete it from the cache.
+
+## Notification Monitoring
+
+The widget can monitor and display desktop notifications in real-time:
+
+### Features
+
+- **Real-time Capture**: Monitors D-Bus for all desktop notifications via `busctl`
+- **Smart Grouping**: Automatically groups notifications by application (e.g., all Instagram notifications together)
+- **Expand/Collapse**: Click on a group header to toggle between collapsed (▶) and expanded (▼) views
+- **Visual Containers**: Each notification group has a semi-transparent background with border for clear separation
+- **Recent First**: Groups are sorted by most recent notification
+- **Notification Details**: Shows app name, summary, and body text (truncated if too long)
+- **Persistent Display**: Keeps up to 5 notifications visible at once
+- **Clear Action**: Right-click anywhere in the notifications section to clear all
+
+### Enabling Notifications
+
+1. Open Settings from the applet menu
+2. Navigate to the Notifications section
+3. Enable "Show Notifications"
+4. Notifications will appear automatically as they arrive
+
+### Using Notification Groups
+
+- **Collapsed groups** show: "▶ AppName (count)"
+- **Expanded groups** show: "▼ AppName (count)" with individual notification details
+- **Left-click** a group header to toggle expand/collapse
+- **Right-click** anywhere in the notifications section to clear all notifications
+
+The grouping feature is especially useful when receiving multiple notifications from the same application, as it keeps the widget compact while still showing all information when needed.
 
 ## Cache
 

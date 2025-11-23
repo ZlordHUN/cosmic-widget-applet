@@ -217,14 +217,14 @@ pub fn draw_weather_icon(cr: &cairo::Context, x: f64, y: f64, size: f64, icon_co
     // Use emoji/unicode symbols for clear, visible icons
     let icon_text = match condition {
         "01" => if is_day { "☀" } else { "🌙" },      // Clear sky - sun or moon
-        "02" => if is_day { "🌤" } else { "☁" },      // Few clouds - sun behind cloud or cloud
-        "03" => "☁",                                   // Scattered clouds
-        "04" => "☁",                                   // Broken/overcast clouds
-        "09" => "🌧",                                  // Shower rain
-        "10" => if is_day { "🌦" } else { "🌧" },     // Rain - sun with rain or just rain
-        "11" => "⛈",                                  // Thunderstorm
-        "13" => "❄",                                   // Snow
-        "50" => "🌫",                                  // Mist/fog
+        "02" => if is_day { "🌤" } else { "🌙☁" },    // Few clouds - sun/moon with cloud
+        "03" => if is_day { "☁" } else { "☁🌙" },     // Scattered clouds - cloud with moon at night
+        "04" => "☁",                                   // Broken/overcast clouds (same day/night)
+        "09" => if is_day { "🌧" } else { "🌧🌙" },   // Shower rain - with moon at night
+        "10" => if is_day { "🌦" } else { "🌧🌙" },   // Rain - sun/moon with rain
+        "11" => if is_day { "⛈" } else { "⛈🌙" },    // Thunderstorm - with moon at night
+        "13" => if is_day { "❄" } else { "❄🌙" },     // Snow - with moon at night
+        "50" => if is_day { "🌫" } else { "🌫🌙" },   // Mist/fog - with moon at night
         _ => "☁",                                      // Default to cloud
     };
     

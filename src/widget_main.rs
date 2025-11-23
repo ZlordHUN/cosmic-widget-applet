@@ -7,9 +7,9 @@ mod config;
 mod widget;
 
 use config::Config;
-use widget::{UtilizationMonitor, TemperatureMonitor, NetworkMonitor, WeatherMonitor, StorageMonitor, BatteryMonitor};
+use widget::{UtilizationMonitor, TemperatureMonitor, NetworkMonitor, WeatherMonitor, StorageMonitor, BatteryMonitor, NotificationMonitor};
 use widget::renderer::{render_widget, RenderParams};
-use widget::layout::calculate_widget_height_with_batteries;
+use widget::layout::calculate_widget_height_with_all;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,7 @@ struct MonitorWidget {
     weather: WeatherMonitor,
     storage: StorageMonitor,
     battery: BatteryMonitor,
+    notifications: NotificationMonitor,
     last_update: Instant,
     
     /// Memory pool for rendering
@@ -72,10 +73,34 @@ struct MonitorWidget {
     /// Track last widget height for resizing
     last_height: u32,
     
+    /// Track last drawn second to synchronize clock updates
+    last_drawn_second: Option<String>,
+    
     /// Mouse dragging state
     dragging: bool,
     drag_start_x: f64,
     drag_start_y: f64,
+    
+    /// Notification section bounds (y_start, y_end)
+    notification_bounds: Option<(f64, f64)>,
+    
+    /// Group bounds for notifications [(app_name, y_start, y_end)]
+    notification_group_bounds: Vec<(String, f64, f64)>,
+    
+    /// Clear button bounds for each group [(app_name, x_start, y_start, x_end, y_end)]
+    notification_clear_bounds: Vec<(String, f64, f64, f64, f64)>,
+    
+    /// Clear all button bounds (x_start, y_start, x_end, y_end)
+    clear_all_bounds: Option<(f64, f64, f64, f64)>,
+    
+    /// Collapsed notification groups (app names)
+    collapsed_groups: std::collections::HashSet<String>,
+    
+    /// Force redraw flag (set when notifications are cleared)
+    force_redraw: bool,
+    
+    /// Last click timestamp to debounce rapid clicks
+    last_click_time: std::time::Instant,
     
     /// Exit flag
     exit: bool,
@@ -109,7 +134,7 @@ impl CompositorHandler for MonitorWidget {
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.draw(qh);
+        self.draw(qh, chrono::Local::now());
     }
 
     fn surface_enter(
@@ -182,7 +207,7 @@ impl LayerShellHandler for MonitorWidget {
         if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
             // Use our default size
         }
-        self.draw(qh);
+        self.draw(qh, chrono::Local::now());
     }
 }
 
@@ -210,24 +235,104 @@ impl PointerHandler for MonitorWidget {
         _pointer: &wayland_client::protocol::wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        // Layer-shell surfaces in COSMIC can't be interactively moved by users
-        // Position is controlled via config file (widget_x, widget_y)
-        // This handler is here for potential future use
-        if !self.config.widget_movable {
-            return;
-        }
-
         for event in events {
             match event.kind {
-                PointerEventKind::Press { button, .. } if button == 0x110 => {
+                // Left-click (button 0x110) to toggle notification groups or clear
+                PointerEventKind::Press { button, .. } if button == 0x110 && !self.config.widget_movable => {
+                    // Debounce clicks - ignore if less than 200ms since last click
+                    let now = Instant::now();
+                    if now.duration_since(self.last_click_time).as_millis() < 200 {
+                        log::debug!("Ignoring rapid click (debounced)");
+                        continue;
+                    }
+                    self.last_click_time = now;
+                    
+                    let click_x = event.position.0;
+                    let click_y = event.position.1;
+                    
+                    log::debug!("Click at ({}, {})", click_x, click_y);
+                    
+                    let mut handled = false;
+                    
+                    // Check if clicking "Clear All" button
+                    if let Some((x_start, y_start, x_end, y_end)) = self.clear_all_bounds {
+                        if click_x >= x_start && click_x <= x_end && click_y >= y_start && click_y <= y_end {
+                            log::info!("Clear All button clicked at ({}, {})", click_x, click_y);
+                            self.notifications.clear();
+                            self.collapsed_groups.clear();
+                            self.force_redraw = true;
+                            handled = true;
+                        }
+                    }
+                    
+                    // Check if clicking a group's clear button
+                    if !handled {
+                        for (app_name, x_start, y_start, x_end, y_end) in &self.notification_clear_bounds {
+                            log::trace!("Checking X button for {}: ({}-{}, {}-{})", app_name, x_start, x_end, y_start, y_end);
+                            if click_x >= *x_start && click_x <= *x_end && click_y >= *y_start && click_y <= *y_end {
+                                log::info!("Clearing notification group: {} at ({}, {})", app_name, click_x, click_y);
+                                self.notifications.clear_app(app_name);
+                                self.collapsed_groups.remove(app_name);
+                                self.force_redraw = true;
+                                handled = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Check if clicking a notification group header (to toggle)
+                    if !handled {
+                        for (app_name, y_start, y_end) in &self.notification_group_bounds {
+                            log::trace!("Checking group header for {}: {}-{}", app_name, y_start, y_end);
+                            if click_y >= *y_start && click_y <= *y_end {
+                                // Make sure we're not clicking the X button area
+                                // X button is at x=340, with radius 7, so roughly 333-347
+                                if click_x < 333.0 {
+                                    log::info!("Toggling notification group: {} at ({}, {})", app_name, click_x, click_y);
+                                    if self.collapsed_groups.contains(app_name) {
+                                        self.collapsed_groups.remove(app_name);
+                                    } else {
+                                        self.collapsed_groups.insert(app_name.clone());
+                                    }
+                                    self.force_redraw = true;
+                                    handled = true;
+                                    break;
+                                } else {
+                                    log::debug!("Click in X button area (x={:.1}), not toggling", click_x);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if handled {
+                        log::debug!("Notification action handled, forcing redraw");
+                    } else {
+                        log::debug!("Click at ({:.1}, {:.1}) not handled by any notification element", click_x, click_y);
+                    }
+                }
+                // Right-click (button 0x111) to clear notifications
+                PointerEventKind::Press { button, .. } if button == 0x111 => {
+                    if let Some((y_start, y_end)) = self.notification_bounds {
+                        let click_y = event.position.1;
+                        if click_y >= y_start && click_y <= y_end {
+                            log::info!("Right-click on notifications section, clearing");
+                            self.notifications.clear();
+                            self.collapsed_groups.clear();
+                            // Set flag to force redraw on next frame
+                            self.force_redraw = true;
+                        }
+                    }
+                }
+                // Widget movement (only if enabled)
+                PointerEventKind::Press { button, .. } if button == 0x110 && self.config.widget_movable => {
                     self.dragging = true;
                     self.drag_start_x = event.position.0;
                     self.drag_start_y = event.position.1;
                 }
-                PointerEventKind::Release { button, .. } if button == 0x110 => {
+                PointerEventKind::Release { button, .. } if button == 0x110 && self.config.widget_movable => {
                     self.dragging = false;
                 }
-                PointerEventKind::Motion { .. } if self.dragging => {
+                PointerEventKind::Motion { .. } if self.dragging && self.config.widget_movable => {
                     let delta_x = (event.position.0 - self.drag_start_x) as i32;
                     let delta_y = (event.position.1 - self.drag_start_y) as i32;
                     
@@ -295,12 +400,21 @@ impl MonitorWidget {
             weather: WeatherMonitor::new(weather_api_key, weather_location),
             storage: StorageMonitor::new(),
             battery: BatteryMonitor::new(),
+            notifications: NotificationMonitor::new(5), // Keep last 5 notifications
             last_update: Instant::now(),
             pool: None,
             last_height: WIDGET_HEIGHT,
+            last_drawn_second: None,
             dragging: false,
             drag_start_x: 0.0,
             drag_start_y: 0.0,
+            notification_bounds: None,
+            notification_group_bounds: Vec::new(),
+            notification_clear_bounds: Vec::new(),
+            clear_all_bounds: None,
+            collapsed_groups: std::collections::HashSet::new(),
+            force_redraw: false,
+            last_click_time: Instant::now(),
             exit: false,
         }
     }
@@ -381,7 +495,7 @@ impl MonitorWidget {
         log::trace!("System stats update complete");
     }
 
-    fn draw(&mut self, _qh: &QueueHandle<Self>) {
+    fn draw(&mut self, _qh: &QueueHandle<Self>, current_time: chrono::DateTime<chrono::Local>) {
         let layer_surface = match &self.layer_surface {
             Some(ls) => ls.clone(),
             None => {
@@ -395,8 +509,9 @@ impl MonitorWidget {
         // Calculate dynamic height based on enabled components
         let disk_count = if self.config.show_storage { self.storage.disk_info.len() } else { 0 };
         let battery_count = if self.config.show_battery { self.battery.devices().len() } else { 0 };
+        let notification_count = if self.config.show_notifications { self.notifications.get_notifications().len() } else { 0 };
         let width = WIDGET_WIDTH as i32;
-        let height = calculate_widget_height_with_batteries(&self.config, disk_count, battery_count) as i32;
+        let height = calculate_widget_height_with_all(&self.config, disk_count, battery_count, notification_count) as i32;
         let stride = width * 4;
 
         log::trace!("Drawing widget: {}x{} (disks: {})", width, height, disk_count);
@@ -454,6 +569,9 @@ impl MonitorWidget {
 
         // Snapshot battery devices for this frame
         let battery_devices = self.battery.devices();
+        
+        // Get notifications
+        let notifications = self.notifications.get_notifications();
 
         let pool = self.pool.as_mut().unwrap();
 
@@ -487,6 +605,7 @@ impl MonitorWidget {
             use_circular_temp_display,
             show_weather,
             show_battery,
+            show_notifications: self.config.show_notifications,
             enable_solaar_integration,
             weather_temp,
             weather_desc,
@@ -494,17 +613,34 @@ impl MonitorWidget {
             weather_icon,
             disk_info: &self.storage.disk_info,
             battery_devices: &battery_devices,
+            notifications: &notifications,
+            collapsed_groups: &self.collapsed_groups,
             section_order: &self.config.section_order,
+            current_time,
         };
         
         // Wrap rendering in panic catch to prevent crashes
         let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            render_widget(canvas, params);
+            render_widget(canvas, params)
         }));
         
-        if let Err(e) = render_result {
-            log::error!("Panic occurred during rendering: {:?}", e);
-            return; // Skip this frame
+        match render_result {
+            Ok((bounds, groups, clear_bounds, clear_all)) => {
+                let group_count = groups.len();
+                self.notification_bounds = bounds;
+                self.notification_group_bounds = groups;
+                self.notification_clear_bounds = clear_bounds;
+                self.clear_all_bounds = clear_all;
+                log::trace!("Render successful, {} notification groups", group_count);
+            }
+            Err(e) => {
+                log::error!("Panic occurred during rendering: {:?}", e);
+                // Clear potentially corrupted state
+                self.notification_group_bounds.clear();
+                self.notification_clear_bounds.clear();
+                self.clear_all_bounds = None;
+                return; // Skip this frame
+            }
         }
 
         // Attach the buffer to the surface
@@ -571,6 +707,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     log::info!("Widget starting with position: X={}, Y={}", base_config.widget_x, base_config.widget_y);
     log::info!("Weather enabled: {}, API key set: {}", base_config.show_weather, !base_config.weather_api_key.is_empty());
+    log::info!("Notifications enabled: {}, section_order: {:?}", base_config.show_notifications, base_config.section_order);
 
     // RECONNECT LOOP - cycle through backoff intervals
     let mut backoff_secs = [1_u64, 2, 5, 10, 20, 30].into_iter().cycle();
@@ -600,18 +737,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         log::info!("Widget initialized, entering main loop");
 
-        let mut last_draw = Instant::now();
         let mut last_heartbeat = Instant::now();
 
         // INNER LOOP - one Wayland session
         'session: loop {
             let now = Instant::now();
             
-            // Redraw every second for clock updates
-            if now.duration_since(last_draw).as_secs() >= 1 {
-                log::trace!("Redrawing widget");
-                widget.draw(&qh);
-                last_draw = now;
+            // First dispatch any pending events without blocking
+            log::trace!("Dispatching events");
+            if let Err(e) = event_queue.dispatch_pending(&mut widget) {
+                log::error!("Error dispatching events: {}", e);
+                
+                // Check for broken pipe in error message - reconnect if so
+                let error_str = e.to_string();
+                if error_str.contains("Broken pipe") || error_str.contains("os error 32") {
+                    log::warn!("Broken pipe during dispatch → reconnecting");
+                    break 'session;
+                }
+                
+                return Err(e.into());
+            }
+            log::trace!("Events dispatched");
+            
+            // Redraw when the clock second changes (synchronized with system time)
+            let current_time = chrono::Local::now();
+            
+            // Subtract 1 second from the time we display to match system clock behavior
+            // System clocks typically show the "current" second only after it's mostly elapsed
+            let display_time = current_time - chrono::Duration::seconds(1);
+            let current_second = display_time.format("%S").to_string();
+            
+            // Immediate redraw for notification interactions (independent of clock)
+            if widget.force_redraw {
+                widget.draw(&qh, display_time);
+                widget.force_redraw = false;
+                log::debug!("Immediate notification redraw triggered");
+            }
+            
+            // Check if the second has changed since last draw for regular updates
+            let should_redraw = if let Some(ref last_sec) = widget.last_drawn_second {
+                &current_second != last_sec
+            } else {
+                true // First draw
+            };
+            
+            if should_redraw {
+                widget.draw(&qh, display_time);
+                widget.last_drawn_second = Some(current_second);
             }
             
             // Check for config updates every 500ms
@@ -637,28 +809,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         
                         widget.config = Arc::new(new_config);
                         // Force a redraw
-                        widget.draw(&qh);
-                        last_draw = now; // Reset draw timer since we just drew
+                        widget.draw(&qh, chrono::Local::now());
                     }
                 }
             }
 
-            // First dispatch any pending events without blocking
-            log::trace!("Dispatching events");
-            if let Err(e) = event_queue.dispatch_pending(&mut widget) {
-                log::error!("Error dispatching events: {}", e);
-                
-                // Check for broken pipe in error message - reconnect if so
-                let error_str = e.to_string();
-                if error_str.contains("Broken pipe") || error_str.contains("os error 32") {
-                    log::warn!("Broken pipe during dispatch → reconnecting");
-                    break 'session;
-                }
-                
-                return Err(e.into());
-            }
-            log::trace!("Events dispatched");
-            
             // Aggressive heartbeat: force a roundtrip every 5 seconds to keep compositor connection alive
             // This actually waits for the compositor response, proving the connection works
             if now.duration_since(last_heartbeat) >= Duration::from_secs(5) {

@@ -73,6 +73,8 @@ pub struct SettingsApp {
     weather_api_key_input: String,
     /// Temporary state for weather location
     weather_location_input: String,
+    /// Temporary state for max notifications input
+    max_notifications_input: String,
     /// Cached battery devices
     cached_devices: Vec<CachedBatteryDevice>,
 }
@@ -97,6 +99,8 @@ pub enum Message {
     ToggleBatterySection(bool),
     ToggleSolaarIntegration(bool),
     RemoveCachedDevice(usize),
+    ToggleNotifications(bool),
+    UpdateMaxNotifications(String),
     UpdateInterval(String),
     UpdateX(String),
     UpdateY(String),
@@ -177,6 +181,12 @@ impl Application for SettingsApp {
             }
         }
 
+        // Migrate old configs: add Notifications to section_order if missing
+        if !config.section_order.iter().any(|s| matches!(s, WidgetSection::Notifications)) {
+            // Add at the end
+            config.section_order.push(WidgetSection::Notifications);
+        }
+
         // Enable widget movement when settings window is open
         config.widget_movable = true;
         if let Some(ref handler) = config_handler {
@@ -188,6 +198,7 @@ impl Application for SettingsApp {
         let y_input = format!("{}", config.widget_y);
         let weather_api_key_input = config.weather_api_key.clone();
         let weather_location_input = config.weather_location.clone();
+        let max_notifications_input = config.max_notifications.to_string();
         
         // Load cached battery devices
         let cache = WidgetCache::load();
@@ -202,6 +213,7 @@ impl Application for SettingsApp {
             y_input,
             weather_api_key_input,
             weather_location_input,
+            max_notifications_input,
             cached_devices,
         };
 
@@ -333,6 +345,18 @@ impl Application for SettingsApp {
                 fl!("weather-location"),
                 widget::text_input("", &self.weather_location_input)
                     .on_input(Message::UpdateWeatherLocation),
+            ))
+            .push(widget::divider::horizontal::default())
+            .push(widget::text::heading("Notifications"))
+            .push(widget::settings::item(
+                "Show Notifications",
+                widget::toggler(self.config.show_notifications)
+                    .on_toggle(Message::ToggleNotifications),
+            ))
+            .push(widget::settings::item(
+                "Max Notifications",
+                widget::text_input("", &self.max_notifications_input)
+                    .on_input(Message::UpdateMaxNotifications),
             ))
             .push(widget::divider::horizontal::default())
             .push(widget::text::heading(fl!("layout-order")))
@@ -485,6 +509,18 @@ impl Application for SettingsApp {
                     let mut cache = WidgetCache::load();
                     cache.battery_devices = self.cached_devices.clone();
                     cache.save();
+                }
+            }
+            Message::ToggleNotifications(enabled) => {
+                self.config.show_notifications = enabled;
+                self.save_config();
+            }
+            Message::UpdateMaxNotifications(value) => {
+                if let Ok(max) = value.parse::<usize>() {
+                    if max > 0 && max <= 20 {
+                        self.config.max_notifications = max;
+                        self.save_config();
+                    }
                 }
             }
             Message::UpdateInterval(value) => {

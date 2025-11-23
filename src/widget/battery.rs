@@ -59,7 +59,7 @@ impl BatteryMonitor {
             .collect();
         
         let devices = Arc::new(Mutex::new(cached_devices));
-        let update_requested = Arc::new(Mutex::new(false));
+        let update_requested = Arc::new(Mutex::new(true)); // Request initial update immediately
         
         // Spawn background thread for battery updates
         let devices_clone = Arc::clone(&devices);
@@ -67,6 +67,26 @@ impl BatteryMonitor {
         
         std::thread::spawn(move || {
             let mut is_first_update = true;
+            
+            // Perform immediate first update on startup
+            match query_solaar() {
+                Ok(new_devices) => {
+                    *devices_clone.lock().unwrap() = new_devices.clone();
+                    
+                    // Update cache after first successful update
+                    if is_first_update && !new_devices.is_empty() {
+                        let mut cache = super::cache::WidgetCache::load();
+                        cache.update_battery_devices(&new_devices);
+                        is_first_update = false;
+                    }
+                }
+                Err(_) => {
+                    // On error, keep cached data
+                }
+            }
+            
+            // Clear the initial update request flag
+            *update_requested_clone.lock().unwrap() = false;
             
             loop {
                 std::thread::sleep(Duration::from_secs(5));

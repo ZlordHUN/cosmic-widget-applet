@@ -11,6 +11,7 @@ pub enum WidgetSection {
     Storage,
     Battery,
     Weather,
+    Notifications,
 }
 
 impl WidgetSection {
@@ -21,6 +22,7 @@ impl WidgetSection {
             WidgetSection::Storage => "Storage",
             WidgetSection::Battery => "Battery",
             WidgetSection::Weather => "Weather",
+            WidgetSection::Notifications => "Notifications",
         }
     }
 }
@@ -76,6 +78,10 @@ pub struct Config {
     pub show_battery: bool,
     /// Enable Solaar integration for battery data
     pub enable_solaar_integration: bool,
+    /// Show notifications section
+    pub show_notifications: bool,
+    /// Maximum number of notifications to display
+    pub max_notifications: usize,
 }
 
 impl Default for Config {
@@ -107,10 +113,13 @@ impl Default for Config {
                 WidgetSection::Storage,
                 WidgetSection::Battery,
                 WidgetSection::Weather,
+                WidgetSection::Notifications,
             ],
             widget_autostart: true,
             show_battery: false,
             enable_solaar_integration: false,
+            show_notifications: false,
+            max_notifications: 5,
         }
     }
 }

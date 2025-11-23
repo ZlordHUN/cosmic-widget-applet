@@ -66,7 +66,14 @@ MonitorWidget struct
 │   └── layer_surface (the actual surface)
 └── Application state
     ├── config (Arc<Config>)
-    ├── sys (System from sysinfo)
+    ├── utilization (CPU, RAM, GPU)
+    ├── temperature (CPU, GPU)
+    ├── network (rx/tx rates)
+    ├── weather (API integration)
+    ├── storage (disk usage)
+    ├── battery (Solaar + HeadsetControl)
+    ├── notifications (D-Bus monitoring)
+    ├── collapsed_groups (notification UI state)
     ├── last_update (for timing)
     └── last_config_check (for polling)
 ```
@@ -129,15 +136,28 @@ MonitorWidget struct
   - Display names: "System" for /, "Home" for /home, vendor+model for external drives
   - Shows usage percentage and capacity for each drive
   - Cached disk information loads instantly on startup with empty bars while refreshing
-- Battery: Logitech wireless device monitoring via Solaar CLI integration
-  - Shells out to `solaar show` command
-  - Parses device names from numbered lines (e.g., "1: G309 LIGHTSPEED")
-  - Extracts battery level and status from "Battery: 35%, discharging" format
-  - Identifies device kind (mouse, keyboard, headset) from "Kind: mouse" lines
+- Battery: Logitech wireless device monitoring via Solaar CLI + gaming headset monitoring via HeadsetControl
+  - Shells out to `solaar show` and `headsetcontrol -b -o json` commands
+  - Parses device names, battery levels, and device kinds (mouse, keyboard, headset)
   - Color-coded vertical battery icons (green > 60%, yellow > 30%, orange > 15%, red ≤ 15%)
+  - Shows connection status (connected/disconnected/connecting)
   - Refreshes every 30 seconds (battery data doesn't change rapidly)
+  - Background thread fetches data immediately on startup for instant rendering
   - Cached device information shows instantly with disconnected icon while loading
-  - Falls back gracefully if Solaar is not installed
+  - Falls back gracefully if Solaar or HeadsetControl is not installed
+- Notifications: Desktop notification monitoring via D-Bus
+  - Uses `busctl monitor` to capture org.freedesktop.Notifications.Notify calls
+  - Parses app_name, summary, and body from D-Bus messages
+  - Groups notifications by application name with expand/collapse UI
+  - Keeps up to 5 most recent notifications in memory
+  - Background thread continuously monitors D-Bus in separate process
+  - Visual grouping with semi-transparent containers and borders
+  - Click group headers to toggle, right-click to clear all
+- Weather: OpenWeatherMap API integration
+  - Fetches temperature, conditions, and location data
+  - Updates every 10 minutes
+  - Dynamic weather icons with full day/night variants for all conditions
+  - Background thread handles API requests to avoid blocking UI
 - Network: Placeholder (needs implementation)
 - Disk I/O: Placeholder (needs implementation)
 
@@ -179,9 +199,11 @@ Settings Window (Scrollable)
 │   ├── Show Weather (toggle)
 │   ├── Weather API Key (text input)
 │   └── Weather Location (text input)
+├── Notification Display
+│   └── Show Notifications (toggle)
 ├── Layout Order
 │   ├── Section ordering with up/down arrow buttons
-│   └── Reorderable list: Utilization, Temperatures, Storage, Battery, Weather
+│   └── Reorderable list: Utilization, Temperatures, Storage, Battery, Weather, Notifications
 └── Widget Position
     ├── X Position (text input)
     ├── Y Position (text input)
@@ -219,9 +241,18 @@ pub struct Config {
     show_storage: bool,     // Storage/disk usage monitoring
     show_battery: bool,     // Battery section display
     enable_solaar_integration: bool,  // Enable Solaar for battery data
+    show_cpu_temp: bool,
+    show_gpu_temp: bool,
+    use_circular_temp_display: bool,
+    show_clock: bool,
+    show_date: bool,
+    use_24hour_time: bool,
+    show_weather: bool,
+    weather_api_key: String,
+    weather_location: String,
+    show_notifications: bool,  // Notification monitoring
     update_interval_ms: u64,
     show_percentages: bool,
-    show_graphs: bool,
     widget_x: i32,         // X position from left
     widget_y: i32,         // Y position from top
     widget_movable: bool,  // Internal (for future drag mode)
@@ -232,7 +263,9 @@ pub enum WidgetSection {
     Utilization,   // CPU, RAM, GPU usage
     Temperatures,  // CPU and GPU temperature displays
     Storage,       // Disk usage information
+    Battery,       // Battery monitoring for wireless devices
     Weather,       // Weather information display
+    Notifications, // Desktop notifications
 }
 ```
 
@@ -391,8 +424,12 @@ watch -n 0.5 cat ~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config
 - `src/widget/layout.rs` - Dynamic height calculation logic
 - `src/widget/storage.rs` - Storage/disk usage monitoring with lsblk integration
 - `src/widget/battery.rs` - Battery monitoring via Solaar (Logitech) and HeadsetControl (headsets) CLI integration
+- `src/widget/notifications.rs` - Desktop notification monitoring via D-Bus with busctl
+- `src/widget/weather.rs` - OpenWeatherMap API integration with day/night icons
 - `src/widget/cache.rs` - Persistent cache for drives and peripherals
 - `src/widget/utilization.rs` - CPU, RAM, GPU monitoring with icon rendering
+- `src/widget/temperature.rs` - Temperature monitoring with circular gauge rendering
+- `src/widget/network.rs` - Network monitoring module
 - `src/config.rs` - Shared configuration structure
 - `src/i18n.rs` - Localization support
 - `i18n/en/cosmic_monitor_applet.ftl` - English translations

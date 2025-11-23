@@ -11,6 +11,11 @@ pub fn calculate_widget_height(config: &Config, disk_count: usize) -> u32 {
 
 /// Calculate the required widget height with battery device count
 pub fn calculate_widget_height_with_batteries(config: &Config, disk_count: usize, battery_count: usize) -> u32 {
+    calculate_widget_height_with_all(config, disk_count, battery_count, 0)
+}
+
+/// Calculate the required widget height with all component counts
+pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, battery_count: usize, notification_count: usize) -> u32 {
     let mut required_height = 10; // Base padding
     
     // Clock and date
@@ -90,6 +95,20 @@ pub fn calculate_widget_height_with_batteries(config: &Config, disk_count: usize
             required_height += battery_count as u32 * 66;
         } else {
             // Default space for "no devices" message
+            required_height += 25;
+        }
+    }
+    
+    // Notifications section
+    if config.show_notifications {
+        required_height += 10; // Spacing before header
+        required_height += 35; // "Notifications" header
+        if notification_count > 0 {
+            // Each notification: ~63px (18px app name + 20px summary + 18px body + 5px spacing)
+            let displayed_count = notification_count.min(5); // Max 5 notifications
+            required_height += displayed_count as u32 * 63;
+        } else {
+            // "No notifications" message
             required_height += 25;
         }
     }

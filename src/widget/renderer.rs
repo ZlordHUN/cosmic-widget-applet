@@ -12,6 +12,7 @@ use super::temperature::draw_temp_circle;
 use super::weather::draw_weather_icon;
 use super::storage::DiskInfo;
 use super::battery::BatteryDevice;
+use super::notifications::Notification;
 use crate::config::WidgetSection;
 
 /// Parameters for rendering the widget
@@ -40,6 +41,7 @@ pub struct RenderParams<'a> {
     pub use_circular_temp_display: bool,
     pub show_weather: bool,
     pub show_battery: bool,
+    pub show_notifications: bool,
     pub enable_solaar_integration: bool,
     pub weather_temp: f32,
     pub weather_desc: &'a str,
@@ -47,11 +49,15 @@ pub struct RenderParams<'a> {
     pub weather_icon: &'a str,
     pub disk_info: &'a [DiskInfo],
     pub battery_devices: &'a [BatteryDevice],
+    pub notifications: &'a [Notification],
+    pub collapsed_groups: &'a std::collections::HashSet<String>,
     pub section_order: &'a [WidgetSection],
+    pub current_time: chrono::DateTime<chrono::Local>,
 }
 
 /// Main rendering function for the widget
-pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
+/// Returns (notification_section_bounds, group_bounds, clear_button_bounds, clear_all_bounds)
+pub fn render_widget(canvas: &mut [u8], params: RenderParams) -> (Option<(f64, f64)>, Vec<(String, f64, f64)>, Vec<(String, f64, f64, f64, f64)>, Option<(f64, f64, f64, f64)>) {
     // Use unsafe to extend the lifetime for Cairo
     // This is safe because the surface doesn't outlive the canvas buffer
     let surface = unsafe {
@@ -68,6 +74,11 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
         )
         .expect("Failed to create cairo surface")
     };
+
+    let mut notification_bounds: Option<(f64, f64)> = None;
+    let mut notification_group_bounds: Vec<(String, f64, f64)> = Vec::new();
+    let mut notification_clear_bounds: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+    let mut clear_all_bounds: Option<(f64, f64, f64, f64)> = None;
 
     {
         let cr = cairo::Context::new(&surface).expect("Failed to create cairo context");
@@ -87,7 +98,7 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
         
         // Render sections
         if params.show_clock || params.show_date {
-            y_pos = render_datetime(&cr, &layout, y_pos, params.show_clock, params.show_date, params.use_24hour_time);
+            y_pos = render_datetime(&cr, &layout, y_pos, params.show_clock, params.show_date, params.use_24hour_time, &params.current_time);
             y_pos += 20.0; // Spacing after datetime
         } else {
             y_pos = 10.0; // Start at top if no clock/date
@@ -131,6 +142,23 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
                         y_pos = render_weather(&cr, &layout, y_pos, &params);
                     }
                 }
+                WidgetSection::Notifications => {
+                    if params.show_notifications {
+                        y_pos += 10.0; // Spacing before notifications section
+                        let (new_y, bounds, groups, clear_bounds, clear_all) = render_notifications(
+                            &cr, 
+                            &layout, 
+                            y_pos, 
+                            params.notifications,
+                            params.collapsed_groups,
+                        );
+                        y_pos = new_y;
+                        notification_bounds = Some(bounds);
+                        notification_group_bounds = groups;
+                        notification_clear_bounds = clear_bounds;
+                        clear_all_bounds = clear_all;
+                    }
+                }
             }
         }
         
@@ -146,6 +174,8 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) {
     
     // Ensure Cairo surface is flushed
     surface.flush();
+    
+    (notification_bounds, notification_group_bounds, notification_clear_bounds, clear_all_bounds)
 }
 
 /// Render date/time section
@@ -156,9 +186,9 @@ fn render_datetime(
     show_clock: bool,
     show_date: bool,
     use_24hour_time: bool,
+    now: &chrono::DateTime<chrono::Local>,
 ) -> f64 {
     let mut y_pos = y_start;
-    let now = chrono::Local::now();
     
     if show_clock {
         // Draw large time (HH:MM or h:MM based on format)
@@ -963,4 +993,249 @@ fn render_storage(cr: &cairo::Context, layout: &pango::Layout, y: f64, disk_info
     }
     
     y
+}
+
+/// Render notifications section
+fn render_notifications(
+    cr: &cairo::Context,
+    layout: &pango::Layout,
+    y_start: f64,
+    notifications: &[Notification],
+    collapsed_groups: &std::collections::HashSet<String>,
+) -> (f64, (f64, f64), Vec<(String, f64, f64)>, Vec<(String, f64, f64, f64, f64)>, Option<(f64, f64, f64, f64)>) {  
+    // Returns (new_y_pos, (section_y_start, section_y_end), group_bounds, clear_button_bounds, clear_all_bounds)
+    use std::collections::HashMap;
+    
+    let section_start = y_start;
+    let mut y_pos = y_start;
+    let mut group_bounds = Vec::new();
+    let mut clear_button_bounds = Vec::new();
+    let mut clear_all_bounds = None;
+    
+    // Draw section header
+    let font_desc = pango::FontDescription::from_string("Ubuntu Bold 14");
+    layout.set_font_description(Some(&font_desc));
+    layout.set_text("Notifications");
+    
+    cr.move_to(10.0, y_pos);
+    pangocairo::functions::layout_path(cr, layout);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.stroke_preserve().expect("Failed to stroke");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    
+    // Draw "Clear All" button if there are notifications
+    if !notifications.is_empty() {
+        let button_x = 285.0;
+        let button_y = y_pos - 2.0;
+        let button_width = 70.0;
+        let button_height = 18.0;
+        
+        // Draw button background
+        cr.set_source_rgba(0.8, 0.2, 0.2, 0.7); // Red with transparency
+        cr.rectangle(button_x, button_y, button_width, button_height);
+        cr.fill().expect("Failed to fill clear all button");
+        
+        // Draw button border
+        cr.set_source_rgb(1.0, 0.3, 0.3); // Lighter red border
+        cr.set_line_width(1.0);
+        cr.rectangle(button_x, button_y, button_width, button_height);
+        cr.stroke().expect("Failed to stroke clear all button");
+        
+        // Draw button text
+        let font_desc_small = pango::FontDescription::from_string("Ubuntu Bold 9");
+        layout.set_font_description(Some(&font_desc_small));
+        layout.set_text("Clear All");
+        
+        cr.move_to(button_x + 10.0, button_y + 3.0);
+        pangocairo::functions::layout_path(cr, layout);
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+        cr.stroke_preserve().expect("Failed to stroke");
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+        
+        clear_all_bounds = Some((button_x, button_y, button_x + button_width, button_y + button_height));
+    }
+    
+    y_pos += 25.0;
+    
+    // Render each notification
+    if notifications.is_empty() {
+        // Show "No notifications" message
+        let font_desc = pango::FontDescription::from_string("Ubuntu Italic 11");
+        layout.set_font_description(Some(&font_desc));
+        layout.set_text("No notifications");
+        
+        cr.move_to(15.0, y_pos);
+        pangocairo::functions::layout_path(cr, layout);
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+        cr.stroke_preserve().expect("Failed to stroke");
+        cr.set_source_rgb(0.6, 0.6, 0.6); // Gray for no notifications
+        cr.fill().expect("Failed to fill");
+        
+        y_pos += 25.0;
+    } else {
+        // Group notifications by app name
+        let mut grouped: HashMap<String, Vec<&Notification>> = HashMap::new();
+        for notif in notifications.iter() {
+            grouped.entry(notif.app_name.clone())
+                .or_insert_with(Vec::new)
+                .push(notif);
+        }
+        
+        // Sort groups by most recent notification
+        let mut groups: Vec<(String, Vec<&Notification>)> = grouped.into_iter().collect();
+        groups.sort_by(|a, b| {
+            let a_latest = a.1.iter().map(|n| n.timestamp).max().unwrap_or(0);
+            let b_latest = b.1.iter().map(|n| n.timestamp).max().unwrap_or(0);
+            b_latest.cmp(&a_latest)
+        });
+        
+        // Render each group
+        for (app_name, group_notifs) in groups.iter() {
+            let group_y_start = y_pos;
+            let is_collapsed = collapsed_groups.contains(app_name);
+            
+            // Calculate total height of this group for background
+            let mut temp_y = y_pos + 20.0; // Header height
+            if !is_collapsed {
+                for notification in group_notifs.iter().take(5) {
+                    temp_y += 18.0; // Summary
+                    if !notification.body.is_empty() {
+                        temp_y += 16.0; // Body
+                    }
+                    temp_y += 3.0; // Spacing
+                }
+            }
+            let group_height = temp_y - group_y_start;
+            
+            // Draw semi-transparent background for the group
+            cr.set_source_rgba(0.1, 0.1, 0.15, 0.7); // Dark blue-ish with transparency
+            cr.rectangle(10.0, group_y_start - 2.0, 350.0, group_height + 4.0);
+            cr.fill().expect("Failed to fill background");
+            
+            // Draw border around the group
+            cr.set_source_rgba(0.3, 0.3, 0.4, 0.9); // Lighter border
+            cr.set_line_width(1.5);
+            cr.rectangle(10.0, group_y_start - 2.0, 350.0, group_height + 4.0);
+            cr.stroke().expect("Failed to stroke border");
+            
+            // Draw group header (app name with count and expand/collapse indicator)
+            let font_desc_bold = pango::FontDescription::from_string("Ubuntu Bold 11");
+            layout.set_font_description(Some(&font_desc_bold));
+            
+            let indicator = if is_collapsed { "▶" } else { "▼" };
+            let header_text = format!("{} {} ({})", indicator, app_name, group_notifs.len());
+            layout.set_text(&header_text);
+            
+            cr.move_to(15.0, y_pos);
+            pangocairo::functions::layout_path(cr, layout);
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            cr.stroke_preserve().expect("Failed to stroke");
+            cr.set_source_rgb(0.8, 0.8, 1.0); // Light blue for app name
+            cr.fill().expect("Failed to fill");
+            
+            // Draw X button to clear this group
+            let x_button_size = 14.0;
+            let x_button_x = 340.0; // Right side of the group
+            let x_button_y = y_pos;
+            
+            // Draw X button background circle
+            cr.set_source_rgba(0.8, 0.2, 0.2, 0.6); // Semi-transparent red
+            cr.arc(x_button_x, x_button_y + 7.0, x_button_size / 2.0, 0.0, 2.0 * std::f64::consts::PI);
+            cr.fill().expect("Failed to fill X button background");
+            
+            // Draw X button border
+            cr.set_source_rgb(1.0, 0.3, 0.3); // Lighter red border
+            cr.set_line_width(1.0);
+            cr.arc(x_button_x, x_button_y + 7.0, x_button_size / 2.0, 0.0, 2.0 * std::f64::consts::PI);
+            cr.stroke().expect("Failed to stroke X button border");
+            
+            // Draw X symbol
+            let x_size = 4.0;
+            let x_center_x = x_button_x;
+            let x_center_y = y_pos + 7.0;
+            
+            cr.set_source_rgb(1.0, 1.0, 1.0); // White X
+            cr.set_line_width(1.5);
+            cr.move_to(x_center_x - x_size, x_center_y - x_size);
+            cr.line_to(x_center_x + x_size, x_center_y + x_size);
+            cr.stroke().expect("Failed to draw X line 1");
+            
+            cr.move_to(x_center_x + x_size, x_center_y - x_size);
+            cr.line_to(x_center_x - x_size, x_center_y + x_size);
+            cr.stroke().expect("Failed to draw X line 2");
+            
+            // Record X button bounds for click detection
+            clear_button_bounds.push((
+                app_name.clone(),
+                x_button_x - x_button_size / 2.0,
+                x_button_y,
+                x_button_x + x_button_size / 2.0,
+                x_button_y + 14.0,
+            ));
+            
+            y_pos += 20.0;
+            let group_y_end = y_pos;
+            
+            // Record group header bounds for click detection
+            group_bounds.push((app_name.clone(), group_y_start, group_y_end));
+            
+            // If not collapsed, show notifications in this group
+            if !is_collapsed {
+                let font_desc = pango::FontDescription::from_string("Ubuntu 11");
+                
+                for notification in group_notifs.iter().take(5) {
+                    // Summary text (indented)
+                    layout.set_font_description(Some(&font_desc));
+                    
+                    // Truncate summary if too long
+                    let summary = if notification.summary.len() > 42 {
+                        format!("{}...", &notification.summary[..39])
+                    } else {
+                        notification.summary.clone()
+                    };
+                    layout.set_text(&summary);
+                    
+                    cr.move_to(25.0, y_pos); // Indent notifications
+                    pangocairo::functions::layout_path(cr, layout);
+                    cr.set_source_rgb(0.0, 0.0, 0.0);
+                    cr.stroke_preserve().expect("Failed to stroke");
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.fill().expect("Failed to fill");
+                    
+                    y_pos += 18.0;
+                    
+                    // Body text (if present and not too long)
+                    if !notification.body.is_empty() {
+                        let body = if notification.body.len() > 45 {
+                            format!("{}...", &notification.body[..42])
+                        } else {
+                            notification.body.clone()
+                        };
+                        
+                        let font_desc_small = pango::FontDescription::from_string("Ubuntu 9");
+                        layout.set_font_description(Some(&font_desc_small));
+                        layout.set_text(&body);
+                        
+                        cr.move_to(25.0, y_pos); // Indent body text
+                        pangocairo::functions::layout_path(cr, layout);
+                        cr.set_source_rgb(0.0, 0.0, 0.0);
+                        cr.stroke_preserve().expect("Failed to stroke");
+                        cr.set_source_rgb(0.8, 0.8, 0.8); // Gray for body
+                        cr.fill().expect("Failed to fill");
+                        
+                        y_pos += 16.0;
+                    }
+                    
+                    y_pos += 3.0; // Small space between notifications in group
+                }
+            }
+            
+            y_pos += 8.0; // Space between groups
+        }
+    }
+    
+    y_pos += 10.0; // Section padding
+    (y_pos, (section_start, y_pos), group_bounds, clear_button_bounds, clear_all_bounds)
 }

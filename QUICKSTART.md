@@ -48,8 +48,9 @@ The widget:
 - Renders as a borderless overlay (no window decorations)
 - Uses Wayland layer-shell protocol with fully transparent background
 - Displays large clock with date (Conky-style with text outlines)
-- Shows CPU and RAM with icons and gradient progress bars
-- Shows real-time system statistics (CPU, memory, network placeholders)
+- Shows CPU, RAM, and GPU with icons and gradient progress bars
+- Shows real-time system statistics (CPU, memory, GPU, storage, battery, weather, notifications)
+- Monitors desktop notifications with smart grouping by application
 - Position is fixed at startup (set via settings)
 
 ### Settings
@@ -64,9 +65,10 @@ Settings include:
 - **Battery Display**: Toggle battery section and enable Solaar integration
 - **Temperature Display**: Toggle CPU and GPU temperature displays, switch between circular gauges and text
 - **Widget Display**: Toggle clock and date displays, 12/24-hour time format
-- **Weather Display**: Configure OpenWeatherMap API key and location
+- **Weather Display**: Configure OpenWeatherMap API key and location (includes day/night icon variants)
+- **Notification Display**: Toggle notification monitoring with grouped display
 - **Display Options**: Percentages toggle and update interval
-- **Layout Order**: Customize section ordering (Utilization, Temperatures, Storage, Weather)
+- **Layout Order**: Customize section ordering (Utilization, Temperatures, Storage, Battery, Weather, Notifications)
 - **Widget Position**: Enter exact X, Y coordinates
 - **Apply Position**: Restart widget to apply new position
 
@@ -98,6 +100,7 @@ Configuration fields:
 - `use_24hour_time` - 12/24-hour time format
 - `show_weather` - Toggle weather display
 - `weather_api_key`, `weather_location` - OpenWeatherMap configuration
+- `show_notifications` - Toggle notification monitoring
 - `update_interval_ms` - Update frequency (100-10000)
 - `show_percentages` - Display percentage values
 - `section_order` - Customizable ordering of widget sections
@@ -182,6 +185,22 @@ The widget will display battery status for all detected Logitech wireless device
 - First startup loads fresh data which takes a few seconds
 - After first run, cache is created and subsequent startups are instant
 - Cache location: `~/.cache/cosmic-monitor-applet/widget_cache.json`
+
+### Notifications not appearing
+- Make sure "Show Notifications" is enabled in Settings
+- Verify `busctl` is installed: `which busctl`
+- Check notifications section order in Settings
+- Try sending a test notification: `notify-send "Test" "Message"`
+- Widget captures new notifications as they arrive (doesn't show old ones)
+
+### Notifications not clearing
+- Right-click anywhere in the notifications section to clear all
+- If widget crashes when clicking, restart it and ensure you're using the latest version
+
+### Notification groups not expanding/collapsing
+- Click directly on the group header (app name line with ▶/▼)
+- Left-click toggles expand/collapse
+- Ensure widget_movable is disabled (left-click is used for both dragging and group toggling)
 
 ## Development
 
