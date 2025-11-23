@@ -178,6 +178,163 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) -> (Option<(f64, f
     (notification_bounds, notification_group_bounds, notification_clear_bounds, clear_all_bounds)
 }
 
+/// Render main widget WITHOUT notifications (for split surface architecture)
+pub fn render_main_widget(canvas: &mut [u8], params: RenderParams) -> (Vec<(String, f64, f64)>, Vec<(String, f64, f64, f64, f64)>, Option<(f64, f64, f64, f64)>) {
+    // Use unsafe to extend the lifetime for Cairo
+    let surface = unsafe {
+        let ptr = canvas.as_mut_ptr();
+        let len = canvas.len();
+        let static_slice: &'static mut [u8] = std::slice::from_raw_parts_mut(ptr, len);
+        
+        cairo::ImageSurface::create_for_data(
+            static_slice,
+            cairo::Format::ARgb32,
+            params.width,
+            params.height,
+            params.width * 4,
+        )
+        .expect("Failed to create cairo surface")
+    };
+
+    let mut notification_bounds = (Vec::new(), Vec::new(), None);
+
+    {
+        let cr = cairo::Context::new(&surface).expect("Failed to create cairo context");
+
+        // Clear background to fully transparent
+        cr.save().expect("Failed to save");
+        cr.set_operator(cairo::Operator::Source);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+        cr.paint().expect("Failed to clear");
+        cr.restore().expect("Failed to restore");
+
+        // Set up Pango for text rendering
+        let layout = pangocairo::functions::create_layout(&cr);
+        
+        // Track vertical position
+        let mut y_pos = 10.0;
+        
+        // Render sections (excluding notifications)
+        if params.show_clock || params.show_date {
+            y_pos = render_datetime(&cr, &layout, y_pos, params.show_clock, params.show_date, params.use_24hour_time, &params.current_time);
+            y_pos += 20.0; // Spacing after datetime
+        } else {
+            y_pos = 10.0; // Start at top if no clock/date
+        }
+        
+        // Render sections in the configured order (skip notifications)
+        for section in params.section_order {
+            match section {
+                WidgetSection::Utilization => {
+                    if params.show_cpu || params.show_memory || params.show_gpu {
+                        y_pos = render_utilization(&cr, &layout, y_pos, &params);
+                    }
+                }
+                WidgetSection::Temperatures => {
+                    if params.show_cpu_temp || params.show_gpu_temp {
+                        y_pos += 10.0;
+                        y_pos = render_temperatures(&cr, &layout, y_pos, &params);
+                    }
+                }
+                WidgetSection::Storage => {
+                    if params.show_storage {
+                        y_pos += 10.0;
+                        y_pos = render_storage(&cr, &layout, y_pos, params.disk_info, params.show_percentages);
+                    }
+                }
+                WidgetSection::Battery => {
+                    if params.show_battery {
+                        y_pos += 10.0;
+                        y_pos = render_battery_section(
+                            &cr,
+                            &layout,
+                            y_pos,
+                            params.battery_devices,
+                            params.enable_solaar_integration,
+                        );
+                    }
+                }
+                WidgetSection::Weather => {
+                    if params.show_weather {
+                        y_pos += 10.0;
+                        y_pos = render_weather(&cr, &layout, y_pos, &params);
+                    }
+                }
+                WidgetSection::Notifications => {
+                    // Render notifications directly on main surface
+                    if params.show_notifications {
+                        let (_new_y, _bounds, groups, clear_bounds, clear_all) = render_notifications(&cr, &layout, y_pos, params.notifications, params.collapsed_groups);
+                        notification_bounds = (groups, clear_bounds, clear_all);
+                    }
+                }
+            }
+        }
+    }
+    
+    surface.flush();
+    notification_bounds
+}
+
+/// Render ONLY notifications on separate surface (for split surface architecture)
+/// Returns (notification_group_bounds, clear_button_bounds, clear_all_bounds)
+pub fn render_notification_surface(
+    canvas: &mut [u8], 
+    width: i32,
+    height: i32,
+    notifications: &[Notification],
+    collapsed_groups: &std::collections::HashSet<String>,
+) -> (Vec<(String, f64, f64)>, Vec<(String, f64, f64, f64, f64)>, Option<(f64, f64, f64, f64)>) {
+    let surface = unsafe {
+        let ptr = canvas.as_mut_ptr();
+        let len = canvas.len();
+        let static_slice: &'static mut [u8] = std::slice::from_raw_parts_mut(ptr, len);
+        
+        cairo::ImageSurface::create_for_data(
+            static_slice,
+            cairo::Format::ARgb32,
+            width,
+            height,
+            width * 4,
+        )
+        .expect("Failed to create cairo surface")
+    };
+
+    let mut notification_group_bounds: Vec<(String, f64, f64)> = Vec::new();
+    let mut notification_clear_bounds: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+    let mut clear_all_bounds: Option<(f64, f64, f64, f64)> = None;
+
+    {
+        let cr = cairo::Context::new(&surface).expect("Failed to create cairo context");
+
+        // Clear background to fully transparent
+        cr.save().expect("Failed to save");
+        cr.set_operator(cairo::Operator::Source);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+        cr.paint().expect("Failed to clear");
+        cr.restore().expect("Failed to restore");
+
+        // Set up Pango for text rendering
+        let layout = pangocairo::functions::create_layout(&cr);
+        
+        // Render notifications starting from top
+        let (_new_y, _bounds, groups, clear_bounds, clear_all) = render_notifications(
+            &cr, 
+            &layout, 
+            10.0,  // Start at top with small padding
+            notifications,
+            collapsed_groups,
+        );
+        
+        notification_group_bounds = groups;
+        notification_clear_bounds = clear_bounds;
+        clear_all_bounds = clear_all;
+    }
+    
+    surface.flush();
+    
+    (notification_group_bounds, notification_clear_bounds, clear_all_bounds)
+}
+
 /// Render date/time section
 fn render_datetime(
     cr: &cairo::Context,
