@@ -444,7 +444,7 @@ impl MonitorWidget {
             if let Some(ref data) = *weather_data_guard {
                 (data.temperature, data.description.clone(), data.location.clone(), data.icon.clone())
             } else {
-                (0.0, String::from("No data"), String::from("Unknown"), String::from("01d"))
+                (f32::NAN, String::from("No data"), String::from("Unknown"), String::from("01d"))
             }
         };
         

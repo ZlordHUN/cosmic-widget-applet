@@ -242,9 +242,15 @@ fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
             let kind = Some("headset".to_string());
             
             // Extract battery information
-            let (level, battery_status) = if let Some(battery) = device_obj.get("battery") {
+            let (level, battery_status, is_battery_available) = if let Some(battery) = device_obj.get("battery") {
                 let status = battery.get("status").and_then(|v| v.as_str());
-                let level = battery.get("level").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok());
+                let level = battery.get("level").and_then(|v| v.as_i64()).and_then(|v| {
+                    if v >= 0 && v <= 100 {
+                        u8::try_from(v).ok()
+                    } else {
+                        None
+                    }
+                });
                 
                 let is_available = status == Some("BATTERY_AVAILABLE");
                 let status_text = if is_available {
@@ -253,13 +259,14 @@ fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
                     Some("unavailable".to_string())
                 };
                 
-                (level, status_text)
+                (level, status_text, is_available)
             } else {
-                (None, None)
+                (None, None, false)
             };
             
-            // HeadsetControl doesn't provide device path info, so we assume connected if we got data
-            let is_connected = true;
+            // HeadsetControl reports the device even if not connected to the dongle
+            // Only mark as connected if battery is available
+            let is_connected = is_battery_available;
             let is_loading = is_connected && level.is_none();
             
             devices.push(BatteryDevice {

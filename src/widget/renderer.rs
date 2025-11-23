@@ -869,7 +869,7 @@ fn render_weather(
     layout.set_font_description(Some(&font_desc));
     
     // Temperature
-    if params.weather_temp > 0.0 {
+    if !params.weather_temp.is_nan() {
         layout.set_text(&format!("{:.1}°C", params.weather_temp));
     } else {
         layout.set_text("N/A");
