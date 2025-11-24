@@ -8,4 +8,4 @@ Terminal=false
 StartupNotify=true
 Categories=COSMIC;System;Monitor;
 Keywords=monitor;system;performance;cpu;memory;
-NoDisplay=false
+NoDisplay=true
