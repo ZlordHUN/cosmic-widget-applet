@@ -151,4 +151,11 @@ impl NotificationMonitor {
         notifs.retain(|n| n.app_name != app_name);
         log::info!("Cleared notifications for app: {}", app_name);
     }
+    
+    /// Remove a specific notification by app_name and timestamp
+    pub fn remove_notification(&self, app_name: &str, timestamp: u64) {
+        let mut notifs = self.notifications.lock().unwrap();
+        notifs.retain(|n| !(n.app_name == app_name && n.timestamp == timestamp));
+        log::info!("Removed notification: {} at {}", app_name, timestamp);
+    }
 }

@@ -1173,6 +1173,9 @@ fn render_notifications(
     layout.set_font_description(Some(&font_desc));
     layout.set_text("Notifications");
     
+    // Get header height for vertical alignment
+    let (_, header_height) = layout.pixel_size();
+    
     cr.move_to(10.0, y_pos);
     pangocairo::functions::layout_path(cr, layout);
     cr.set_source_rgb(0.0, 0.0, 0.0);
@@ -1180,12 +1183,13 @@ fn render_notifications(
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
     
-    // Draw "Clear All" button if there are notifications
+    // Draw "Clear All" button aligned vertically with header
     if !grouped_notifications.is_empty() {
-        let button_x = 285.0;
-        let button_y = y_pos - 2.0;
         let button_width = 70.0;
         let button_height = 18.0;
+        let button_x = 285.0;
+        // Vertically center with header text
+        let button_y = y_pos + (header_height as f64 - button_height) / 2.0;
         
         // Draw button background
         cr.set_source_rgba(0.8, 0.2, 0.2, 0.7); // Red with transparency
@@ -1213,7 +1217,7 @@ fn render_notifications(
         clear_all_bounds = Some((button_x, button_y, button_x + button_width, button_y + button_height));
     }
     
-    y_pos += 25.0;
+    y_pos += 35.0; // More space after header before groups
     
     // Render each notification group
     if grouped_notifications.is_empty() {
@@ -1237,27 +1241,27 @@ fn render_notifications(
             let is_collapsed = collapsed_groups.contains(app_name);
             
             // Calculate total height of this group for background
-            let mut temp_y = y_pos + 20.0; // Header height
+            let mut temp_y = y_pos + 22.0; // Header height
             if !is_collapsed {
                 for notification in group_notifs.iter().take(5) {
-                    temp_y += 18.0; // Summary
+                    temp_y += 20.0; // Summary line with X button
                     if !notification.body.is_empty() {
-                        temp_y += 16.0; // Body
+                        temp_y += 14.0; // Body
                     }
-                    temp_y += 3.0; // Spacing
+                    temp_y += 4.0; // Spacing
                 }
             }
             let group_height = temp_y - group_y_start;
             
             // Draw semi-transparent background for the group
             cr.set_source_rgba(0.1, 0.1, 0.15, 0.7); // Dark blue-ish with transparency
-            cr.rectangle(10.0, group_y_start - 2.0, 350.0, group_height + 4.0);
+            cr.rectangle(10.0, group_y_start - 8.0, 360.0, group_height + 16.0);
             cr.fill().expect("Failed to fill background");
             
             // Draw border around the group
             cr.set_source_rgba(0.3, 0.3, 0.4, 0.9); // Lighter border
             cr.set_line_width(1.5);
-            cr.rectangle(10.0, group_y_start - 2.0, 350.0, group_height + 4.0);
+            cr.rectangle(10.0, group_y_start - 8.0, 360.0, group_height + 16.0);
             cr.stroke().expect("Failed to stroke border");
             
             // Draw group header (app name with count and expand/collapse indicator)
@@ -1306,7 +1310,7 @@ fn render_notifications(
             cr.line_to(x_center_x - x_size, x_center_y + x_size);
             cr.stroke().expect("Failed to draw X line 2");
             
-            // Record X button bounds for click detection
+            // Record X button bounds for click detection (group clear)
             clear_button_bounds.push((
                 app_name.clone(),
                 x_button_x - x_button_size / 2.0,
@@ -1315,7 +1319,7 @@ fn render_notifications(
                 x_button_y + 14.0,
             ));
             
-            y_pos += 20.0;
+            y_pos += 22.0;
             let group_y_end = y_pos;
             
             // Record group header bounds for click detection
@@ -1329,9 +1333,9 @@ fn render_notifications(
                     // Summary text (indented)
                     layout.set_font_description(Some(&font_desc));
                     
-                    // Truncate summary if too long
-                    let summary = if notification.summary.len() > 42 {
-                        format!("{}...", &notification.summary[..39])
+                    // Truncate summary if too long (leave room for X button)
+                    let summary = if notification.summary.len() > 38 {
+                        format!("{}...", &notification.summary[..35])
                     } else {
                         notification.summary.clone()
                     };
@@ -1344,7 +1348,39 @@ fn render_notifications(
                     cr.set_source_rgb(1.0, 1.0, 1.0);
                     cr.fill().expect("Failed to fill");
                     
-                    y_pos += 18.0;
+                    // Draw individual dismiss X button for this notification
+                    let notif_x_size = 10.0;
+                    let notif_x_x = 340.0;
+                    let notif_x_y = y_pos + 2.0;
+                    
+                    // Draw small X button background
+                    cr.set_source_rgba(0.6, 0.2, 0.2, 0.5); // Subtle red
+                    cr.arc(notif_x_x, notif_x_y + 5.0, notif_x_size / 2.0, 0.0, 2.0 * std::f64::consts::PI);
+                    cr.fill().expect("Failed to fill notification X");
+                    
+                    // Draw X symbol (smaller)
+                    let nx_size = 3.0;
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_line_width(1.0);
+                    cr.move_to(notif_x_x - nx_size, notif_x_y + 5.0 - nx_size);
+                    cr.line_to(notif_x_x + nx_size, notif_x_y + 5.0 + nx_size);
+                    cr.stroke().expect("Failed to draw notif X line 1");
+                    cr.move_to(notif_x_x + nx_size, notif_x_y + 5.0 - nx_size);
+                    cr.line_to(notif_x_x - nx_size, notif_x_y + 5.0 + nx_size);
+                    cr.stroke().expect("Failed to draw notif X line 2");
+                    
+                    // Record individual notification X button bounds
+                    // Format: "app_name:timestamp" to identify the specific notification
+                    let notif_id = format!("{}:{}", app_name, notification.timestamp);
+                    clear_button_bounds.push((
+                        notif_id,
+                        notif_x_x - notif_x_size / 2.0,
+                        notif_x_y,
+                        notif_x_x + notif_x_size / 2.0,
+                        notif_x_y + notif_x_size,
+                    ));
+                    
+                    y_pos += 20.0;
                     
                     // Body text (if present and not too long)
                     if !notification.body.is_empty() {
@@ -1365,10 +1401,10 @@ fn render_notifications(
                         cr.set_source_rgb(0.8, 0.8, 0.8); // Gray for body
                         cr.fill().expect("Failed to fill");
                         
-                        y_pos += 16.0;
+                        y_pos += 14.0;
                     }
                     
-                    y_pos += 3.0; // Small space between notifications in group
+                    y_pos += 4.0; // Small space between notifications in group
                 }
             }
             

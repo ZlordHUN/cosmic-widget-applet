@@ -269,17 +269,31 @@ impl PointerHandler for MonitorWidget {
                         }
                     }
                     
-                    // Check if clicking a group's clear button
+                    // Check if clicking a group's clear button or individual notification dismiss
                     if !handled {
-                        for (app_name, x_start, y_start, x_end, y_end) in &self.notification_clear_bounds {
-                            log::trace!("Checking X button for {}: ({}-{}, {}-{})", app_name, x_start, x_end, y_start, y_end);
+                        for (key, x_start, y_start, x_end, y_end) in &self.notification_clear_bounds {
+                            log::trace!("Checking X button for {}: ({}-{}, {}-{})", key, x_start, x_end, y_start, y_end);
                             if click_x >= *x_start && click_x <= *x_end && click_y >= *y_start && click_y <= *y_end {
-                                log::info!("Clearing notification group: {} at ({}, {})", app_name, click_x, click_y);
-                                self.notifications.clear_app(app_name);
-                                self.collapsed_groups.remove(app_name);
-                                self.force_redraw = true;
-                                handled = true;
-                                break;
+                                // Check if this is an individual notification dismiss (format: "app_name:timestamp")
+                                // or a group clear (format: just "app_name")
+                                if let Some((app_name, timestamp_str)) = key.split_once(':') {
+                                    // Individual notification dismiss
+                                    if let Ok(timestamp) = timestamp_str.parse::<u64>() {
+                                        log::info!("Dismissing notification: {} at timestamp {} (click at {}, {})", app_name, timestamp, click_x, click_y);
+                                        self.notifications.remove_notification(app_name, timestamp);
+                                        self.force_redraw = true;
+                                        handled = true;
+                                        break;
+                                    }
+                                } else {
+                                    // Group clear
+                                    log::info!("Clearing notification group: {} at ({}, {})", key, click_x, click_y);
+                                    self.notifications.clear_app(key);
+                                    self.collapsed_groups.remove(key);
+                                    self.force_redraw = true;
+                                    handled = true;
+                                    break;
+                                }
                             }
                         }
                     }
