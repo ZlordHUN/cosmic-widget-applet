@@ -25,6 +25,7 @@
 //!
 //! - [`renderer`]: Cairo-based drawing of all widget sections
 //! - [`layout`]: Dynamic height calculation based on enabled sections
+//! - [`theme`]: COSMIC desktop theme integration (accent color, dark/light mode)
 //!
 //! ## Utility Modules
 //!
@@ -49,6 +50,7 @@ pub mod media;
 // === Rendering Module Declarations ===
 pub mod renderer;
 pub mod layout;
+pub mod theme;
 
 // === Utility Module Declarations ===
 pub mod cache;
@@ -83,3 +85,6 @@ pub use notifications::NotificationMonitor;
 
 /// Cider media player integration
 pub use media::{MediaMonitor, MediaInfo, PlaybackStatus};
+
+/// COSMIC theme integration
+pub use theme::CosmicTheme;

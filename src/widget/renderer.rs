@@ -74,6 +74,7 @@ use super::storage::DiskInfo;
 use super::battery::BatteryDevice;
 use super::notifications::Notification;
 use super::media::MediaInfo;
+use super::theme::CosmicTheme;
 use crate::config::WidgetSection;
 
 // ============================================================================
@@ -96,6 +97,7 @@ use crate::config::WidgetSection;
 /// - **Weather**: Data from WeatherMonitor
 /// - **Notifications**: Grouped notifications from NotificationMonitor
 /// - **Media**: Playback info from MediaMonitor
+/// - **Theme**: COSMIC desktop theme (accent color, dark/light mode)
 ///
 /// # Configuration Flags
 ///
@@ -195,6 +197,8 @@ pub struct RenderParams<'a> {
     pub section_order: &'a [WidgetSection],
     /// Current local time for clock/date display
     pub current_time: chrono::DateTime<chrono::Local>,
+    /// COSMIC desktop theme settings (colors, dark/light mode)
+    pub theme: &'a CosmicTheme,
 }
 
 // ============================================================================
@@ -332,6 +336,7 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) -> (Option<(f64, f
                             y_pos,
                             params.grouped_notifications,
                             params.collapsed_groups,
+                            params.theme,
                         );
                         y_pos = new_y;
                         notification_bounds = Some(bounds);
@@ -343,7 +348,7 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) -> (Option<(f64, f
                 WidgetSection::Media => {
                     if params.show_media {
                         y_pos += 10.0; // Spacing before media section
-                        let (new_y, buttons) = render_media(&cr, &layout, y_pos, params.media_info);
+                        let (new_y, buttons) = render_media(&cr, &layout, y_pos, params.media_info, params.theme);
                         y_pos = new_y;
                         media_button_bounds = buttons;
                     }
@@ -466,7 +471,7 @@ pub fn render_main_widget(canvas: &mut [u8], params: RenderParams) -> (Vec<(Stri
                 WidgetSection::Notifications => {
                     // Render notifications directly on main surface
                     if params.show_notifications {
-                        let (new_y, _bounds, groups, clear_bounds, clear_all) = render_notifications(&cr, &layout, y_pos, params.grouped_notifications, params.collapsed_groups);
+                        let (new_y, _bounds, groups, clear_bounds, clear_all) = render_notifications(&cr, &layout, y_pos, params.grouped_notifications, params.collapsed_groups, params.theme);
                         y_pos = new_y;  // Update y_pos so next section knows where to start
                         notification_bounds = (groups, clear_bounds, clear_all);
                     }
@@ -474,7 +479,7 @@ pub fn render_main_widget(canvas: &mut [u8], params: RenderParams) -> (Vec<(Stri
                 WidgetSection::Media => {
                     if params.show_media {
                         y_pos += 10.0;
-                        let (new_y, _buttons) = render_media(&cr, &layout, y_pos, params.media_info);
+                        let (new_y, _buttons) = render_media(&cr, &layout, y_pos, params.media_info, params.theme);
                         y_pos = new_y;
                     }
                 }
@@ -536,6 +541,9 @@ pub fn render_notification_surface(
         // Set up Pango for text rendering
         let layout = pangocairo::functions::create_layout(&cr);
         
+        // Use default theme for standalone notification surface
+        let theme = CosmicTheme::default();
+        
         // Render notifications starting from top
         let (_new_y, _bounds, groups, clear_bounds, clear_all) = render_notifications(
             &cr, 
@@ -543,6 +551,7 @@ pub fn render_notification_surface(
             10.0,  // Start at top with small padding
             grouped_notifications,
             collapsed_groups,
+            &theme,
         );
         
         notification_group_bounds = groups;
@@ -1438,13 +1447,16 @@ fn render_storage(cr: &cairo::Context, layout: &pango::Layout, y: f64, disk_info
     y
 }
 
-/// Render notifications section
+/// Render notifications section with theme-aware colors.
+///
+/// Uses the COSMIC theme for panel backgrounds and text colors.
 fn render_notifications(
     cr: &cairo::Context,
     layout: &pango::Layout,
     y_start: f64,
     grouped_notifications: &[(String, Vec<Notification>)],
     collapsed_groups: &std::collections::HashSet<String>,
+    theme: &CosmicTheme,
 ) -> (f64, (f64, f64), Vec<(String, f64, f64)>, Vec<(String, f64, f64, f64, f64)>, Option<(f64, f64, f64, f64)>) {  
     // Returns (new_y_pos, (section_y_start, section_y_end), group_bounds, clear_button_bounds, clear_all_bounds)
     
@@ -1453,6 +1465,13 @@ fn render_notifications(
     let mut group_bounds = Vec::new();
     let mut clear_button_bounds = Vec::new();
     let mut clear_all_bounds = None;
+    
+    // Get theme colors
+    let (text_r, text_g, text_b) = theme.text_color();
+    let (sec_r, sec_g, sec_b) = theme.secondary_text_color();
+    let (panel_r, panel_g, panel_b, panel_a) = theme.panel_background();
+    let (border_r, border_g, border_b, border_a) = theme.border_color();
+    let (accent_r, accent_g, accent_b) = theme.accent_rgb();
     
     // Draw section header
     let font_desc = pango::FontDescription::from_string("Ubuntu Bold 14");
@@ -1466,7 +1485,7 @@ fn render_notifications(
     pangocairo::functions::layout_path(cr, layout);
     cr.set_source_rgb(0.0, 0.0, 0.0);
     cr.stroke_preserve().expect("Failed to stroke");
-    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_source_rgb(text_r, text_g, text_b);
     cr.fill().expect("Failed to fill");
     
     // Draw "Clear All" button aligned vertically with header
@@ -1497,7 +1516,7 @@ fn render_notifications(
         pangocairo::functions::layout_path(cr, layout);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
-        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.set_source_rgb(text_r, text_g, text_b);
         cr.fill().expect("Failed to fill");
         
         clear_all_bounds = Some((button_x, button_y, button_x + button_width, button_y + button_height));
@@ -1516,7 +1535,7 @@ fn render_notifications(
         pangocairo::functions::layout_path(cr, layout);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
-        cr.set_source_rgb(0.6, 0.6, 0.6); // Gray for no notifications
+        cr.set_source_rgb(sec_r, sec_g, sec_b);
         cr.fill().expect("Failed to fill");
         
         y_pos += 25.0;
@@ -1539,13 +1558,13 @@ fn render_notifications(
             }
             let group_height = temp_y - group_y_start;
             
-            // Draw semi-transparent background for the group
-            cr.set_source_rgba(0.1, 0.1, 0.15, 0.7); // Dark blue-ish with transparency
+            // Draw semi-transparent background for the group (theme-aware)
+            cr.set_source_rgba(panel_r, panel_g, panel_b, panel_a);
             cr.rectangle(10.0, group_y_start - 8.0, 360.0, group_height + 16.0);
             cr.fill().expect("Failed to fill background");
             
-            // Draw border around the group
-            cr.set_source_rgba(0.3, 0.3, 0.4, 0.9); // Lighter border
+            // Draw border around the group (theme-aware)
+            cr.set_source_rgba(border_r, border_g, border_b, border_a);
             cr.set_line_width(1.5);
             cr.rectangle(10.0, group_y_start - 8.0, 360.0, group_height + 16.0);
             cr.stroke().expect("Failed to stroke border");
@@ -1562,7 +1581,8 @@ fn render_notifications(
             pangocairo::functions::layout_path(cr, layout);
             cr.set_source_rgb(0.0, 0.0, 0.0);
             cr.stroke_preserve().expect("Failed to stroke");
-            cr.set_source_rgb(0.8, 0.8, 1.0); // Light blue for app name
+            // Use accent color for app name header
+            cr.set_source_rgb(accent_r * 1.2, accent_g * 1.2, accent_b * 1.2); // Slightly brighter accent
             cr.fill().expect("Failed to fill");
             
             // Draw X button to clear this group
@@ -1631,7 +1651,7 @@ fn render_notifications(
                     pangocairo::functions::layout_path(cr, layout);
                     cr.set_source_rgb(0.0, 0.0, 0.0);
                     cr.stroke_preserve().expect("Failed to stroke");
-                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_source_rgb(text_r, text_g, text_b);
                     cr.fill().expect("Failed to fill");
                     
                     // Draw individual dismiss X button for this notification
@@ -1684,7 +1704,7 @@ fn render_notifications(
                         pangocairo::functions::layout_path(cr, layout);
                         cr.set_source_rgb(0.0, 0.0, 0.0);
                         cr.stroke_preserve().expect("Failed to stroke");
-                        cr.set_source_rgb(0.8, 0.8, 0.8); // Gray for body
+                        cr.set_source_rgb(sec_r, sec_g, sec_b); // Secondary color for body
                         cr.fill().expect("Failed to fill");
                         
                         y_pos += 14.0;
@@ -1702,18 +1722,28 @@ fn render_notifications(
     (y_pos, (section_start, y_pos), group_bounds, clear_button_bounds, clear_all_bounds)
 }
 
-/// Render media player section
+/// Render media player section with theme-aware colors.
+///
+/// Uses the COSMIC theme accent color for the progress bar and play button.
 /// Returns (y_position, button_bounds) where button_bounds is Vec<(button_name, x_start, y_start, x_end, y_end)>
 fn render_media(
     cr: &cairo::Context,
     layout: &pango::Layout,
     y_start: f64,
     media_info: &MediaInfo,
+    theme: &CosmicTheme,
 ) -> (f64, MediaButtonBounds) {
     use super::media::PlaybackStatus;
     
     let mut y_pos = y_start;
     let mut button_bounds: MediaButtonBounds = Vec::new();
+    
+    // Get theme colors
+    let (text_r, text_g, text_b) = theme.text_color();
+    let (sec_r, sec_g, sec_b) = theme.secondary_text_color();
+    let (panel_r, panel_g, panel_b, panel_a) = theme.panel_background();
+    let (border_r, border_g, border_b, border_a) = theme.border_color();
+    let (accent_r, accent_g, accent_b) = theme.accent_rgb();
     
     // Draw section header
     let font_desc = pango::FontDescription::from_string("Ubuntu Bold 14");
@@ -1724,7 +1754,7 @@ fn render_media(
     pangocairo::functions::layout_path(cr, layout);
     cr.set_source_rgb(0.0, 0.0, 0.0);
     cr.stroke_preserve().expect("Failed to stroke");
-    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_source_rgb(text_r, text_g, text_b);
     cr.fill().expect("Failed to fill");
     
     y_pos += 28.0;  // More space after header
@@ -1739,20 +1769,20 @@ fn render_media(
         pangocairo::functions::layout_path(cr, layout);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
-        cr.set_source_rgb(0.6, 0.6, 0.6);
+        cr.set_source_rgb(sec_r, sec_g, sec_b);
         cr.fill().expect("Failed to fill");
         
         return (y_pos + 25.0, button_bounds);
     }
     
-    // Draw background panel
+    // Draw background panel (theme-aware)
     let panel_height = 125.0;
     let panel_y = y_pos;
-    cr.set_source_rgba(0.1, 0.1, 0.15, 0.7);
+    cr.set_source_rgba(panel_r, panel_g, panel_b, panel_a);
     cr.rectangle(10.0, panel_y, 360.0, panel_height);
     cr.fill().expect("Failed to fill background");
     
-    cr.set_source_rgba(0.3, 0.3, 0.4, 0.9);
+    cr.set_source_rgba(border_r, border_g, border_b, border_a);
     cr.set_line_width(1.5);
     cr.rectangle(10.0, panel_y, 360.0, panel_height);
     cr.stroke().expect("Failed to stroke border");
@@ -1776,7 +1806,7 @@ fn render_media(
     pangocairo::functions::layout_path(cr, layout);
     cr.set_source_rgb(0.0, 0.0, 0.0);
     cr.stroke_preserve().expect("Failed to stroke");
-    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_source_rgb(text_r, text_g, text_b);
     cr.fill().expect("Failed to fill");
     
     // Draw artist
@@ -1797,7 +1827,7 @@ fn render_media(
         pangocairo::functions::layout_path(cr, layout);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
-        cr.set_source_rgb(0.8, 0.8, 0.8);
+        cr.set_source_rgb(sec_r, sec_g, sec_b);
         cr.fill().expect("Failed to fill");
     }
     
@@ -1834,10 +1864,10 @@ fn render_media(
     cr.rectangle(bar_x, y_pos, bar_width, bar_height);
     cr.fill().expect("Failed to fill progress background");
     
-    // Progress fill
+    // Progress fill (using theme accent color)
     let progress = media_info.progress();
     if progress > 0.0 {
-        cr.set_source_rgba(0.4, 0.6, 1.0, 0.9); // Blue progress
+        cr.set_source_rgba(accent_r, accent_g, accent_b, 0.9);
         cr.rectangle(bar_x, y_pos, bar_width * progress, bar_height);
         cr.fill().expect("Failed to fill progress");
     }
@@ -1911,8 +1941,8 @@ fn render_media(
     let play_x = prev_x + button_size + button_spacing;
     let play_y = y_pos;
     
-    // Draw play/pause button background (larger, highlighted)
-    cr.set_source_rgba(0.4, 0.6, 1.0, 0.6);
+    // Draw play/pause button background (larger, highlighted with accent color)
+    cr.set_source_rgba(accent_r, accent_g, accent_b, 0.6);
     cr.arc(play_x + button_size / 2.0, play_y + button_size / 2.0, button_size / 2.0 + 4.0, 0.0, 2.0 * std::f64::consts::PI);
     cr.fill().expect("Failed to fill");
     

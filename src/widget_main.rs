@@ -65,7 +65,7 @@ mod config;
 mod widget;
 
 use config::Config;
-use widget::{UtilizationMonitor, TemperatureMonitor, NetworkMonitor, WeatherMonitor, StorageMonitor, BatteryMonitor, NotificationMonitor, MediaMonitor, load_weather_font};
+use widget::{UtilizationMonitor, TemperatureMonitor, NetworkMonitor, WeatherMonitor, StorageMonitor, BatteryMonitor, NotificationMonitor, MediaMonitor, CosmicTheme, load_weather_font};
 use widget::renderer::{render_widget, RenderParams};
 use widget::layout::calculate_widget_height_with_all;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
@@ -219,6 +219,13 @@ struct MonitorWidget {
     last_click_time: std::time::Instant,
     /// Set to true when compositor requests close
     exit: bool,
+    
+    // === Theme ===
+    
+    /// Current COSMIC theme (accent color, dark/light mode)
+    theme: CosmicTheme,
+    /// Last time we checked for theme changes
+    last_theme_check: Instant,
 }
 
 // ============================================================================
@@ -634,6 +641,8 @@ impl MonitorWidget {
             force_redraw: false,
             last_click_time: Instant::now(),
             exit: false,
+            theme: CosmicTheme::load(),
+            last_theme_check: Instant::now(),
         }
     }
 
@@ -907,6 +916,7 @@ impl MonitorWidget {
             media_info: &media_info,
             section_order: &self.config.section_order,
             current_time,
+            theme: &self.theme,
         };
         
         // Wrap rendering in panic catch to prevent crashes
@@ -1137,6 +1147,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Force a redraw with full stats update
                         widget.draw(&qh, chrono::Local::now(), true);
                     }
+                }
+            }
+            
+            // === Theme Hot-Reload ===
+            // Check for theme changes every 2 seconds (less frequent than config)
+            if now.duration_since(widget.last_theme_check).as_secs() >= 2 {
+                widget.last_theme_check = now;
+                let new_theme = CosmicTheme::load();
+                // Check if accent color or dark mode changed
+                if (new_theme.accent.red - widget.theme.accent.red).abs() > 0.01
+                    || (new_theme.accent.green - widget.theme.accent.green).abs() > 0.01
+                    || (new_theme.accent.blue - widget.theme.accent.blue).abs() > 0.01
+                    || new_theme.is_dark != widget.theme.is_dark
+                {
+                    log::info!("Theme changed, reloading");
+                    widget.theme = new_theme;
+                    widget.draw(&qh, chrono::Local::now(), true);
                 }
             }
 
