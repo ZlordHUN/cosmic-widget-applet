@@ -1726,6 +1726,7 @@ fn render_notifications(
 /// Render media player section with theme-aware colors.
 ///
 /// Uses the COSMIC theme accent color for the progress bar and play button.
+/// Displays album artwork if available, alongside track info and controls.
 /// Returns (y_position, button_bounds) where button_bounds is Vec<(button_name, x_start, y_start, x_end, y_end)>
 fn render_media(
     cr: &cairo::Context,
@@ -1777,7 +1778,7 @@ fn render_media(
     }
     
     // Draw background panel (theme-aware)
-    let panel_height = 125.0;
+    let panel_height = 140.0;  // Increased to fit album art + controls
     let panel_y = y_pos;
     cr.set_source_rgba(panel_r, panel_g, panel_b, panel_a);
     cr.rectangle(10.0, panel_y, 360.0, panel_height);
@@ -1791,13 +1792,65 @@ fn render_media(
     // Content starts inside the panel with padding
     y_pos += 10.0;
     
-    // Draw track title (moved up, no play/pause icon here anymore)
-    let text_x = 20.0;
+    // Album art dimensions and position
+    let art_size = 64.0;
+    let art_x = 20.0;
+    let art_y = y_pos;
+    let has_art = media_info.album_art.is_some();
+    
+    // Draw album art if available
+    if let Some(ref album_art) = media_info.album_art {
+        // Draw a background/border for the art
+        cr.set_source_rgba(0.2, 0.2, 0.2, 0.8);
+        cr.rectangle(art_x - 2.0, art_y - 2.0, art_size + 4.0, art_size + 4.0);
+        cr.fill().expect("Failed to fill art background");
+        
+        // Create an ImageSurface from the album art data
+        if album_art.width > 0 && album_art.height > 0 {
+            // Create a new surface and copy the pixel data
+            if let Ok(mut art_surface) = cairo::ImageSurface::create(
+                cairo::Format::ARgb32,
+                album_art.width as i32,
+                album_art.height as i32,
+            ) {
+                // Copy pixel data to the surface
+                {
+                    let mut data = art_surface.data().expect("Failed to get surface data");
+                    let src_len = album_art.data.len().min(data.len());
+                    data[..src_len].copy_from_slice(&album_art.data[..src_len]);
+                }
+                
+                // Scale and draw the art
+                cr.save().expect("Failed to save");
+                cr.translate(art_x, art_y);
+                let scale_x = art_size / album_art.width as f64;
+                let scale_y = art_size / album_art.height as f64;
+                cr.scale(scale_x, scale_y);
+                cr.set_source_surface(&art_surface, 0.0, 0.0).expect("Failed to set source");
+                cr.paint().expect("Failed to paint album art");
+                cr.restore().expect("Failed to restore");
+            }
+        }
+        
+        // Draw border around the art
+        cr.set_source_rgba(0.4, 0.4, 0.4, 0.8);
+        cr.set_line_width(1.0);
+        cr.rectangle(art_x, art_y, art_size, art_size);
+        cr.stroke().expect("Failed to stroke art border");
+    }
+    
+    // Adjust text position based on whether we have artwork
+    let text_x = if has_art { art_x + art_size + 10.0 } else { 20.0 };
+    let max_title_chars = if has_art { 28 } else { 40 };
+    let max_artist_chars = if has_art { 33 } else { 45 };
+    let max_album_chars = if has_art { 38 } else { 50 };
+    
+    // Draw track title
     let font_desc_bold = pango::FontDescription::from_string("Ubuntu Bold 12");
     layout.set_font_description(Some(&font_desc_bold));
     
-    let title = if media_info.title.len() > 40 {
-        format!("{}...", &media_info.title[..37])
+    let title = if media_info.title.len() > max_title_chars {
+        format!("{}...", &media_info.title[..max_title_chars.saturating_sub(3)])
     } else {
         media_info.title.clone()
     };
@@ -1817,8 +1870,8 @@ fn render_media(
         let font_desc = pango::FontDescription::from_string("Ubuntu 11");
         layout.set_font_description(Some(&font_desc));
         
-        let artist = if media_info.artist.len() > 45 {
-            format!("{}...", &media_info.artist[..42])
+        let artist = if media_info.artist.len() > max_artist_chars {
+            format!("{}...", &media_info.artist[..max_artist_chars.saturating_sub(3)])
         } else {
             media_info.artist.clone()
         };
@@ -1839,8 +1892,8 @@ fn render_media(
         let font_desc_small = pango::FontDescription::from_string("Ubuntu Italic 10");
         layout.set_font_description(Some(&font_desc_small));
         
-        let album = if media_info.album.len() > 50 {
-            format!("{}...", &media_info.album[..47])
+        let album = if media_info.album.len() > max_album_chars {
+            format!("{}...", &media_info.album[..max_album_chars.saturating_sub(3)])
         } else {
             media_info.album.clone()
         };
@@ -1854,8 +1907,15 @@ fn render_media(
         cr.fill().expect("Failed to fill");
     }
     
-    // Draw progress bar (full width)
-    y_pos += 18.0;
+    // Draw progress bar (full width, positioned below both art and text)
+    // Reset y_pos to be below the album art if it was taller
+    let content_bottom = if has_art {
+        (art_y + art_size).max(y_pos + 16.0)
+    } else {
+        y_pos + 18.0
+    };
+    y_pos = content_bottom + 4.0;
+    
     let bar_x = 20.0;
     let bar_width = 330.0;
     let bar_height = 6.0;

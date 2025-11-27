@@ -13,6 +13,7 @@
 //! - `playback/playpause` - Toggle play/pause
 //! - `playback/next` - Skip to next track
 //! - `playback/previous` - Go to previous track
+//! - `playback/seek` - Seek to position
 //!
 //! ## Authentication
 //!
@@ -24,18 +25,81 @@
 //! A background thread polls the API every second to get current track
 //! info. This provides real-time progress updates for the progress bar.
 //!
+//! ## Album Art
+//!
+//! Album artwork is downloaded from Apple Music CDN and cached in memory.
+//! Images are decoded to RGBA format for Cairo rendering. The cache is
+//! keyed by URL to avoid re-downloading when tracks repeat.
+//!
 //! ## Error Handling
 //!
 //! - Cider not running → Empty MediaInfo (no media section displayed)
 //! - API errors → Silent fallback to empty state
 //! - Network timeout → 1 second limit to prevent blocking
-//!
-//! ## Future Expansion
-//!
-//! Could support MPRIS D-Bus interface for generic media player support.
+//! - Artwork errors → Falls back to no artwork display
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::collections::HashMap;
+
+// ============================================================================
+// Album Art Cache
+// ============================================================================
+
+/// Decoded album art ready for rendering.
+///
+/// Stores RGBA pixel data along with dimensions for Cairo rendering.
+#[derive(Clone)]
+pub struct AlbumArt {
+    /// RGBA pixel data (4 bytes per pixel)
+    pub data: Vec<u8>,
+    /// Image width in pixels
+    pub width: u32,
+    /// Image height in pixels
+    pub height: u32,
+}
+
+impl std::fmt::Debug for AlbumArt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlbumArt")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
+}
+
+/// Cache for downloaded and decoded album artwork.
+///
+/// Keyed by artwork URL to avoid re-downloading the same image.
+/// Limited to prevent unbounded memory growth.
+struct ArtworkCache {
+    /// URL → decoded artwork mapping
+    cache: HashMap<String, AlbumArt>,
+    /// Maximum number of cached artworks
+    max_size: usize,
+}
+
+impl ArtworkCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            max_size,
+        }
+    }
+    
+    fn get(&self, url: &str) -> Option<AlbumArt> {
+        self.cache.get(url).cloned()
+    }
+    
+    fn insert(&mut self, url: String, art: AlbumArt) {
+        // Simple eviction: clear cache if at capacity
+        if self.cache.len() >= self.max_size {
+            self.cache.clear();
+        }
+        self.cache.insert(url, art);
+    }
+}
 
 // ============================================================================
 // Playback Status Enum
@@ -76,8 +140,10 @@ pub struct MediaInfo {
     pub artist: String,
     /// Album name
     pub album: String,
-    /// Album art URL (currently unused)
+    /// Album art URL from API
     pub art_url: Option<String>,
+    /// Decoded album artwork ready for rendering
+    pub album_art: Option<AlbumArt>,
     /// Current playback status
     pub status: PlaybackStatus,
     /// Current playback position in milliseconds
@@ -85,14 +151,19 @@ pub struct MediaInfo {
     /// Total track duration in milliseconds
     pub duration: u64,
     /// Whether play command is available
+    #[allow(dead_code)]
     pub can_play: bool,
     /// Whether pause command is available
+    #[allow(dead_code)]
     pub can_pause: bool,
     /// Whether next track command is available
+    #[allow(dead_code)]
     pub can_go_next: bool,
     /// Whether previous track command is available
+    #[allow(dead_code)]
     pub can_go_previous: bool,
-    /// Whether seeking is supported (currently unused)
+    /// Whether seeking is supported
+    #[allow(dead_code)]
     pub can_seek: bool,
 }
 
@@ -143,11 +214,14 @@ impl MediaInfo {
 ///
 /// - `media_info`: Shared state for current track (Arc<Mutex>)
 /// - `cider_token`: Shared API token, can be updated from settings
+/// - `artwork_cache`: Shared cache for decoded album artwork
 pub struct MediaMonitor {
     /// Current media info, updated by background thread
     media_info: Arc<Mutex<MediaInfo>>,
     /// Cider API token for authentication (optional)
     cider_token: Arc<Mutex<Option<String>>>,
+    /// Cache for downloaded album artwork
+    artwork_cache: Arc<Mutex<ArtworkCache>>,
 }
 
 impl MediaMonitor {
@@ -162,45 +236,75 @@ impl MediaMonitor {
     /// Immediately spawns a background thread that:
     /// 1. Polls `now-playing` endpoint every second
     /// 2. Checks `is-playing` for accurate status
-    /// 3. Updates shared MediaInfo state
+    /// 3. Downloads and caches album artwork
+    /// 4. Updates shared MediaInfo state
     pub fn new(api_token: Option<String>) -> Self {
         let media_info = Arc::new(Mutex::new(MediaInfo::default()));
         // Use provided token or None if empty
         let token = api_token.filter(|t| !t.is_empty());
         let cider_token = Arc::new(Mutex::new(token));
+        let artwork_cache = Arc::new(Mutex::new(ArtworkCache::new(10)));
         
         // Spawn background thread to monitor media
         let media_info_clone = Arc::clone(&media_info);
         let cider_token_clone = Arc::clone(&cider_token);
+        let artwork_cache_clone = Arc::clone(&artwork_cache);
         
         std::thread::spawn(move || {
-            Self::monitor_loop(media_info_clone, cider_token_clone);
+            Self::monitor_loop(media_info_clone, cider_token_clone, artwork_cache_clone);
         });
         
         Self {
             media_info,
             cider_token,
+            artwork_cache,
         }
     }
     
     /// Main background monitoring loop.
     ///
     /// Runs forever, polling the Cider API every second and updating
-    /// the shared MediaInfo state.
+    /// the shared MediaInfo state. Also downloads artwork when track changes.
     fn monitor_loop(
         media_info: Arc<Mutex<MediaInfo>>,
         cider_token: Arc<Mutex<Option<String>>>,
+        artwork_cache: Arc<Mutex<ArtworkCache>>,
     ) {
         log::info!("Starting Cider media monitor");
+        let mut last_art_url: Option<String> = None;
         
         loop {
             // Try Cider API with current token
             let token = cider_token.lock().unwrap().clone();
-            if let Some(info) = Self::try_cider_api(token.as_deref()) {
+            if let Some(mut info) = Self::try_cider_api(token.as_deref()) {
+                // Check if we need to load new artwork
+                if info.art_url.is_some() && info.art_url != last_art_url {
+                    let url = info.art_url.clone().unwrap();
+                    last_art_url = info.art_url.clone();
+                    
+                    // Check cache first
+                    let cached = artwork_cache.lock().unwrap().get(&url);
+                    if let Some(art) = cached {
+                        info.album_art = Some(art);
+                    } else {
+                        // Download and cache artwork
+                        if let Some(art) = Self::download_artwork(&url) {
+                            artwork_cache.lock().unwrap().insert(url, art.clone());
+                            info.album_art = Some(art);
+                        }
+                    }
+                } else if info.art_url.is_some() {
+                    // Same URL, use cached
+                    let url = info.art_url.as_ref().unwrap();
+                    let cached = artwork_cache.lock().unwrap().get(url);
+                    info.album_art = cached;
+                }
+                
                 let mut stored = media_info.lock().unwrap();
                 *stored = info;
             } else {
                 // No media playing or Cider not running
+                last_art_url = None;
                 let mut stored = media_info.lock().unwrap();
                 *stored = MediaInfo::default();
             }
@@ -208,6 +312,69 @@ impl MediaMonitor {
             // Poll every second for responsive progress updates
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+    
+    /// Download and decode album artwork from URL.
+    ///
+    /// Downloads the image using curl, then decodes it using the `image` crate.
+    /// Resizes to a reasonable size for the widget display.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - URL to download artwork from (typically Apple Music CDN)
+    ///
+    /// # Returns
+    ///
+    /// Decoded `AlbumArt` if successful, `None` on any error
+    fn download_artwork(url: &str) -> Option<AlbumArt> {
+        use std::process::Command;
+        use image::GenericImageView;
+        
+        log::info!("Downloading album art from: {}", url);
+        
+        // Download image data using curl
+        let output = Command::new("curl")
+            .args(&["-s", "--max-time", "5", "-L"])  // Silent, 5 second timeout, follow redirects
+            .arg(url)
+            .output()
+            .ok()?;
+        
+        if !output.status.success() || output.stdout.is_empty() {
+            log::warn!("Failed to download album art");
+            return None;
+        }
+        
+        // Decode image
+        let img = image::load_from_memory(&output.stdout).ok()?;
+        
+        // Resize to target size (e.g., 64x64 for widget display)
+        let target_size = 64u32;
+        let resized = img.resize(target_size, target_size, image::imageops::FilterType::Lanczos3);
+        
+        // Convert to RGBA
+        let rgba = resized.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        
+        // Cairo expects BGRA with pre-multiplied alpha (ARGB32 format)
+        // Convert RGBA to BGRA
+        let mut bgra_data: Vec<u8> = Vec::with_capacity((width * height * 4) as usize);
+        for pixel in rgba.pixels() {
+            let [r, g, b, a] = pixel.0;
+            // Pre-multiply alpha and swap to BGRA
+            let alpha = a as f32 / 255.0;
+            bgra_data.push((b as f32 * alpha) as u8); // B
+            bgra_data.push((g as f32 * alpha) as u8); // G
+            bgra_data.push((r as f32 * alpha) as u8); // R
+            bgra_data.push(a);                         // A
+        }
+        
+        log::info!("Album art loaded: {}x{}", width, height);
+        
+        Some(AlbumArt {
+            data: bgra_data,
+            width,
+            height,
+        })
     }
     
     /// Query Cider API for current track info.
@@ -280,7 +447,7 @@ impl MediaMonitor {
     /// Parse Cider API JSON response into MediaInfo.
     ///
     /// Uses simple string parsing to avoid JSON dependency overhead.
-    /// Extracts: name, artistName, albumName, url, durationInMillis,
+    /// Extracts: name, artistName, albumName, artwork.url, durationInMillis,
     /// currentPlaybackTime.
     fn parse_cider_response(json: &str, is_playing: bool) -> Option<MediaInfo> {
         // Check if status is ok
@@ -321,9 +488,18 @@ impl MediaMonitor {
             info.album = album;
         }
         
-        // Extract artwork URL (for potential future use)
-        if let Some(artwork) = Self::extract_json_string(json, "\"url\":\"") {
-            info.art_url = Some(artwork);
+        // Extract artwork URL from within the artwork object
+        // The response has: "artwork":{"width":...,"height":...,"url":"https://..."}
+        if let Some(artwork_start) = json.find("\"artwork\":{") {
+            let artwork_section = &json[artwork_start..];
+            // Find url within the artwork object
+            if let Some(url) = Self::extract_json_string(artwork_section, "\"url\":\"") {
+                // Replace {w}x{h} placeholders with actual size
+                let artwork_url = url
+                    .replace("{w}", "300")
+                    .replace("{h}", "300");
+                info.art_url = Some(artwork_url);
+            }
         }
         
         // Extract duration in milliseconds
