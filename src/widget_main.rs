@@ -52,7 +52,7 @@
 //!
 //! The widget uses wlr-layer-shell to:
 //! - Position at an absolute X,Y coordinate on the desktop
-//! - Stay above regular windows (Layer::Top)
+//! - Stay below regular windows (Layer::Bottom) - acts like desktop widget
 //! - Not reserve exclusive space (other windows can overlap)
 //! - Accept mouse input for dragging (when settings is open) and clicks
 //!
@@ -650,7 +650,7 @@ impl MonitorWidget {
     ///
     /// Configures the surface to:
     /// - Anchor to top-left corner with offset from config
-    /// - Use Layer::Top for visibility above normal windows
+    /// - Use Layer::Bottom so windows can cover the widget
     /// - Not reserve exclusive space
     /// - Accept keyboard input on demand (for future features)
     fn create_layer_surface(&mut self, qh: &QueueHandle<Self>) {
@@ -659,7 +659,7 @@ impl MonitorWidget {
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
             surface,
-            Layer::Top,  // Use Top layer for better interaction
+            Layer::Bottom,  // Below windows, acts like desktop widget
             Some("cosmic-monitor-widget"),
             None,
         );
