@@ -475,7 +475,7 @@ impl PointerHandler for MonitorWidget {
                         }
                     }
                     
-                    // Priority 4: Check media control buttons (previous, play/pause, next, progress_bar)
+                    // Priority 4: Check media control buttons (previous, play/pause, next, progress_bar, player_dot_N)
                     if !handled {
                         for (button_name, x_start, y_start, x_end, y_end) in &self.media_button_bounds {
                             if click_x >= *x_start && click_x <= *x_end && click_y >= *y_start && click_y <= *y_end {
@@ -497,6 +497,15 @@ impl PointerHandler for MonitorWidget {
                                         let progress = (click_offset / bar_width).clamp(0.0, 1.0);
                                         log::info!("Progress bar clicked: {:.1}%", progress * 100.0);
                                         self.media.seek_to_progress(progress);
+                                    }
+                                    name if name.starts_with("player_dot_") => {
+                                        // Extract player index from button name
+                                        if let Some(index_str) = name.strip_prefix("player_dot_") {
+                                            if let Ok(index) = index_str.parse::<usize>() {
+                                                log::info!("Switching to player {}", index);
+                                                self.media.select_player(index);
+                                            }
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -812,8 +821,9 @@ impl MonitorWidget {
         let disk_count = if self.config.show_storage { self.storage.disk_info.len() } else { 0 };
         let battery_count = if self.config.show_battery { self.battery.devices().len() } else { 0 };
         let notification_count = if self.config.show_notifications { self.notifications.get_notifications().len() } else { 0 };
+        let player_count = if self.config.show_media { self.media.get_player_state().player_count() } else { 0 };
         let width = WIDGET_WIDTH as i32;
-        let height = calculate_widget_height_with_all(&self.config, disk_count, battery_count, notification_count) as i32;
+        let height = calculate_widget_height_with_all(&self.config, disk_count, battery_count, notification_count, player_count) as i32;
         let stride = width * 4;
 
         log::trace!("Drawing widget: {}x{} (disks: {})", width, height, disk_count);
@@ -882,7 +892,12 @@ impl MonitorWidget {
             .expect("Failed to create buffer");
 
         // Get media info
-        let media_info = self.media.get_media_info();
+        let player_state = self.media.get_player_state();
+        let media_info = player_state.current_player()
+            .map(|(_, info)| info.clone())
+            .unwrap_or_default();
+        let player_count = player_state.player_count();
+        let current_player_index = player_state.current_index;
         
         // Use Cairo for rendering
         let params = RenderParams {
@@ -922,6 +937,8 @@ impl MonitorWidget {
             grouped_notifications,
             collapsed_groups: &self.collapsed_groups,
             media_info: &media_info,
+            player_count,
+            current_player_index,
             section_order: &self.config.section_order,
             current_time,
             theme: &self.theme,

@@ -55,7 +55,7 @@ pub fn calculate_widget_height(config: &Config, disk_count: usize) -> u32 {
 ///
 /// Use [`calculate_widget_height_with_all`] for full control.
 pub fn calculate_widget_height_with_batteries(config: &Config, disk_count: usize, battery_count: usize) -> u32 {
-    calculate_widget_height_with_all(config, disk_count, battery_count, 0)
+    calculate_widget_height_with_all(config, disk_count, battery_count, 0, 0)
 }
 
 /// Calculate the required widget height based on enabled sections and content counts.
@@ -68,11 +68,12 @@ pub fn calculate_widget_height_with_batteries(config: &Config, disk_count: usize
 /// * `disk_count` - Number of mounted disks to display
 /// * `battery_count` - Number of battery devices (system + Solaar)
 /// * `notification_count` - Number of notifications (capped at max_notifications)
+/// * `player_count` - Number of media players (for pagination dots)
 ///
 /// # Returns
 ///
 /// Height in pixels, minimum 100px
-pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, battery_count: usize, notification_count: usize) -> u32 {
+pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, battery_count: usize, notification_count: usize, player_count: usize) -> u32 {
     let mut required_height = BASE_PADDING;
     
     // === Clock & Date Section ===
@@ -186,8 +187,11 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
     if config.show_media {
         required_height += SECTION_SPACING;
         required_height += 28; // "Now Playing" header (smaller)
-        required_height += 130; // Panel: title, artist, album, progress, controls
-        required_height += 30; // Bottom padding
+        required_height += 145; // Panel: title, artist, album, progress, controls
+        if player_count > 1 {
+            required_height += 36; // Extra space for pagination dots
+        }
+        required_height += 15; // Bottom padding after panel
     }
     
     // Final padding

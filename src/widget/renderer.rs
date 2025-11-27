@@ -193,6 +193,10 @@ pub struct RenderParams<'a> {
     pub collapsed_groups: &'a std::collections::HashSet<String>,
     /// Current media playback information
     pub media_info: &'a MediaInfo,
+    /// Number of available media players
+    pub player_count: usize,
+    /// Index of currently selected player
+    pub current_player_index: usize,
     /// Ordered list of sections to render
     pub section_order: &'a [WidgetSection],
     /// Current local time for clock/date display
@@ -349,7 +353,7 @@ pub fn render_widget(canvas: &mut [u8], params: RenderParams) -> (Option<(f64, f
                 WidgetSection::Media => {
                     if params.show_media {
                         y_pos += 10.0; // Spacing before media section
-                        let (new_y, buttons) = render_media(&cr, &layout, y_pos, params.media_info, params.theme);
+                        let (new_y, buttons) = render_media(&cr, &layout, y_pos, params.media_info, params.theme, params.player_count, params.current_player_index);
                         y_pos = new_y;
                         media_button_bounds = buttons;
                     }
@@ -480,7 +484,7 @@ pub fn render_main_widget(canvas: &mut [u8], params: RenderParams) -> (Vec<(Stri
                 WidgetSection::Media => {
                     if params.show_media {
                         y_pos += 10.0;
-                        let (new_y, _buttons) = render_media(&cr, &layout, y_pos, params.media_info, params.theme);
+                        let (new_y, _buttons) = render_media(&cr, &layout, y_pos, params.media_info, params.theme, params.player_count, params.current_player_index);
                         y_pos = new_y;
                     }
                 }
@@ -1727,6 +1731,7 @@ fn render_notifications(
 ///
 /// Uses the COSMIC theme accent color for the progress bar and play button.
 /// Displays album artwork if available, alongside track info and controls.
+/// Shows pagination dots when multiple players are available.
 /// Returns (y_position, button_bounds) where button_bounds is Vec<(button_name, x_start, y_start, x_end, y_end)>
 fn render_media(
     cr: &cairo::Context,
@@ -1734,6 +1739,8 @@ fn render_media(
     y_start: f64,
     media_info: &MediaInfo,
     theme: &CosmicTheme,
+    player_count: usize,
+    current_player_index: usize,
 ) -> (f64, MediaButtonBounds) {
     use super::media::PlaybackStatus;
     
@@ -1778,7 +1785,13 @@ fn render_media(
     }
     
     // Draw background panel (theme-aware)
-    let panel_height = 140.0;  // Increased to fit album art + controls
+    // Increase height if there are pagination dots
+    let base_panel_height = 145.0;  // Base panel height
+    let panel_height = if player_count > 1 {
+        base_panel_height + 36.0  // Extra space for pagination dots
+    } else {
+        base_panel_height
+    };
     let panel_y = y_pos;
     cr.set_source_rgba(panel_r, panel_g, panel_b, panel_a);
     cr.rectangle(10.0, panel_y, 360.0, panel_height);
@@ -1914,7 +1927,7 @@ fn render_media(
     } else {
         y_pos + 18.0
     };
-    y_pos = content_bottom + 4.0;
+    y_pos = content_bottom + 6.0;  // Space between album art and progress bar
     
     let bar_x = 20.0;
     let bar_width = 330.0;
@@ -2061,6 +2074,47 @@ fn render_media(
     cr.fill().expect("Failed to fill");
     
     button_bounds.push(("next".to_string(), next_x - 2.0, next_y - 2.0, next_x + button_size + 2.0, next_y + button_size + 2.0));
+    
+    // Draw pagination dots if multiple players
+    if player_count > 1 {
+        y_pos += button_size + 24.0;  // Space between controls and dots
+        
+        let dot_radius = 4.0;
+        let dot_spacing = 12.0;
+        let total_dots_width = (player_count as f64) * dot_spacing;
+        let dots_start_x = (370.0 - total_dots_width) / 2.0 + dot_radius;
+        
+        for i in 0..player_count {
+            let dot_x = dots_start_x + (i as f64) * dot_spacing;
+            let dot_y = y_pos;
+            
+            if i == current_player_index {
+                // Active dot - filled with accent color
+                cr.set_source_rgba(accent_r, accent_g, accent_b, 1.0);
+            } else {
+                // Inactive dot - outline only
+                cr.set_source_rgba(0.5, 0.5, 0.5, 0.8);
+            }
+            
+            cr.arc(dot_x, dot_y, dot_radius, 0.0, 2.0 * std::f64::consts::PI);
+            
+            if i == current_player_index {
+                cr.fill().expect("Failed to fill dot");
+            } else {
+                cr.set_line_width(1.5);
+                cr.stroke().expect("Failed to stroke dot");
+            }
+            
+            // Add clickable bounds for each dot
+            button_bounds.push((
+                format!("player_dot_{}", i),
+                dot_x - dot_radius - 4.0,
+                dot_y - dot_radius - 4.0,
+                dot_x + dot_radius + 4.0,
+                dot_y + dot_radius + 4.0,
+            ));
+        }
+    }
     
     // Return position after the panel with some padding
     (panel_y + panel_height + 15.0, button_bounds)
