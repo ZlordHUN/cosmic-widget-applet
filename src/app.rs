@@ -121,7 +121,7 @@ impl AppModel {
     /// `true` if the widget process is found, `false` otherwise.
     fn check_widget_running() -> bool {
         if let Ok(output) = std::process::Command::new("pgrep")
-            .arg("-f")
+            .arg("-x")
             .arg("cosmic-widget")
             .output()
         {
@@ -311,9 +311,10 @@ impl cosmic::Application for AppModel {
             Message::ToggleWidget => {
                 if self.widget_running {
                     // Kill the widget process
+                    // Use exact match to avoid killing cosmic-widget-applet too
                     log::info!("Stopping widget via pkill");
                     let _ = std::process::Command::new("pkill")
-                        .arg("-f")
+                        .arg("-x")
                         .arg("cosmic-widget")
                         .spawn();
                     self.widget_running = false;
