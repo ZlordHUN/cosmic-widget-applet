@@ -18,7 +18,7 @@
 //! desktop. It maintains minimal state - just tracking whether the widget is
 //! running and the current configuration.
 //!
-//! The actual monitoring widget runs as a separate process (`cosmic-monitor-widget`)
+//! The actual monitoring widget runs as a separate process (`cosmic-widget`)
 //! to allow for layer-shell positioning and independent lifecycle management.
 
 use crate::config::Config;
@@ -113,7 +113,7 @@ impl AppModel {
     
     /// Checks if the widget process is currently running.
     ///
-    /// Uses `pgrep` to search for the `cosmic-monitor-widget` process.
+    /// Uses `pgrep` to search for the `cosmic-widget` process.
     /// This is a simple but effective approach that doesn't require
     /// tracking PIDs manually.
     ///
@@ -122,7 +122,7 @@ impl AppModel {
     fn check_widget_running() -> bool {
         if let Ok(output) = std::process::Command::new("pgrep")
             .arg("-f")
-            .arg("cosmic-monitor-widget")
+            .arg("cosmic-widget")
             .output()
         {
             // pgrep returns empty output if no matching process found
@@ -149,10 +149,10 @@ impl cosmic::Application for AppModel {
 
     /// Unique application identifier in reverse domain name notation.
     /// Used for:
-    /// - Configuration storage path (~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/)
+    /// - Configuration storage path (~/.config/cosmic/com.github.zoliviragh.CosmicWidget/)
     /// - D-Bus registration
     /// - Desktop file identification
-    const APP_ID: &'static str = "com.github.zoliviragh.CosmicMonitor";
+    const APP_ID: &'static str = "com.github.zoliviragh.CosmicWidget";
 
     fn core(&self) -> &cosmic::Core {
         &self.core
@@ -188,7 +188,7 @@ impl cosmic::Application for AppModel {
         // Auto-start widget if configured to do so
         let widget_running = if config.widget_autostart {
             log::info!("Auto-start enabled, launching widget");
-            if std::process::Command::new("cosmic-monitor-widget").spawn().is_ok() {
+            if std::process::Command::new("cosmic-widget").spawn().is_ok() {
                 log::info!("Widget auto-started successfully");
                 true
             } else {
@@ -314,7 +314,7 @@ impl cosmic::Application for AppModel {
                     log::info!("Stopping widget via pkill");
                     let _ = std::process::Command::new("pkill")
                         .arg("-f")
-                        .arg("cosmic-monitor-widget")
+                        .arg("cosmic-widget")
                         .spawn();
                     self.widget_running = false;
                     
@@ -324,7 +324,7 @@ impl cosmic::Application for AppModel {
                 } else {
                     // Launch the widget process
                     log::info!("Launching widget");
-                    if std::process::Command::new("cosmic-monitor-widget").spawn().is_ok() {
+                    if std::process::Command::new("cosmic-widget").spawn().is_ok() {
                         self.widget_running = true;
                         
                         // Enable auto-start since user explicitly showed the widget
@@ -332,14 +332,14 @@ impl cosmic::Application for AppModel {
                         self.save_config();
                         log::info!("Widget launched successfully");
                     } else {
-                        log::error!("Failed to launch widget - is cosmic-monitor-widget in PATH?");
+                        log::error!("Failed to launch widget - is cosmic-widget in PATH?");
                     }
                 }
             }
             
             Message::OpenSettings => {
                 // Launch the settings application as a separate process
-                let _ = std::process::Command::new("cosmic-monitor-settings").spawn();
+                let _ = std::process::Command::new("cosmic-widget-settings").spawn();
             }
             
             Message::TogglePopup => {

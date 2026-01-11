@@ -10,9 +10,9 @@
 //! # Component Overview
 //!
 //! COSMIC Monitor consists of three separate binaries:
-//! 1. **cosmic-monitor-applet** (this binary): Panel integration
-//! 2. **cosmic-monitor-widget**: Standalone desktop widget (see `widget_main.rs`)
-//! 3. **cosmic-monitor-settings**: Configuration GUI (see `settings_main.rs`)
+//! 1. **cosmic-widget-applet** (this binary): Panel integration
+//! 2. **cosmic-widget**: Standalone desktop widget (see `widget_main.rs`)
+//! 3. **cosmic-widget-settings**: Configuration GUI (see `settings_main.rs`)
 //!
 //! # Architecture
 //!
@@ -34,7 +34,7 @@ mod i18n;
 /// Initializes logging and internationalization, then starts the iced event loop
 /// for the panel applet. The applet itself is defined in `app.rs`.
 fn main() -> cosmic::iced::Result {
-    // Initialize logger to write to /tmp/cosmic-monitor.log
+    // Initialize logger to write to /tmp/cosmic-widget.log
     // This log file is shared with the widget process for unified debugging.
     // Note: Logging is always enabled for the applet (it's lightweight).
     use std::fs::OpenOptions;
@@ -42,7 +42,7 @@ fn main() -> cosmic::iced::Result {
     let log_file = OpenOptions::new()
         .create(true)      // Create file if it doesn't exist
         .append(true)      // Append to existing content (don't truncate)
-        .open("/tmp/cosmic-monitor.log")
+        .open("/tmp/cosmic-widget.log")
         .expect("Failed to open log file");
     
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

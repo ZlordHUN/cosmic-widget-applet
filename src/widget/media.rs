@@ -452,6 +452,7 @@ impl MediaMonitor {
     fn get_mpris_players() -> Option<Vec<String>> {
         let output = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 "--dest=org.freedesktop.DBus",
                 "/org/freedesktop/DBus",
@@ -484,6 +485,7 @@ impl MediaMonitor {
         // Get metadata
         let metadata_output = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",
@@ -497,6 +499,7 @@ impl MediaMonitor {
         // Get playback status
         let status_output = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",
@@ -510,6 +513,7 @@ impl MediaMonitor {
         // Get position
         let position_output = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",
@@ -1238,6 +1242,7 @@ impl MediaMonitor {
     fn mpris_play_pause(&self, bus_name: &str) {
         let _ = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",
@@ -1249,6 +1254,7 @@ impl MediaMonitor {
     fn mpris_next(&self, bus_name: &str) {
         let _ = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",
@@ -1260,6 +1266,7 @@ impl MediaMonitor {
     fn mpris_previous(&self, bus_name: &str) {
         let _ = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",
@@ -1272,6 +1279,7 @@ impl MediaMonitor {
         // Get current position first
         let output = Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",
@@ -1290,6 +1298,7 @@ impl MediaMonitor {
         
         Command::new("dbus-send")
             .args(&[
+                "--session",
                 "--print-reply",
                 &format!("--dest={}", bus_name),
                 "/org/mpris/MediaPlayer2",

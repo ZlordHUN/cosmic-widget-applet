@@ -1,4 +1,4 @@
-app-title = Cosmic Monitor Applet
+app-title = Cosmic Widget Applet
 about = About
 view = View
 welcome = Welcome to COSMIC! ✨

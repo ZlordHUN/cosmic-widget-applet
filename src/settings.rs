@@ -18,7 +18,7 @@
 //!
 //! # Architecture
 //!
-//! The settings app is a separate binary (`cosmic-monitor-settings`) that:
+//! The settings app is a separate binary (`cosmic-widget-settings`) that:
 //! - Reads/writes the same config as the applet and widget via cosmic-config
 //! - Enables "movable mode" while open so users can drag the widget
 //! - Can restart the widget to apply changes via "Save & Apply"
@@ -78,10 +78,10 @@ pub struct CachedDiskInfo {
 impl WidgetCache {
     /// Returns the path to the cache file.
     ///
-    /// Located at `~/.cache/cosmic-monitor-applet/widget_cache.json`
+    /// Located at `~/.cache/cosmic-widget-applet/widget_cache.json`
     fn cache_path() -> std::path::PathBuf {
         let mut path = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        path.push("cosmic-monitor-applet");
+        path.push("cosmic-widget-applet");
         std::fs::create_dir_all(&path).ok();
         path.push("widget_cache.json");
         path
@@ -277,7 +277,7 @@ impl Application for SettingsApp {
     type Message = Message;
 
     /// Settings app ID - distinct from the main applet to allow separate windows.
-    const APP_ID: &'static str = "com.github.zoliviragh.CosmicMonitor.Settings";
+    const APP_ID: &'static str = "com.github.zoliviragh.CosmicWidget.Settings";
 
     fn core(&self) -> &cosmic::app::Core {
         &self.core
@@ -304,7 +304,7 @@ impl Application for SettingsApp {
     ) -> (Self, Task<cosmic::Action<Self::Message>>) {
         // Load config from the main app's config path (not the settings app path)
         let config_handler = cosmic_config::Config::new(
-            "com.github.zoliviragh.CosmicMonitor",
+            "com.github.zoliviragh.CosmicWidget",
             Config::VERSION,
         )
         .ok();
@@ -630,7 +630,7 @@ impl Application for SettingsApp {
                 widget::toggler(self.config.enable_logging)
                     .on_toggle(Message::ToggleLogging),
             ))
-            .push(widget::text::body("Writes debug logs to /tmp/cosmic-monitor.log"))
+            .push(widget::text::body("Writes debug logs to /tmp/cosmic-widget.log"))
             
             // === Save & Apply Button ===
             .push(
@@ -850,7 +850,7 @@ impl Application for SettingsApp {
                 // Kill existing widget process
                 match std::process::Command::new("pkill")
                     .arg("-f")
-                    .arg("cosmic-monitor-widget")
+                    .arg("cosmic-widget")
                     .status() {
                     Ok(status) => eprintln!("pkill status: {:?}", status),
                     Err(e) => eprintln!("pkill error: {:?}", e),
@@ -860,7 +860,7 @@ impl Application for SettingsApp {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 
                 // Spawn new widget using installed binary (from PATH)
-                match std::process::Command::new("cosmic-monitor-widget")
+                match std::process::Command::new("cosmic-widget")
                     .spawn() {
                     Ok(child) => eprintln!("Widget spawned with PID: {:?}", child.id()),
                     Err(e) => eprintln!("Spawn error: {:?}", e),

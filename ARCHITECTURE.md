@@ -4,9 +4,9 @@
 
 This project implements a Conky-style system monitor for COSMIC desktop with three separate binaries:
 
-1. **cosmic-monitor-applet** - Panel applet providing menu interface
-2. **cosmic-monitor-widget** - Borderless floating widget using Wayland layer-shell
-3. **cosmic-monitor-settings** - Configuration window
+1. **cosmic-widget-applet** - Panel applet providing menu interface
+2. **cosmic-widget** - Borderless floating widget using Wayland layer-shell
+3. **cosmic-widget-settings** - Configuration window
 
 ## Why Three Binaries?
 
@@ -29,8 +29,8 @@ This separation allows the widget to run continuously while settings/applet can 
 - Launches settings window
 
 **Key Features**:
-- Toggle Widget: Spawns or kills `cosmic-monitor-widget` process
-- Settings: Launches `cosmic-monitor-settings`
+- Toggle Widget: Spawns or kills `cosmic-widget` process
+- Settings: Launches `cosmic-widget-settings`
 - About: Shows app information
 
 **File**: `src/main.rs` (entry point), `src/app.rs` (logic)
@@ -224,9 +224,9 @@ Settings Window (Scrollable)
 
 **Apply Position Logic**:
 ```rust
-1. pkill -f cosmic-monitor-widget
+1. pkill -f cosmic-widget
 2. sleep(300ms)
-3. spawn /usr/bin/cosmic-monitor-widget
+3. spawn /usr/bin/cosmic-widget
 ```
 
 Why restart? Layer-shell margins are set at surface creation and cannot be changed at runtime.
@@ -285,9 +285,9 @@ pub enum WidgetSection {
 }
 ```
 
-**Storage**: `~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config`
+**Storage**: `~/.config/cosmic/com.github.zoliviragh.CosmicWidget/v1/config`
 
-**Cache**: `~/.cache/cosmic-monitor-applet/widget_cache.json`
+**Cache**: `~/.cache/cosmic-widget-applet/widget_cache.json`
 - Stores disk names and mount points
 - Stores battery device names and kinds
 - Enables instant display of placeholders on startup:
@@ -363,15 +363,15 @@ pub enum WidgetSection {
 
 ```toml
 [[bin]]
-name = "cosmic-monitor-applet"
+name = "cosmic-widget-applet"
 path = "src/main.rs"
 
 [[bin]]
-name = "cosmic-monitor-widget"
+name = "cosmic-widget"
 path = "src/widget_main.rs"
 
 [[bin]]
-name = "cosmic-monitor-settings"
+name = "cosmic-widget-settings"
 path = "src/settings_main.rs"
 ```
 
@@ -403,7 +403,7 @@ path = "src/settings_main.rs"
 ### Debugging Widget
 ```bash
 # Run with stderr output
-cosmic-monitor-widget 2>&1
+cosmic-widget 2>&1
 
 # Shows:
 # - Widget starting with position: X=?, Y=?
@@ -413,7 +413,7 @@ cosmic-monitor-widget 2>&1
 ### Debugging Settings
 ```bash
 # Run from terminal to see button clicks
-cosmic-monitor-settings 2>&1
+cosmic-widget-settings 2>&1
 
 # Shows:
 # - ApplyPosition clicked! Current position: X=?, Y=?
@@ -424,7 +424,7 @@ cosmic-monitor-settings 2>&1
 ### Testing Config Changes
 ```bash
 # Watch config file
-watch -n 0.5 cat ~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config
+watch -n 0.5 cat ~/.config/cosmic/com.github.zoliviragh.CosmicWidget/v1/config
 
 # Modify settings and see updates in real-time
 ```
@@ -449,6 +449,6 @@ watch -n 0.5 cat ~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config
 - `src/widget/network.rs` - Network monitoring module
 - `src/config.rs` - Shared configuration structure
 - `src/i18n.rs` - Localization support
-- `i18n/en/cosmic_monitor_applet.ftl` - English translations
+- `i18n/en/cosmic_widget_applet.ftl` - English translations
 - `resources/app.desktop` - Applet desktop file
 - `resources/settings.desktop` - Settings desktop file

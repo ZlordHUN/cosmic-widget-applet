@@ -1,9 +1,9 @@
 [Desktop Entry]
-Name=Cosmic Monitor Settings
-Comment=Configure system resource monitor for COSMIC
+Name=Cosmic Widget Settings
+Comment=Configure system resource monitor widget for COSMIC
 Type=Application
-Icon=com.github.zoliviragh.CosmicMonitor
-Exec=cosmic-monitor-settings
+Icon=com.github.zoliviragh.CosmicWidget
+Exec=cosmic-widget-settings
 Terminal=false
 StartupNotify=true
 Categories=COSMIC;Settings;

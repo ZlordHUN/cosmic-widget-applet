@@ -62,6 +62,7 @@ use std::time::{Duration, Instant};
 /// - `level`: Battery percentage 0-100, None if unavailable
 /// - `status`: Text status like "discharging", "charging", "good"
 /// - `kind`: Device type - "mouse", "keyboard", "headset"
+/// - `codename`: Short device codename for deduplication (e.g., "MX MCHNCL M")
 /// - `is_loading`: True while waiting for first real data (showing cached)
 /// - `is_connected`: False if device is paired but powered off/out of range
 #[derive(Debug, Clone)]
@@ -74,6 +75,8 @@ pub struct BatteryDevice {
     pub status: Option<String>,
     /// Device kind (e.g. "mouse", "keyboard", "headset")
     pub kind: Option<String>,
+    /// Device codename for deduplication (Logitech devices may appear multiple times)
+    pub codename: Option<String>,
     /// True if showing cached data while loading real data
     pub is_loading: bool,
     /// True if device is currently connected and responding
@@ -144,6 +147,7 @@ impl BatteryMonitor {
                 level: None,  // No cached level, will show "loading"
                 status: None,
                 kind: d.kind.clone(),
+                codename: None,
                 is_loading: true,  // Mark as loading until real data arrives
                 is_connected: false,
             })
@@ -289,10 +293,14 @@ fn query_solaar() -> Result<Vec<BatteryDevice>, String> {
 
     // Fallback: plain-text `solaar show` if JSON didn't give us devices
     // Older Solaar versions don't support JSON output
+    // Note: We don't check exit status here because Solaar may output valid
+    // device data to stdout before encountering an error (exit code 1).
+    // This happens when there's a Python exception while querying certain
+    // device settings - the battery data is still valid.
     if all_devices.is_empty() {
         if let Ok(output) = Command::new("solaar").arg("show").output() {
-            if output.status.success() {
-                if let Ok(text) = String::from_utf8(output.stdout) {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                if !text.is_empty() {
                     all_devices.extend(parse_solaar_text(&text));
                 }
             }
@@ -389,7 +397,7 @@ fn extract_device_from_json(value: &serde_json::Value) -> Option<BatteryDevice> 
         (None, None)
     };
 
-    Some(BatteryDevice { name, level, status, kind, is_loading: false, is_connected: true })
+    Some(BatteryDevice { name, level, status, kind, codename: None, is_loading: false, is_connected: true })
 }
 
 /// Extract battery level and status from a JSON battery object.
@@ -488,6 +496,7 @@ fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
                 level,
                 status: battery_status,
                 kind,
+                codename: None,
                 is_loading,
                 is_connected,
             });
@@ -518,12 +527,13 @@ fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
 ///
 /// 1. Look for device names starting with "N: Device Name" pattern
 /// 2. Track current device context
-/// 3. Extract "Kind:" and "Battery:" fields within device section
-/// 4. Avoid duplicates (same device can appear multiple times)
+/// 3. Extract "Kind:", "Codename:" and "Battery:" fields within device section
+/// 4. Avoid duplicates (same device can appear multiple times with different names)
 fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
     let mut devices = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_kind: Option<String> = None;
+    let mut current_codename: Option<String> = None;
     let mut in_device_section = false;
 
     for line in text.lines() {
@@ -543,6 +553,7 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
                     let after_colon = &line[colon_pos + 1..].trim();
                     current_name = Some(after_colon.to_string());
                     current_kind = None;
+                    current_codename = None;
                     in_device_section = true;
                     continue;
                 }
@@ -560,23 +571,54 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
                 current_kind = Some(kind_value.trim().to_string());
             }
         }
+        
+        // Look for codename (e.g., "Codename: MX MCHNCL M")
+        // This helps deduplicate devices that appear multiple times with different names
+        if trimmed.starts_with("Codename") {
+            if let Some(codename_value) = trimmed.split(':').nth(1) {
+                current_codename = Some(codename_value.trim().to_string());
+            }
+        }
 
         // Look for a battery line under the current device
-        // Format: "Battery: 90% (discharging)"
+        // Format: "Battery: 90% (discharging)" or "Battery: unknown (device is offline)."
         if trimmed.starts_with("Battery:") {
             if let Some(rest) = trimmed.strip_prefix("Battery:") {
                 let (level, status) = parse_battery_line(rest.trim());
-                // Only add if we have both a device name and battery level
-                if let (Some(name), Some(lvl)) = (current_name.clone(), level) {
-                    // Check if we already have this device (avoid duplicates)
-                    if !devices.iter().any(|d: &BatteryDevice| d.name == name) {
+                // Add device if we have a name (even without battery level for offline devices)
+                if let Some(name) = current_name.clone() {
+                    // Device is connected if it has a battery level
+                    let is_connected = level.is_some();
+                    
+                    // Check for duplicates by name or codename (same device can appear multiple times)
+                    // Logitech devices paired to multiple slots show up with different names but same codename
+                    let existing_idx = devices.iter().position(|d: &BatteryDevice| {
+                        d.name == name || (current_codename.is_some() && current_codename == d.codename)
+                    });
+                    
+                    if let Some(idx) = existing_idx {
+                        // If existing device is disconnected but this one is connected, replace it
+                        if !devices[idx].is_connected && is_connected {
+                            devices[idx] = BatteryDevice { 
+                                name, 
+                                level, 
+                                status,
+                                kind: current_kind.clone(),
+                                codename: current_codename.clone(),
+                                is_loading: false,
+                                is_connected,
+                            };
+                        }
+                    } else {
+                        // New device, add it
                         devices.push(BatteryDevice { 
                             name, 
-                            level: Some(lvl), 
+                            level, 
                             status,
                             kind: current_kind.clone(),
+                            codename: current_codename.clone(),
                             is_loading: false,
-                            is_connected: true,
+                            is_connected,
                         });
                     }
                 }

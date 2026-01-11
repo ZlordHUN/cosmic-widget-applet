@@ -8,7 +8,7 @@
 //!
 //! # Binary
 //!
-//! Compiles to `cosmic-monitor-widget`, typically installed to `/usr/bin/`.
+//! Compiles to `cosmic-widget`, typically installed to `/usr/bin/`.
 //! Can be launched via:
 //! - Panel applet "Show Widget" button
 //! - Auto-start when applet loads (if configured)
@@ -677,7 +677,7 @@ impl MonitorWidget {
             qh,
             surface,
             Layer::Bottom,  // Below windows, acts like desktop widget
-            Some("cosmic-monitor-widget"),
+            Some("cosmic-widget"),
             None,
         );
 
@@ -1035,7 +1035,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Load configuration to check if logging should be enabled
     let config_handler = cosmic_config::Config::new(
-        "com.github.zoliviragh.CosmicMonitor",
+        "com.github.zoliviragh.CosmicWidget",
         Config::VERSION,
     )?;
     
@@ -1048,7 +1048,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/tmp/cosmic-monitor.log")
+            .open("/tmp/cosmic-widget.log")
             .expect("Failed to open log file");
         
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

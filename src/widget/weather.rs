@@ -54,15 +54,15 @@ const WEATHER_ICONS_FONT: &[u8] = include_bytes!("../../resources/weathericons.t
 ///
 /// # Font Location
 ///
-/// Written to: `$XDG_CACHE_HOME/cosmic-monitor-weathericons.ttf`
-/// (typically `~/.cache/cosmic-monitor-weathericons.ttf`)
+/// Written to: `$XDG_CACHE_HOME/cosmic-widget-weathericons.ttf`
+/// (typically `~/.cache/cosmic-widget-weathericons.ttf`)
 pub fn load_weather_font() {
     use std::io::Write;
     use std::fs;
     
     // Create a temporary file for the font (Pango needs a file path)
     let cache_dir = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    let font_path = cache_dir.join("cosmic-monitor-weathericons.ttf");
+    let font_path = cache_dir.join("cosmic-widget-weathericons.ttf");
     
     // Write font to cache if it doesn't exist or size doesn't match (updated binary)
     if !font_path.exists() || fs::metadata(&font_path).map(|m| m.len()).unwrap_or(0) != WEATHER_ICONS_FONT.len() as u64 {

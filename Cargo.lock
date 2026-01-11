@@ -1119,35 +1119,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-monitor-applet"
-version = "0.1.0"
-dependencies = [
- "cairo-rs",
- "chrono",
- "dirs 5.0.1",
- "env_logger",
- "futures-util",
- "i18n-embed",
- "i18n-embed-fl",
- "image",
- "libc",
- "libcosmic",
- "log",
- "pango",
- "pangocairo",
- "reqwest",
- "rust-embed",
- "serde",
- "serde_json",
- "smithay-client-toolkit 0.20.0",
- "sysinfo",
- "tokio",
- "wayland-client",
- "wayland-protocols-wlr",
- "zbus 4.4.0",
-]
-
-[[package]]
 name = "cosmic-panel-config"
 version = "0.1.0"
 source = "git+https://github.com/pop-os/cosmic-panel#8f445a4ce944b6422e6310da06ad15a311c2bbf8"
@@ -1220,6 +1191,35 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "cosmic-widget-applet"
+version = "0.1.0"
+dependencies = [
+ "cairo-rs",
+ "chrono",
+ "dirs 5.0.1",
+ "env_logger",
+ "futures-util",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "image",
+ "libc",
+ "libcosmic",
+ "log",
+ "pango",
+ "pangocairo",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "smithay-client-toolkit 0.20.0",
+ "sysinfo",
+ "tokio",
+ "wayland-client",
+ "wayland-protocols-wlr",
+ "zbus 4.4.0",
 ]
 
 [[package]]

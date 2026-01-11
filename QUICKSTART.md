@@ -7,27 +7,27 @@
 cargo build --release
 
 # Or build individually
-cargo build --release --bin cosmic-monitor-applet
-cargo build --release --bin cosmic-monitor-widget
-cargo build --release --bin cosmic-monitor-settings
+cargo build --release --bin cosmic-widget-applet
+cargo build --release --bin cosmic-widget
+cargo build --release --bin cosmic-widget-settings
 ```
 
 This creates three binaries:
-- `target/release/cosmic-monitor-applet` - Panel applet
-- `target/release/cosmic-monitor-widget` - Borderless floating widget (layer-shell)
-- `target/release/cosmic-monitor-settings` - Configuration window
+- `target/release/cosmic-widget-applet` - Panel applet
+- `target/release/cosmic-widget` - Borderless floating widget (layer-shell)
+- `target/release/cosmic-widget-settings` - Configuration window
 
 ## Installing
 
 ```bash
 # Install all binaries
-sudo install -Dm755 target/release/cosmic-monitor-applet /usr/bin/cosmic-monitor-applet
-sudo install -Dm755 target/release/cosmic-monitor-widget /usr/bin/cosmic-monitor-widget
-sudo install -Dm755 target/release/cosmic-monitor-settings /usr/local/bin/cosmic-monitor-settings
+sudo install -Dm755 target/release/cosmic-widget-applet /usr/bin/cosmic-widget-applet
+sudo install -Dm755 target/release/cosmic-widget /usr/bin/cosmic-widget
+sudo install -Dm755 target/release/cosmic-widget-settings /usr/local/bin/cosmic-widget-settings
 
 # Install desktop files
-sudo install -Dm644 resources/app.desktop /usr/share/applications/com.github.zoliviragh.CosmicMonitor.desktop
-sudo install -Dm644 resources/settings.desktop /usr/share/applications/com.github.zoliviragh.CosmicMonitor.Settings.desktop
+sudo install -Dm644 resources/app.desktop /usr/share/applications/com.github.zoliviragh.CosmicWidget.desktop
+sudo install -Dm644 resources/settings.desktop /usr/share/applications/com.github.zoliviragh.CosmicWidget.Settings.desktop
 ```
 
 ## Running
@@ -41,7 +41,7 @@ Add the applet to your COSMIC panel through the panel configuration. The applet 
 ### Widget (Borderless Overlay)
 The widget is controlled via the panel applet menu. It can also be launched directly:
 ```bash
-cosmic-monitor-widget &
+cosmic-widget &
 ```
 
 The widget:
@@ -56,7 +56,7 @@ The widget:
 ### Settings
 Open via the applet menu or launch directly:
 ```bash
-cosmic-monitor-settings
+cosmic-widget-settings
 ```
 
 Settings include:
@@ -76,12 +76,12 @@ Settings include:
 
 Settings are stored via cosmic-config at:
 ```
-~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/config
+~/.config/cosmic/com.github.zoliviragh.CosmicWidget/v1/config
 ```
 
 Cache is stored at:
 ```
-~/.cache/cosmic-monitor-applet/widget_cache.json
+~/.cache/cosmic-widget-applet/widget_cache.json
 ```
 
 The cache stores:
@@ -132,7 +132,7 @@ Alternatively, to have the widget start with the system independently:
 
 1. Add to COSMIC startup applications:
    ```bash
-   cosmic-monitor-widget
+   cosmic-widget
    ```
 
 2. Or create a systemd user service (optional)
@@ -157,8 +157,8 @@ The widget will display battery status for all detected Logitech wireless device
 ## Troubleshooting
 
 ### Widget not appearing
-- Check if it's running: `ps aux | grep cosmic-monitor-widget`
-- Try launching from terminal to see errors: `cosmic-monitor-widget`
+- Check if it's running: `ps aux | grep cosmic-widget`
+- Try launching from terminal to see errors: `cosmic-widget`
 - Make sure it's installed to `/usr/bin/`
 
 ### Widget positioned off-screen
@@ -187,7 +187,7 @@ The widget will display battery status for all detected Logitech wireless device
 ### Widget startup slow
 - First startup loads fresh data which takes a few seconds
 - After first run, cache is created and subsequent startups are instant
-- Cache location: `~/.cache/cosmic-monitor-applet/widget_cache.json`
+- Cache location: `~/.cache/cosmic-widget-applet/widget_cache.json`
 
 ### Notifications not appearing
 - Make sure "Show Notifications" is enabled in Settings
@@ -218,13 +218,13 @@ The widget will display battery status for all detected Logitech wireless device
 
 ```bash
 # Run applet in development
-cargo run --bin cosmic-monitor-applet
+cargo run --bin cosmic-widget-applet
 
 # Run widget with debug output
-cargo run --bin cosmic-monitor-widget 2>&1
+cargo run --bin cosmic-widget 2>&1
 
 # Run settings
-cargo run --bin cosmic-monitor-settings
+cargo run --bin cosmic-widget-settings
 
 # Watch for changes and rebuild
 cargo watch -x 'build --release'

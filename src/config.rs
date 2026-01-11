@@ -9,7 +9,7 @@
 //!
 //! # Architecture
 //!
-//! The configuration is stored at `~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/`
+//! The configuration is stored at `~/.config/cosmic/com.github.zoliviragh.CosmicWidget/v1/`
 //! and uses the CosmicConfigEntry derive macro for automatic serialization and versioning.
 //!
 //! # Usage
@@ -18,7 +18,7 @@
 //! use cosmic::cosmic_config::{Config as CosmicConfig, CosmicConfigEntry};
 //! use crate::config::Config;
 //!
-//! let handler = CosmicConfig::new("com.github.zoliviragh.CosmicMonitor", Config::VERSION)?;
+//! let handler = CosmicConfig::new("com.github.zoliviragh.CosmicWidget", Config::VERSION)?;;
 //! let config = Config::get_entry(&handler).unwrap_or_default();
 //! ```
 
@@ -244,7 +244,7 @@ pub struct Config {
     // Advanced Settings
     // ========================================================================
     
-    /// Enable debug logging to /tmp/cosmic-monitor.log.
+    /// Enable debug logging to /tmp/cosmic-widget.log.
     /// Useful for troubleshooting issues. Disabled by default for performance.
     pub enable_logging: bool,
 }

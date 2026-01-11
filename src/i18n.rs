@@ -10,9 +10,9 @@
 //! ```text
 //! i18n/
 //! ├── en/
-//! │   └── cosmic_monitor_applet.ftl   # English translations (fallback)
+//! │   └── cosmic_widget_applet.ftl   # English translations (fallback)
 //! └── de/                              # German translations (example)
-//!     └── cosmic_monitor_applet.ftl
+//!     └── cosmic_widget_applet.ftl
 //! ```
 //!
 //! # Usage
@@ -32,7 +32,7 @@
 //! # Adding New Translations
 //!
 //! 1. Create a new directory under `i18n/` with the locale code (e.g., `fr/`)
-//! 2. Copy `en/cosmic_monitor_applet.ftl` to the new directory
+//! 2. Copy `en/cosmic_widget_applet.ftl` to the new directory
 //! 3. Translate the strings in the new file
 //!
 //! The system automatically selects the best available translation based on

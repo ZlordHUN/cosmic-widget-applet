@@ -1,9 +1,9 @@
 [Desktop Entry]
-Name=Cosmic Monitor Widget
+Name=Cosmic Widget
 Comment=System resource monitor widget for COSMIC
 Type=Application
-Icon=com.github.zoliviragh.CosmicMonitor
-Exec=cosmic-monitor-widget
+Icon=com.github.zoliviragh.CosmicWidget
+Exec=cosmic-widget
 Terminal=false
 StartupNotify=true
 Categories=COSMIC;System;Monitor;

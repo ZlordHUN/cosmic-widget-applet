@@ -1,21 +1,21 @@
 [package]
-name = "cosmic-monitor-applet"
+name = "cosmic-widget-applet"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
-description = "System resource monitor applet for COSMIC"
-repository = "https://github.com/pop-os/cosmic-app-template"
+description = "System resource monitor widget for COSMIC"
+repository = "https://github.com/zoliviragh/cosmic-widget-applet"
 
 [[bin]]
-name = "cosmic-monitor-applet"
+name = "cosmic-widget-applet"
 path = "src/main.rs"
 
 [[bin]]
-name = "cosmic-monitor-widget"
+name = "cosmic-widget"
 path = "src/widget_main.rs"
 
 [[bin]]
-name = "cosmic-monitor-settings"
+name = "cosmic-widget-settings"
 path = "src/settings_main.rs"
 
 [dependencies]

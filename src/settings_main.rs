@@ -7,7 +7,7 @@
 //!
 //! # Binary
 //!
-//! This compiles to `cosmic-monitor-settings` and is typically installed to
+//! This compiles to `cosmic-widget-settings` and is typically installed to
 //! `/usr/bin/` or `~/.local/bin/`. It's launched via:
 //! - The panel applet's "Configure" button
 //! - The `.desktop` file in applications menu
@@ -39,7 +39,7 @@ mod settings;
 /// with the SettingsApp model defined in `settings.rs`.
 fn main() -> cosmic::iced::Result {
     // Initialize internationalization with system language preferences.
-    // This loads translations from i18n/en/cosmic_monitor_applet.ftl (and other locales).
+    // This loads translations from i18n/en/cosmic_widget_applet.ftl (and other locales).
     let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
     i18n::init(&requested_languages);
 

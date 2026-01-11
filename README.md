@@ -1,10 +1,10 @@
 <div align="center">
 
-# COSMIC Monitor Applet
+# COSMIC Widget
 
 ![Icon](resources/icon.svg)
 
-*A Conky-style system monitoring applet for the COSMIC desktop environment*
+*A Conky-style system monitoring widget for the COSMIC desktop environment*
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
@@ -42,9 +42,9 @@ A borderless floating widget that displays real-time system statistics for the C
 
 This project consists of three separate binaries:
 
-1. **cosmic-monitor-applet**: Panel applet that provides the menu interface
-2. **cosmic-monitor-widget**: Borderless widget using direct Wayland layer-shell
-3. **cosmic-monitor-settings**: Configuration window for customizing the widget
+1. **cosmic-widget-applet**: Panel applet that provides the menu interface
+2. **cosmic-widget**: Borderless widget using direct Wayland layer-shell
+3. **cosmic-widget-settings**: Configuration window for customizing the widget
 
 The widget uses the Wayland layer-shell protocol directly (via smithay-client-toolkit) to bypass COSMIC's window management and achieve true borderless rendering, similar to Conky.
 
@@ -55,9 +55,9 @@ The widget uses the Wayland layer-shell protocol directly (via smithay-client-to
 cargo build --release
 
 # Or build individually
-cargo build --release --bin cosmic-monitor-applet
-cargo build --release --bin cosmic-monitor-widget
-cargo build --release --bin cosmic-monitor-settings
+cargo build --release --bin cosmic-widget-applet
+cargo build --release --bin cosmic-widget
+cargo build --release --bin cosmic-widget-settings
 ```
 
 ## Installation
@@ -70,14 +70,14 @@ cargo build --release
 sudo just install
 
 # Or install manually
-sudo install -Dm755 target/release/cosmic-monitor-applet /usr/local/bin/cosmic-monitor-applet
-sudo install -Dm755 target/release/cosmic-monitor-widget /usr/local/bin/cosmic-monitor-widget
-sudo install -Dm755 target/release/cosmic-monitor-settings /usr/local/bin/cosmic-monitor-settings
+sudo install -Dm755 target/release/cosmic-widget-applet /usr/local/bin/cosmic-widget-applet
+sudo install -Dm755 target/release/cosmic-widget /usr/local/bin/cosmic-widget
+sudo install -Dm755 target/release/cosmic-widget-settings /usr/local/bin/cosmic-widget-settings
 
 # Install desktop files and icon
-sudo install -Dm644 resources/app.desktop /usr/local/share/applications/com.github.zoliviragh.CosmicMonitor.desktop
-sudo install -Dm644 resources/settings.desktop /usr/local/share/applications/com.github.zoliviragh.CosmicMonitor.Settings.desktop
-sudo install -Dm644 resources/icon.svg /usr/local/share/icons/hicolor/scalable/apps/com.github.zoliviragh.CosmicMonitor.svg
+sudo install -Dm644 resources/app.desktop /usr/local/share/applications/com.github.zoliviragh.CosmicWidget.desktop
+sudo install -Dm644 resources/settings.desktop /usr/local/share/applications/com.github.zoliviragh.CosmicWidget.Settings.desktop
+sudo install -Dm644 resources/icon.svg /usr/local/share/icons/hicolor/scalable/apps/com.github.zoliviragh.CosmicWidget.svg
 
 # Update desktop database and icon cache
 sudo update-desktop-database /usr/local/share/applications
@@ -96,7 +96,7 @@ sudo gtk-update-icon-cache -f -t /usr/local/share/icons/hicolor
 
 Settings are stored using cosmic-config at:
 ```
-~/.config/cosmic/com.github.zoliviragh.CosmicMonitor/v1/
+~/.config/cosmic/com.github.zoliviragh.CosmicWidget/v1/
 ```
 
 Available options:
@@ -313,7 +313,7 @@ The grouping feature is especially useful when receiving multiple notifications 
 
 The widget caches drive and peripheral information at:
 ```
-~/.cache/cosmic-monitor-applet/widget_cache.json
+~/.cache/cosmic-widget-applet/widget_cache.json
 ```
 
 This allows the widget to instantly display disk names and battery devices on startup while loading fresh data in the background. Storage drives show empty bars with "Loading..." and battery devices show a "Disconnected" icon until data is refreshed or device comes online.

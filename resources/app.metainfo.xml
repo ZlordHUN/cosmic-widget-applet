@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.github.zoliviragh.CosmicMonitor</id>
+  <id>com.github.zoliviragh.CosmicWidget</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MPL-2.0</project_license>
-  <name>Cosmic Monitor Applet</name>
-  <summary>System resource monitor applet for COSMIC</summary>
+  <name>Cosmic Widget</name>
+  <summary>System resource monitor widget for COSMIC</summary>
   <icon type="remote" width="64" height="64" scale="1">
-    https://github.com/pop-os/cosmic-app-template/raw/main/resources/icons/hicolor/scalable/apps/icon.svg
+    https://github.com/zoliviragh/cosmic-widget-applet/raw/main/resources/icon.svg
   </icon>
-  <url type="vcs-browser">https://github.com/pop-os/cosmic-app-template</url>
-  <launchable type="desktop-id">com.github.zoliviragh.CosmicMonitor.desktop</launchable>
+  <url type="vcs-browser">https://github.com/zoliviragh/cosmic-widget-applet</url>
+  <launchable type="desktop-id">com.github.zoliviragh.CosmicWidget.desktop</launchable>
   <provides>
-    <id>com.github.zoliviragh.CosmicMonitor</id>
+    <id>com.github.zoliviragh.CosmicWidget</id>
     <binaries>
-      <binary>cosmic-monitor-applet</binary>
+      <binary>cosmic-widget-applet</binary>
     </binaries>
   </provides>
   <requires>

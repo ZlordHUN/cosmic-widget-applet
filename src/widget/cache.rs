@@ -11,7 +11,7 @@
 //!
 //! # Cache Location
 //!
-//! The cache is stored at `~/.cache/cosmic-monitor-applet/widget_cache.json`
+//! The cache is stored at `~/.cache/cosmic-widget-applet/widget_cache.json`
 //!
 //! # Data Stored
 //!
@@ -76,7 +76,7 @@ impl WidgetCache {
     /// Falls back to `/tmp` if cache directory cannot be determined.
     fn cache_path() -> PathBuf {
         let mut path = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        path.push("cosmic-monitor-applet");
+        path.push("cosmic-widget-applet");
         fs::create_dir_all(&path).ok();
         path.push("widget_cache.json");
         path

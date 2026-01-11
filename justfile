@@ -1,7 +1,7 @@
-name := 'cosmic-monitor-applet'
-widget-name := 'cosmic-monitor-widget'
-settings-name := 'cosmic-monitor-settings'
-appid := 'com.github.zoliviragh.CosmicMonitor'
+name := 'cosmic-widget-applet'
+widget-name := 'cosmic-widget'
+settings-name := 'cosmic-widget-settings'
+appid := 'com.github.zoliviragh.CosmicWidget'
 
 rootdir := ''
 prefix := '/usr/local'
