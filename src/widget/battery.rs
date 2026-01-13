@@ -463,33 +463,34 @@ fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
             let kind = Some("headset".to_string());
             
             // Extract battery information
-            let (level, battery_status, is_battery_available) = if let Some(battery) = device_obj.get("battery") {
+            let (level, battery_status) = if let Some(battery) = device_obj.get("battery") {
                 let status = battery.get("status").and_then(|v| v.as_str());
                 let level = battery.get("level").and_then(|v| v.as_i64()).and_then(|v| {
                     if v >= 0 && v <= 100 {
                         u8::try_from(v).ok()
                     } else {
-                        None
+                        None  // -1 means reading failed, treat as no level
                     }
                 });
                 
-                // HeadsetControl uses "BATTERY_AVAILABLE" status
-                let is_available = status == Some("BATTERY_AVAILABLE");
-                let status_text = if is_available {
-                    Some("available".to_string())
+                // HeadsetControl battery status:
+                // - BATTERY_AVAILABLE: battery level was successfully read
+                // - BATTERY_UNAVAILABLE: device present but couldn't read level (timing issue)
+                let status_text = if status == Some("BATTERY_AVAILABLE") && level.is_some() {
+                    Some("discharging".to_string())
                 } else {
-                    Some("unavailable".to_string())
+                    None  // No status if we couldn't read the level
                 };
                 
-                (level, status_text, is_available)
+                (level, status_text)
             } else {
-                (None, None, false)
+                (None, None)
             };
             
-            // HeadsetControl reports the device even if not connected to the dongle
-            // Only mark as connected if battery is available (device is powered on)
-            let is_connected = is_battery_available;
-            let is_loading = is_connected && level.is_none();
+            // Device is connected if HeadsetControl successfully queried it
+            // is_loading should be false - we're not "loading", we just couldn't read the battery
+            let is_connected = true;
+            let is_loading = false;
             
             devices.push(BatteryDevice {
                 name,

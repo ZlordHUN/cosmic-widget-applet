@@ -1197,13 +1197,15 @@ fn render_battery_section(
 
             y += 38.0; // Increased spacing between devices
         } else {
-            // No battery level available
-            layout.set_text("  Battery: N/A");
-            cr.move_to(10.0, y);
+            // No battery level available - show disconnected icon with N/A text
+            draw_disconnected_icon(cr, 10.0, y - 2.0, icon_size);
+            
+            layout.set_text("N/A");
+            cr.move_to(10.0 + icon_size + 8.0, y - 2.0);
             pangocairo::functions::layout_path(cr, layout);
             cr.set_source_rgb(0.0, 0.0, 0.0);
             cr.stroke_preserve().expect("Failed to stroke");
-            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.set_source_rgb(0.7, 0.7, 0.7);
             cr.fill().expect("Failed to fill");
             y += 38.0; // Increased spacing between devices
         }
