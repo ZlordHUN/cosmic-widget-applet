@@ -408,17 +408,12 @@ impl PointerHandler for MonitorWidget {
             }
             
             match event.kind {
-                // === Left-click handling (when NOT in drag mode) ===
+                // === Left-click handling ===
                 // Handles clicks on: Clear All, individual notification X buttons,
                 // group collapse/expand, and media playback controls.
+                // Note: Media buttons work even when widget_movable is true
                 PointerEventKind::Press { button, .. } if button == 0x110 => {
                     log::info!("Left-click detected at ({}, {}), widget_movable={}", event.position.0, event.position.1, self.config.widget_movable);
-                    
-                    // If widget is movable, don't process clicks (allow drag instead)
-                    if self.config.widget_movable {
-                        log::debug!("Widget is movable, skipping click handling");
-                        continue;
-                    }
                     
                     // Debounce: ignore clicks within 200ms of each other
                     let now = Instant::now();
@@ -552,6 +547,12 @@ impl PointerHandler for MonitorWidget {
                     
                     if handled {
                         log::debug!("Notification action handled, forcing redraw");
+                    } else if self.config.widget_movable {
+                        // No interactive element was clicked, start drag in movable mode
+                        log::debug!("No element clicked, starting drag at ({:.1}, {:.1})", click_x, click_y);
+                        self.dragging = true;
+                        self.drag_start_x = click_x;
+                        self.drag_start_y = click_y;
                     } else {
                         log::debug!("Click at ({:.1}, {:.1}) not handled by any notification element", click_x, click_y);
                     }
@@ -572,14 +573,7 @@ impl PointerHandler for MonitorWidget {
                 }
                 
                 // === Widget Dragging (only when movable mode is enabled) ===
-                // This is activated when the settings window is open
-                
-                // Start drag on left-click
-                PointerEventKind::Press { button, .. } if button == 0x110 && self.config.widget_movable => {
-                    self.dragging = true;
-                    self.drag_start_x = event.position.0;
-                    self.drag_start_y = event.position.1;
-                }
+                // Drag is started in the main Press handler above if no element was clicked
                 
                 // End drag on release
                 PointerEventKind::Release { button, .. } if button == 0x110 && self.config.widget_movable => {
