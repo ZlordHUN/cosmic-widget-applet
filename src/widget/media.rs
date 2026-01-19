@@ -283,6 +283,17 @@ impl MultiPlayerState {
             self.current_index = index;
         }
     }
+    
+    /// Toggle the playing state of the current player.
+    /// Used for immediate UI feedback after play/pause commands.
+    pub fn toggle_current_playing(&mut self) {
+        if let Some((_, info)) = self.players.get_mut(self.current_index) {
+            info.status = match info.status {
+                PlaybackStatus::Playing => PlaybackStatus::Paused,
+                _ => PlaybackStatus::Playing,
+            };
+        }
+    }
 }
 
 // ============================================================================
@@ -347,6 +358,10 @@ impl MediaMonitor {
     ) {
         log::info!("Starting multi-player media monitor");
         let mut last_art_urls: HashMap<PlayerId, String> = HashMap::new();
+        // Track last known position when playing, to work around Firefox MPRIS bug
+        // where position keeps incrementing even when paused
+        let mut paused_positions: HashMap<PlayerId, u64> = HashMap::new();
+        let mut last_status: HashMap<PlayerId, PlaybackStatus> = HashMap::new();
         
         loop {
             let mut players: Vec<(PlayerId, MediaInfo)> = Vec::new();
@@ -378,6 +393,27 @@ impl MediaMonitor {
                 for bus_name in mpris_players {
                     if let Some(mut info) = Self::try_mpris_player(&bus_name) {
                         let player_id = PlayerId::Mpris(bus_name.clone());
+                        
+                        // Workaround for Firefox MPRIS bug: position keeps incrementing when paused
+                        // Track when player transitions from Playing to Paused and freeze position
+                        let prev_status = last_status.get(&player_id).cloned();
+                        if info.status == PlaybackStatus::Playing {
+                            // Playing: update our cached position and clear any frozen position
+                            paused_positions.remove(&player_id);
+                        } else if info.status == PlaybackStatus::Paused {
+                            // Just transitioned to Paused? Save the current position
+                            if prev_status == Some(PlaybackStatus::Playing) {
+                                paused_positions.insert(player_id.clone(), info.position);
+                            }
+                            // Use the frozen position if we have one
+                            if let Some(&frozen_pos) = paused_positions.get(&player_id) {
+                                info.position = frozen_pos;
+                            }
+                        } else {
+                            // Stopped: clear cached position
+                            paused_positions.remove(&player_id);
+                        }
+                        last_status.insert(player_id.clone(), info.status.clone());
                         
                         // Load artwork if available
                         if let Some(ref url) = info.art_url {
@@ -1118,15 +1154,21 @@ impl MediaMonitor {
     
     /// Toggle play/pause on the current player.
     pub fn play_pause(&self) {
-        let state = self.player_state.lock().unwrap();
+        let mut state = self.player_state.lock().unwrap();
         if let Some((player_id, _)) = state.current_player() {
             let player_id = player_id.clone();
+            
+            // Toggle local state immediately for responsive UI
+            state.toggle_current_playing();
             drop(state);
             
+            log::info!("play_pause called for player: {:?}", player_id);
             match &player_id {
                 PlayerId::Cider => self.cider_play_pause(),
                 PlayerId::Mpris(bus_name) => self.mpris_play_pause(bus_name),
             }
+        } else {
+            log::warn!("play_pause called but no current player available");
         }
     }
     
@@ -1197,17 +1239,26 @@ impl MediaMonitor {
     }
     
     fn cider_play_pause(&self) {
-        if self.send_cider_command("playpause") {
-            let mut state = self.player_state.lock().unwrap();
-            if let Some((PlayerId::Cider, info)) = state.players.iter_mut()
-                .find(|(id, _)| matches!(id, PlayerId::Cider))
-            {
-                info.status = match info.status {
-                    PlaybackStatus::Playing => PlaybackStatus::Paused,
-                    _ => PlaybackStatus::Playing,
-                };
+        // State is already toggled by play_pause() caller
+        // Just send command in background to avoid blocking
+        self.send_cider_command_async("playpause");
+    }
+    
+    fn send_cider_command_async(&self, endpoint: &str) {
+        let token = self.cider_token.lock().unwrap().clone();
+        let url = format!("http://localhost:10767/api/v1/playback/{}", endpoint);
+        
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("curl");
+            cmd.args(&["-s", "-X", "POST", "--max-time", "1"]);
+            
+            if let Some(t) = token {
+                cmd.args(&["-H", &format!("apptoken: {}", t)]);
             }
-        }
+            
+            cmd.arg(&url);
+            let _ = cmd.output();
+        });
     }
     
     fn cider_next(&self) {
@@ -1240,7 +1291,8 @@ impl MediaMonitor {
     // ========================================================================
     
     fn mpris_play_pause(&self, bus_name: &str) {
-        let _ = Command::new("dbus-send")
+        log::info!("Sending PlayPause to MPRIS player: {}", bus_name);
+        let result = Command::new("dbus-send")
             .args(&[
                 "--session",
                 "--print-reply",
@@ -1249,6 +1301,19 @@ impl MediaMonitor {
                 "org.mpris.MediaPlayer2.Player.PlayPause",
             ])
             .output();
+        
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    log::info!("PlayPause command succeeded for {}", bus_name);
+                } else {
+                    log::error!("PlayPause command failed for {}: {:?}", bus_name, String::from_utf8_lossy(&output.stderr));
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to execute dbus-send for PlayPause: {}", e);
+            }
+        }
     }
     
     fn mpris_next(&self, bus_name: &str) {

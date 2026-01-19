@@ -217,6 +217,22 @@ pub struct RenderParams<'a> {
 pub type MediaButtonBounds = Vec<(String, f64, f64, f64, f64)>;
 
 // ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Truncate a string to a maximum number of characters, adding "..." if truncated.
+/// This function handles multi-byte UTF-8 characters correctly.
+fn truncate_string(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count > max_chars {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    } else {
+        s.to_string()
+    }
+}
+
+// ============================================================================
 // Main Rendering Functions
 // ============================================================================
 
@@ -1864,11 +1880,7 @@ fn render_media(
     let font_desc_bold = pango::FontDescription::from_string("Ubuntu Bold 12");
     layout.set_font_description(Some(&font_desc_bold));
     
-    let title = if media_info.title.len() > max_title_chars {
-        format!("{}...", &media_info.title[..max_title_chars.saturating_sub(3)])
-    } else {
-        media_info.title.clone()
-    };
+    let title = truncate_string(&media_info.title, max_title_chars);
     layout.set_text(&title);
     
     cr.move_to(text_x, y_pos);
@@ -1885,11 +1897,7 @@ fn render_media(
         let font_desc = pango::FontDescription::from_string("Ubuntu 11");
         layout.set_font_description(Some(&font_desc));
         
-        let artist = if media_info.artist.len() > max_artist_chars {
-            format!("{}...", &media_info.artist[..max_artist_chars.saturating_sub(3)])
-        } else {
-            media_info.artist.clone()
-        };
+        let artist = truncate_string(&media_info.artist, max_artist_chars);
         layout.set_text(&artist);
         
         cr.move_to(text_x, y_pos);
@@ -1907,11 +1915,7 @@ fn render_media(
         let font_desc_small = pango::FontDescription::from_string("Ubuntu Italic 10");
         layout.set_font_description(Some(&font_desc_small));
         
-        let album = if media_info.album.len() > max_album_chars {
-            format!("{}...", &media_info.album[..max_album_chars.saturating_sub(3)])
-        } else {
-            media_info.album.clone()
-        };
+        let album = truncate_string(&media_info.album, max_album_chars);
         layout.set_text(&album);
         
         cr.move_to(text_x, y_pos);

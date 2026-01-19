@@ -186,15 +186,21 @@ impl cosmic::Application for AppModel {
         let interval_input = format!("{}", config.update_interval_ms);
         
         // Auto-start widget if configured to do so
+        // Note: We add a small delay to give the compositor time to fully initialize
+        // its layer-shell input routing. Without this, the widget may not receive
+        // pointer events when started too early at boot.
         let widget_running = if config.widget_autostart {
-            log::info!("Auto-start enabled, launching widget");
-            if std::process::Command::new("cosmic-widget").spawn().is_ok() {
-                log::info!("Widget auto-started successfully");
-                true
-            } else {
-                log::error!("Failed to auto-start widget");
-                false
-            }
+            log::info!("Auto-start enabled, launching widget with 2s delay for compositor init");
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if let Err(e) = std::process::Command::new("cosmic-widget").spawn() {
+                    log::error!("Failed to auto-start widget: {}", e);
+                } else {
+                    log::info!("Widget auto-started successfully after delay");
+                }
+            });
+            // Assume it will start successfully (we'll verify later)
+            true
         } else {
             // Check if widget is already running (user may have started it manually)
             log::info!("Auto-start disabled, checking if widget is already running");

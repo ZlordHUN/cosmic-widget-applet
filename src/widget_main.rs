@@ -362,13 +362,17 @@ impl SeatHandler for MonitorWidget {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat) {
+        log::info!("New seat detected");
+    }
     
     /// Called when a seat gains a new capability (pointer, keyboard, touch).
     /// We request pointer events when pointer capability is available.
     fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wayland_client::protocol::wl_seat::WlSeat, capability: Capability) {
+        log::info!("New capability: {:?}", capability);
         if capability == Capability::Pointer {
             // Request pointer events
+            log::info!("Requesting pointer events from seat");
             let _ = self.seat_state.get_pointer(qh, &seat);
         }
     }
@@ -389,11 +393,33 @@ impl PointerHandler for MonitorWidget {
         events: &[PointerEvent],
     ) {
         for event in events {
+            // Log all pointer events for debugging
+            match &event.kind {
+                PointerEventKind::Enter { .. } => {
+                    log::info!("Pointer entered widget surface at ({}, {})", event.position.0, event.position.1);
+                }
+                PointerEventKind::Leave { .. } => {
+                    log::info!("Pointer left widget surface");
+                }
+                PointerEventKind::Motion { .. } => {
+                    // Don't log motion events, too noisy
+                }
+                _ => {}
+            }
+            
             match event.kind {
                 // === Left-click handling (when NOT in drag mode) ===
                 // Handles clicks on: Clear All, individual notification X buttons,
                 // group collapse/expand, and media playback controls.
-                PointerEventKind::Press { button, .. } if button == 0x110 && !self.config.widget_movable => {
+                PointerEventKind::Press { button, .. } if button == 0x110 => {
+                    log::info!("Left-click detected at ({}, {}), widget_movable={}", event.position.0, event.position.1, self.config.widget_movable);
+                    
+                    // If widget is movable, don't process clicks (allow drag instead)
+                    if self.config.widget_movable {
+                        log::debug!("Widget is movable, skipping click handling");
+                        continue;
+                    }
+                    
                     // Debounce: ignore clicks within 200ms of each other
                     let now = Instant::now();
                     if now.duration_since(self.last_click_time).as_millis() < 200 {
@@ -480,6 +506,14 @@ impl PointerHandler for MonitorWidget {
                         for (button_name, x_start, y_start, x_end, y_end) in &self.media_button_bounds {
                             if click_x >= *x_start && click_x <= *x_end && click_y >= *y_start && click_y <= *y_end {
                                 log::info!("Media button '{}' clicked at ({}, {})", button_name, click_x, click_y);
+                                // Debug: log current player state
+                                let player_state = self.media.get_player_state();
+                                log::info!("Player state: {} players, current_index={}", player_state.player_count(), player_state.current_index);
+                                if let Some((id, info)) = player_state.current_player() {
+                                    log::info!("Current player: {:?}, title: {}", id, info.title);
+                                } else {
+                                    log::warn!("No current player available!");
+                                }
                                 match button_name.as_str() {
                                     "play_pause" => {
                                         self.media.play_pause();
