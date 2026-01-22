@@ -96,6 +96,8 @@ pub struct StorageMonitor {
     disk_models: Arc<Mutex<HashMap<String, String>>>,
     /// Flag to track first update for cache saving
     is_first_update: bool,
+    /// Counter for periodic full disk list refresh (to detect new mounts)
+    update_counter: u32,
 }
 
 impl StorageMonitor {
@@ -148,6 +150,7 @@ impl StorageMonitor {
             disk_info,
             disk_models,
             is_first_update: true,
+            update_counter: 0,
         }
     }
     
@@ -221,9 +224,17 @@ impl StorageMonitor {
     /// - `/dev/sda1` → `sda` (SATA partition)
     /// - `/dev/mmcblk0p1` → `mmcblk0` (SD card partition)
     pub fn update(&mut self) {
-        // Only refresh existing disk data, don't rescan for new disks every time
-        // refresh_list() causes file descriptor leaks when called frequently
-        self.disks.refresh();
+        // Periodically refresh the full disk list to detect new mounts
+        // Every 30 updates (~30 seconds with 1s interval) we rescan for new disks
+        // This catches USB drives being plugged in or new partitions being mounted
+        self.update_counter += 1;
+        if self.update_counter >= 30 {
+            self.update_counter = 0;
+            self.disks = Disks::new_with_refreshed_list();
+        } else {
+            // Normal update: just refresh existing disk data (fast, no FD leak)
+            self.disks.refresh();
+        }
         
         self.disk_info.clear();
         

@@ -1412,8 +1412,9 @@ fn render_weather(
 /// Render storage/disk usage section
 fn render_storage(cr: &cairo::Context, layout: &pango::Layout, y: f64, disk_info: &[DiskInfo], show_percentages: bool) -> f64 {
     let mut y = y;
-    let bar_width = 200.0;
+    let bar_width = 280.0;  // Extended to accommodate longer SSD model names
     let bar_height = 12.0;
+    let percentage_x = 300.0;  // Position for percentage text (after extended bar)
     
     // Section header
     let header_font = pango::FontDescription::from_string("Ubuntu Bold 14");
@@ -1456,7 +1457,7 @@ fn render_storage(cr: &cairo::Context, layout: &pango::Layout, y: f64, disk_info
                 format!("{:.1}%", disk.used_percentage)
             };
             layout.set_text(&percentage_text);
-            cr.move_to(220.0, y);
+            cr.move_to(percentage_x, y);
             pangocairo::functions::layout_path(cr, layout);
             cr.set_source_rgb(0.0, 0.0, 0.0);
             cr.stroke_preserve().expect("Failed to stroke");
