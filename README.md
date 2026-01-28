@@ -22,7 +22,7 @@ A borderless floating widget that displays real-time system statistics for the C
 - **Borderless Widget**: Floating overlay widget using Wayland layer-shell protocol (no window borders!)
 - **Dynamic Sizing**: Widget automatically adjusts height based on enabled features
 - **Clock Display**: Large time display with 12/24-hour format toggle and date with Conky-style text outlines (toggleable)
-- **Weather Integration**: Real-time weather data with dynamic icons (sun, moon, clouds, rain, snow, fog, thunderstorm) from OpenWeatherMap API with day/night variants for all conditions
+- **Weather Integration**: Real-time weather data with dynamic icons (sun, moon, clouds, rain, snow, fog, thunderstorm) from Open-Meteo API (no API key required!) with day/night variants for all conditions
 - **Notification Monitor**: Real-time desktop notification capture via D-Bus with smart grouping by application, expand/collapse groups, and visual containers
 - **Temperature Monitoring**: Individual CPU and GPU temperature displays with sensor detection
 - **Circular Temperature Gauges**: Color-changing hollow rings for temperature visualization (switchable to text mode)
@@ -105,7 +105,7 @@ Available options:
 - **Battery Display**: Toggle battery section and enable Solaar integration for Logitech wireless devices
 - **Temperature Display**: Toggle CPU and GPU temperature monitoring independently, switch between circular gauges and text display
 - **Widget Display**: Toggle clock (12/24-hour format) and date displays independently
-- **Weather Display**: Toggle weather information, configure OpenWeatherMap API key and location (includes day/night icon variants)
+- **Weather Display**: Toggle weather information and configure location (no API key needed - uses Open-Meteo)
 - **Notification Display**: Toggle notification monitoring with grouped display by application
 - **Media Display**: Toggle media player information display with multi-source support (Cider, MPRIS players like browsers, Spotify, etc.)
 - **Layout Order**: Customize the order in which sections appear in the widget (Utilization, Temperatures, Storage, Battery, Weather, Notifications, Media)
@@ -143,13 +143,13 @@ Trade-offs:
 
 To enable weather display:
 
-1. Get a free API key from [OpenWeatherMap](https://openweathermap.org/api)
-2. Open Settings from the applet menu
-3. Enable "Show Weather"
-4. Enter your API key
-5. Enter your location (e.g., "London" or "New York")
+1. Open Settings from the applet menu
+2. Enable "Show Weather"
+3. Enter your location (e.g., "London", "New York", "Berlin")
 
-Weather updates every 10 minutes and displays:
+No API key required! Weather data is provided by [Open-Meteo](https://open-meteo.com/), a free and open-source weather API.
+
+Weather updates every 2 minutes and displays:
 - Current temperature
 - Weather description
 - Location name

@@ -519,16 +519,12 @@ impl Application for SettingsApp {
             .push(widget::divider::horizontal::default())
             
             // === Weather Display Section ===
+            // Uses Open-Meteo API (free, no API key required)
             .push(widget::text::heading(fl!("weather-display")))
             .push(widget::settings::item(
                 fl!("show-weather"),
                 widget::toggler(self.config.show_weather)
                     .on_toggle(Message::ToggleWeather),
-            ))
-            .push(widget::settings::item(
-                fl!("weather-api-key"),
-                widget::text_input("", &self.weather_api_key_input)
-                    .on_input(Message::UpdateWeatherApiKey),
             ))
             .push(widget::settings::item(
                 fl!("weather-location"),

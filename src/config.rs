@@ -153,16 +153,16 @@ pub struct Config {
     // Weather Section
     // ========================================================================
     
-    /// Show weather information from OpenWeatherMap.
-    /// Requires a valid API key and location to be configured.
+    /// Show weather information from Open-Meteo (no API key required).
+    /// Requires a location to be configured.
     pub show_weather: bool,
     
-    /// OpenWeatherMap API key for fetching weather data.
-    /// Get a free key at https://openweathermap.org/api
+    /// API key (deprecated - no longer required with Open-Meteo).
+    /// Kept for backward compatibility but ignored.
     pub weather_api_key: String,
     
-    /// Location for weather data (city name, "City,Country" format, or coordinates).
-    /// Examples: "London,UK", "New York,US", "48.8566,2.3522"
+    /// Location for weather data (city name or "City,Country" format).
+    /// Examples: "London", "New York", "Berlin, Germany"
     pub weather_location: String,
 
     // ========================================================================

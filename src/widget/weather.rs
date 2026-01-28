@@ -2,33 +2,31 @@
 
 //! # Weather Monitoring Module
 //!
-//! This module integrates with the OpenWeatherMap API to display current weather
+//! This module integrates with the Open-Meteo API to display current weather
 //! conditions in the widget. It includes custom icon rendering using the
 //! Weather Icons font.
 //!
 //! ## API Integration
 //!
-//! Uses the OpenWeatherMap "Current Weather Data" API:
-//! ```text
-//! https://api.openweathermap.org/data/2.5/weather?q={location}&appid={key}&units=metric
-//! ```
+//! Uses the Open-Meteo free API (no API key required):
+//! - Geocoding: `https://geocoding-api.open-meteo.com/v1/search?name={city}`
+//! - Weather: `https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=...`
 //!
-//! Requires a free API key from https://openweathermap.org/api
+//! See https://open-meteo.com/en/docs for full documentation.
 //!
 //! ## Update Frequency
 //!
-//! - Minimum interval: 10 minutes (600 seconds)
+//! - Minimum interval: 2 minutes (120 seconds)
 //! - Background thread polls for requests every 10 seconds
 //! - First update triggers immediately on startup
 //!
 //! ## Icon System
 //!
-//! OpenWeatherMap returns icon codes like "01d" (clear day) or "10n" (rain night).
-//! These are mapped to Weather Icons font characters for visual display.
+//! Open-Meteo returns WMO weather codes which are mapped to Weather Icons
+//! font characters for visual display.
 //!
 //! ## Error Handling
 //!
-//! - Missing API key: Silently skips updates
 //! - Missing location: Silently skips updates
 //! - API failure: Keeps previous data, logs error
 //! - Network timeout: 5 second limit to prevent blocking
@@ -74,43 +72,45 @@ pub fn load_weather_font() {
 }
 
 // ============================================================================
-// OpenWeatherMap API Response Structures
+// Open-Meteo API Response Structures
 // ============================================================================
 
-/// Root response from OpenWeatherMap "Current Weather" API.
+/// Response from Open-Meteo Geocoding API.
 #[derive(Debug, Deserialize)]
-struct OpenWeatherResponse {
-    /// Main weather measurements (temp, humidity)
-    main: MainWeather,
-    /// Array of weather conditions (usually one element)
-    weather: Vec<WeatherCondition>,
-    /// City name from API (may differ from input location)
+struct GeocodingResponse {
+    results: Option<Vec<GeocodingResult>>,
+}
+
+/// Single result from geocoding search.
+#[derive(Debug, Deserialize)]
+struct GeocodingResult {
     name: String,
+    latitude: f64,
+    longitude: f64,
+    country: Option<String>,
+    #[serde(default)]
+    admin1: Option<String>,
 }
 
-/// Temperature and humidity data from API.
+/// Response from Open-Meteo Weather Forecast API.
 #[derive(Debug, Deserialize)]
-struct MainWeather {
-    /// Current temperature in Celsius (with units=metric)
-    temp: f32,
-    /// "Feels like" temperature accounting for wind/humidity
-    feels_like: f32,
-    /// Minimum temperature (at the moment, not forecast)
-    temp_min: f32,
-    /// Maximum temperature (at the moment, not forecast)
-    temp_max: f32,
-    /// Humidity percentage (0-100)
-    humidity: u8,
+struct OpenMeteoResponse {
+    current: CurrentWeather,
 }
 
-/// Weather condition details from API.
+/// Current weather data from Open-Meteo API.
 #[derive(Debug, Deserialize)]
-struct WeatherCondition {
-    /// Human-readable description (e.g., "light rain", "clear sky")
-    description: String,
-    /// Icon code for weather visualization (e.g., "01d", "10n")
-    /// Format: 2-digit condition + day(d)/night(n) suffix
-    icon: String,
+struct CurrentWeather {
+    /// Current temperature in Celsius
+    temperature_2m: f32,
+    /// Relative humidity percentage
+    relative_humidity_2m: u8,
+    /// Apparent (feels like) temperature
+    apparent_temperature: f32,
+    /// WMO weather interpretation code
+    weather_code: u8,
+    /// 1 if daytime, 0 if night
+    is_day: u8,
 }
 
 // ============================================================================
@@ -120,7 +120,7 @@ struct WeatherCondition {
 /// Processed weather data for display in the widget.
 ///
 /// This struct contains all weather information needed for rendering,
-/// extracted and normalized from the OpenWeatherMap API response.
+/// extracted and normalized from the Open-Meteo API response.
 ///
 /// # Serialization
 ///
@@ -131,15 +131,15 @@ pub struct WeatherData {
     pub temperature: f32,
     /// "Feels like" temperature (wind chill / heat index)
     pub feels_like: f32,
-    /// Current minimum temperature
+    /// Current minimum temperature (not available from Open-Meteo current, set same as temp)
     pub temp_min: f32,
-    /// Current maximum temperature
+    /// Current maximum temperature (not available from Open-Meteo current, set same as temp)
     pub temp_max: f32,
     /// Humidity percentage (0-100)
     pub humidity: u8,
-    /// Capitalized weather description (e.g., "Light rain")
+    /// Capitalized weather description
     pub description: String,
-    /// OpenWeatherMap icon code (e.g., "01d", "10n")
+    /// Icon code for weather visualization (OpenWeatherMap-compatible format)
     pub icon: String,
     /// City name returned by API
     pub location: String,
@@ -162,10 +162,64 @@ impl Default for WeatherData {
 }
 
 // ============================================================================
+// WMO Weather Code Mapping
+// ============================================================================
+
+/// Convert WMO weather code to description and OpenWeatherMap-compatible icon code.
+///
+/// WMO Weather interpretation codes (WW):
+/// - 0: Clear sky
+/// - 1, 2, 3: Mainly clear, partly cloudy, overcast
+/// - 45, 48: Fog and depositing rime fog
+/// - 51, 53, 55: Drizzle (light, moderate, dense)
+/// - 56, 57: Freezing drizzle
+/// - 61, 63, 65: Rain (slight, moderate, heavy)
+/// - 66, 67: Freezing rain
+/// - 71, 73, 75: Snowfall (slight, moderate, heavy)
+/// - 77: Snow grains
+/// - 80, 81, 82: Rain showers (slight, moderate, violent)
+/// - 85, 86: Snow showers
+/// - 95: Thunderstorm
+/// - 96, 99: Thunderstorm with hail
+fn wmo_to_description_and_icon(code: u8, is_day: bool) -> (String, String) {
+    let day_suffix = if is_day { "d" } else { "n" };
+    
+    let (description, icon_base) = match code {
+        0 => ("Clear sky", "01"),
+        1 => ("Mainly clear", "02"),
+        2 => ("Partly cloudy", "03"),
+        3 => ("Overcast", "04"),
+        45 | 48 => ("Fog", "50"),
+        51 => ("Light drizzle", "09"),
+        53 => ("Moderate drizzle", "09"),
+        55 => ("Dense drizzle", "09"),
+        56 | 57 => ("Freezing drizzle", "09"),
+        61 => ("Slight rain", "10"),
+        63 => ("Moderate rain", "10"),
+        65 => ("Heavy rain", "10"),
+        66 | 67 => ("Freezing rain", "10"),
+        71 => ("Slight snowfall", "13"),
+        73 => ("Moderate snowfall", "13"),
+        75 => ("Heavy snowfall", "13"),
+        77 => ("Snow grains", "13"),
+        80 => ("Slight rain showers", "09"),
+        81 => ("Moderate rain showers", "09"),
+        82 => ("Violent rain showers", "09"),
+        85 => ("Slight snow showers", "13"),
+        86 => ("Heavy snow showers", "13"),
+        95 => ("Thunderstorm", "11"),
+        96 | 99 => ("Thunderstorm with hail", "11"),
+        _ => ("Unknown", "01"),
+    };
+    
+    (description.to_string(), format!("{}{}", icon_base, day_suffix))
+}
+
+// ============================================================================
 // Weather Monitor Struct
 // ============================================================================
 
-/// Monitors weather conditions via OpenWeatherMap API.
+/// Monitors weather conditions via Open-Meteo API.
 ///
 /// Fetches weather data in a background thread to avoid blocking the render loop.
 /// Updates are rate-limited to once every 10 minutes to respect API quotas.
@@ -173,25 +227,27 @@ impl Default for WeatherData {
 /// # Threading Model
 ///
 /// - `weather_data`: Shared state with latest weather info
-/// - `api_key` / `location`: Shared config, can be updated from settings
+/// - `location`: Shared config, can be updated from settings
 /// - `update_requested`: Flag to trigger background fetch
 /// - Background thread checks for requests every 10 seconds
 ///
 /// # Configuration
 ///
-/// Requires both an API key and location to be set. Without these, updates
-/// are silently skipped.
+/// Only requires a location to be set. No API key needed!
 pub struct WeatherMonitor {
     /// Shared weather data, updated by background thread
     pub weather_data: Arc<Mutex<Option<WeatherData>>>,
     /// Timestamp of last update (for rate limiting)
     pub last_update: Instant,
-    /// OpenWeatherMap API key (shared for background thread)
-    api_key: Arc<Mutex<String>>,
     /// Location query string (city name or "city,country")
     location: Arc<Mutex<String>>,
+    /// Cached coordinates from last geocoding lookup
+    cached_coords: Arc<Mutex<Option<(f64, f64, String)>>>,
     /// Flag to signal background thread that an update is needed
     update_requested: Arc<Mutex<bool>>,
+    /// API key (kept for backward compatibility, but no longer required)
+    #[allow(dead_code)]
+    api_key: Arc<Mutex<String>>,
 }
 
 impl WeatherMonitor {
@@ -199,7 +255,7 @@ impl WeatherMonitor {
     ///
     /// # Arguments
     ///
-    /// * `api_key` - OpenWeatherMap API key (from settings)
+    /// * `api_key` - Ignored (kept for backward compatibility)
     /// * `location` - Location query (e.g., "London", "New York,US")
     ///
     /// # Initialization
@@ -216,13 +272,14 @@ impl WeatherMonitor {
         let location = Arc::new(Mutex::new(location));
         let update_requested = Arc::new(Mutex::new(false));
         let weather_data = Arc::new(Mutex::new(None));
+        let cached_coords: Arc<Mutex<Option<(f64, f64, String)>>> = Arc::new(Mutex::new(None));
         
         // Spawn background thread for weather updates
         // This avoids blocking the main render loop on network requests
-        let api_key_clone = Arc::clone(&api_key);
         let location_clone = Arc::clone(&location);
         let update_requested_clone = Arc::clone(&update_requested);
         let weather_data_clone = Arc::clone(&weather_data);
+        let cached_coords_clone = Arc::clone(&cached_coords);
         
         std::thread::spawn(move || {
             loop {
@@ -241,19 +298,49 @@ impl WeatherMonitor {
                 };
                 
                 if requested {
-                    let api_key = api_key_clone.lock().unwrap().clone();
                     let location = location_clone.lock().unwrap().clone();
                     
-                    if !api_key.is_empty() && !location.is_empty() {
+                    if !location.is_empty() {
                         log::info!("Background: Fetching weather data for location: {}", location);
-                        match Self::fetch_weather_static(&api_key, &location) {
-                            Ok(data) => {
-                                log::info!("Background: Weather data fetched: {}°C, {} (icon: {})", 
-                                    data.temperature, data.description, data.icon);
-                                *weather_data_clone.lock().unwrap() = Some(data);
+                        
+                        // Get coordinates (from cache or geocoding API)
+                        let cached = {
+                            let guard = cached_coords_clone.lock().unwrap();
+                            guard.clone()
+                        };
+                        
+                        let coords: Option<(f64, f64, String)> = match cached {
+                            Some((lat, lon, ref cached_loc)) if *cached_loc == location => {
+                                log::debug!("Using cached coordinates for {}: ({}, {})", location, lat, lon);
+                                Some((lat, lon, cached_loc.clone()))
                             }
-                            Err(e) => {
-                                log::error!("Background: Failed to fetch weather: {}", e);
+                            _ => {
+                                log::info!("Geocoding location: {}", location);
+                                match Self::geocode_location(&location) {
+                                    Ok((lat, lon, name)) => {
+                                        log::info!("Geocoded {} to ({}, {}) - {}", location, lat, lon, name);
+                                        let result = (lat, lon, location.clone());
+                                        *cached_coords_clone.lock().unwrap() = Some(result.clone());
+                                        Some((lat, lon, name))
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to geocode location {}: {}", location, e);
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        
+                        if let Some((lat, lon, ref location_name)) = coords {
+                            match Self::fetch_weather_static(lat, lon, location_name) {
+                                Ok(data) => {
+                                    log::info!("Background: Weather data fetched: {}°C, {} (icon: {})", 
+                                        data.temperature, data.description, data.icon);
+                                    *weather_data_clone.lock().unwrap() = Some(data);
+                                }
+                                Err(e) => {
+                                    log::error!("Background: Failed to fetch weather: {}", e);
+                                }
                             }
                         }
                     }
@@ -266,37 +353,36 @@ impl WeatherMonitor {
             last_update,
             api_key,
             location,
+            cached_coords,
             update_requested,
         }
     }
 
     /// Request a weather update if rate limit has elapsed.
     ///
-    /// Rate-limited to once every 10 minutes (600 seconds) to respect
-    /// OpenWeatherMap API quotas. The actual API call runs in the background
-    /// thread - this just sets a flag.
+    /// Rate-limited to once every 2 minutes (120 seconds). Open-Meteo allows
+    /// up to 10,000 calls/day for non-commercial use. The actual API call
+    /// runs in the background thread - this just sets a flag.
     ///
     /// # Skipped When
     ///
-    /// - API key is empty or not configured
     /// - Location is empty or not configured
     /// - Less than 10 minutes since last update
     pub fn update(&mut self) {
-        // Only update if we have an API key and location
+        // Only update if we have a location
         {
-            let api_key = self.api_key.lock().unwrap();
             let location = self.location.lock().unwrap();
             
-            if api_key.is_empty() || location.is_empty() {
-                log::trace!("Weather update skipped: API key or location not configured");
+            if location.is_empty() {
+                log::trace!("Weather update skipped: location not configured");
                 return;
             }
         }
         
-        // Don't update more than once every 10 minutes (API rate limiting)
+        // Don't update more than once every 2 minutes (API rate limiting)
         let elapsed = self.last_update.elapsed().as_secs();
-        if elapsed < 600 {
-            log::trace!("Weather update skipped: too soon ({}s since last update, need 600s)", elapsed);
+        if elapsed < 120 {
+            log::trace!("Weather update skipped: too soon ({}s since last update, need 120s)", elapsed);
             return;
         }
         
@@ -305,86 +391,93 @@ impl WeatherMonitor {
         self.last_update = Instant::now();
     }
     
-    /// Fetch weather data from OpenWeatherMap API (blocking).
+    /// Geocode a location name to coordinates using Open-Meteo Geocoding API.
+    fn geocode_location(location: &str) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
+        let location = location.trim_matches('"');
+        
+        let url = format!(
+            "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
+            urlencoding::encode(location)
+        );
+        
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+            
+        let response: GeocodingResponse = client.get(&url).send()?.json()?;
+        
+        let result = response.results
+            .and_then(|r| r.into_iter().next())
+            .ok_or("No location found")?;
+        
+        // Build a nice location name
+        let location_name = if let Some(country) = &result.country {
+            if let Some(admin1) = &result.admin1 {
+                format!("{}, {}", result.name, admin1)
+            } else {
+                format!("{}, {}", result.name, country)
+            }
+        } else {
+            result.name.clone()
+        };
+        
+        Ok((result.latitude, result.longitude, location_name))
+    }
+    
+    /// Fetch weather data from Open-Meteo API (blocking).
     ///
     /// This is a static method called from the background thread.
     ///
     /// # API Request
     ///
     /// ```text
-    /// GET https://api.openweathermap.org/data/2.5/weather?q={location}&appid={key}&units=metric
+    /// GET https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=...
     /// ```
-    ///
-    /// # Processing
-    ///
-    /// 1. Strip quotes from config values (cosmic_config quirk)
-    /// 2. Build API URL with metric units
-    /// 3. Make HTTP request with 5-second timeout
-    /// 4. Parse JSON response
-    /// 5. Capitalize weather description
-    /// 6. Return processed WeatherData
-    fn fetch_weather_static(api_key: &str, location: &str) -> Result<WeatherData, Box<dyn std::error::Error>> {
-        // Strip quotes from location and API key (cosmic_config may store them with quotes)
-        let location = location.trim_matches('"');
-        let api_key = api_key.trim_matches('"');
-        
-        log::debug!("Making API request for location: {}", location);
+    fn fetch_weather_static(lat: f64, lon: f64, location: &str) -> Result<WeatherData, Box<dyn std::error::Error>> {
+        log::debug!("Making API request for coordinates: ({}, {})", lat, lon);
         
         let url = format!(
-            "https://api.openweathermap.org/data/2.5/weather?q={}&appid={}&units=metric",
-            location, api_key
+            "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,is_day&temperature_unit=celsius",
+            lat, lon
         );
 
         // Use a client with timeout to prevent blocking indefinitely
-        // 5 seconds is generous for a simple API call
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
             
-        let response: OpenWeatherResponse = client.get(&url).send()?.json()?;
+        let response: OpenMeteoResponse = client.get(&url).send()?.json()?;
         
-        log::debug!("Weather API response received for: {}", response.name);
+        log::debug!("Weather API response received");
 
-        // Capitalize first letter of description
-        let description = response
-            .weather
-            .first()
-            .map(|w| {
-                let mut desc = w.description.clone();
-                if let Some(first_char) = desc.chars().next() {
-                    desc = first_char.to_uppercase().collect::<String>() + &desc[1..];
-                }
-                desc
-            })
-            .unwrap_or_else(|| String::from("Unknown"));
-
-        // Extract icon code (e.g., "01d", "10n")
-        let icon = response
-            .weather
-            .first()
-            .map(|w| w.icon.clone())
-            .unwrap_or_else(|| String::from("01d"));
+        let is_day = response.current.is_day == 1;
+        let (description, icon) = wmo_to_description_and_icon(response.current.weather_code, is_day);
 
         Ok(WeatherData {
-            temperature: response.main.temp,
-            feels_like: response.main.feels_like,
-            temp_min: response.main.temp_min,
-            temp_max: response.main.temp_max,
-            humidity: response.main.humidity,
+            temperature: response.current.temperature_2m,
+            feels_like: response.current.apparent_temperature,
+            temp_min: response.current.temperature_2m,  // Not available in current data
+            temp_max: response.current.temperature_2m,  // Not available in current data
+            humidity: response.current.relative_humidity_2m,
             description,
             icon,
-            location: response.name,
+            location: location.to_string(),
         })
     }
     
-    /// Update the API key (called when settings change).
+    /// Update the API key (kept for backward compatibility, but no longer used).
     pub fn set_api_key(&mut self, api_key: String) {
         *self.api_key.lock().unwrap() = api_key;
     }
     
     /// Update the location query (called when settings change).
+    /// Clears the cached coordinates to force a new geocoding lookup.
     pub fn set_location(&mut self, location: String) {
-        *self.location.lock().unwrap() = location;
+        let old_location = self.location.lock().unwrap().clone();
+        if old_location != location {
+            *self.location.lock().unwrap() = location;
+            *self.cached_coords.lock().unwrap() = None;  // Clear cache on location change
+        }
     }
 }
 
@@ -394,7 +487,7 @@ impl WeatherMonitor {
 
 /// Draw a weather icon using the Weather Icons font.
 ///
-/// Maps OpenWeatherMap icon codes to Weather Icons Unicode characters
+/// Maps icon codes to Weather Icons Unicode characters
 /// and renders them using Pango/Cairo.
 ///
 /// # Arguments
@@ -403,11 +496,11 @@ impl WeatherMonitor {
 /// * `x` - Left edge X coordinate
 /// * `y` - Top edge Y coordinate
 /// * `size` - Icon size in pixels (width and height)
-/// * `icon_code` - OpenWeatherMap icon code (e.g., "01d", "10n")
+/// * `icon_code` - Icon code (e.g., "01d", "10n")
 ///
 /// # Icon Code Format
 ///
-/// OpenWeatherMap uses codes like "01d" or "10n":
+/// Uses OpenWeatherMap-compatible codes like "01d" or "10n":
 /// - First 2 chars: Weather condition (01-50)
 /// - Last char: Day (d) or Night (n)
 ///
@@ -429,7 +522,7 @@ pub fn draw_weather_icon(cr: &cairo::Context, x: f64, y: f64, size: f64, icon_co
     let condition = if icon_code.len() >= 2 { &icon_code[0..2] } else { "01" };
     let is_day = icon_code.ends_with('d');
     
-    // Map OpenWeatherMap icon codes to Weather Icons font Unicode characters
+    // Map icon codes to Weather Icons font Unicode characters
     // Reference: https://erikflowers.github.io/weather-icons/
     let icon_char = match condition {
         "01" => if is_day { "\u{f00d}" } else { "\u{f02e}" },  // wi-day-sunny / wi-night-clear
