@@ -919,6 +919,7 @@ fn render_circular_temps(
             y + circle_radius - text_height as f64 / 2.0
         );
         pangocairo::functions::layout_path(cr, layout);
+        cr.set_line_width(0.8);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
         cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -934,6 +935,7 @@ fn render_circular_temps(
             y + circle_diameter + 6.0
         );
         pangocairo::functions::layout_path(cr, layout);
+        cr.set_line_width(0.8);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
         cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -960,6 +962,7 @@ fn render_circular_temps(
             y + circle_radius - text_height as f64 / 2.0
         );
         pangocairo::functions::layout_path(cr, layout);
+        cr.set_line_width(0.8);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
         cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -975,6 +978,7 @@ fn render_circular_temps(
             y + circle_diameter + 6.0
         );
         pangocairo::functions::layout_path(cr, layout);
+        cr.set_line_width(0.8);
         cr.set_source_rgb(0.0, 0.0, 0.0);
         cr.stroke_preserve().expect("Failed to stroke");
         cr.set_source_rgb(1.0, 1.0, 1.0);

@@ -77,12 +77,20 @@ impl TemperatureMonitor {
     ///
     /// # CPU Detection Priority
     ///
-    /// Matches first sensor containing (case-insensitive):
-    /// 1. "cpu" - Generic CPU label
-    /// 2. "package" - Intel package temperature
-    /// 3. "core" - Individual core temperature
-    /// 4. "tctl" - AMD Ryzen control temperature
-    /// 5. "tdie" - AMD Ryzen die temperature
+    /// Uses a tiered priority system (case-insensitive) to find the most
+    /// accurate CPU temperature reading:
+    ///
+    /// **Tier 1 — Preferred (actual die/package temps):**
+    /// - "tdie" - AMD Ryzen actual die temperature
+    /// - "tccd" - AMD Ryzen CCD (Core Complex Die) temps — averaged if multiple
+    /// - "package" - Intel package temperature
+    ///
+    /// **Tier 2 — Acceptable fallbacks:**
+    /// - "cpu" - Generic CPU label
+    /// - "core" - Individual core temperature
+    ///
+    /// **Tier 3 — Last resort:**
+    /// - "tctl" - AMD Ryzen control temperature (inflated for fan curves)
     ///
     /// # GPU Detection Priority
     ///
@@ -96,19 +104,54 @@ impl TemperatureMonitor {
         // Refresh all component data from hwmon
         self.components.refresh();
         
-        // Try to find CPU temperature
-        // Search through all components for first matching CPU sensor
-        self.cpu_temp = 0.0;
+        // ---- CPU Temperature Detection ----
+        // Use a tiered approach: prefer actual die temps over control temps.
+        // AMD Tctl is intentionally offset above real die temp for fan curves,
+        // so we prefer Tdie or Tccd readings when available.
+        
+        let mut tdie_temp: Option<f32> = None;
+        let mut tccd_temps: Vec<f32> = Vec::new();
+        let mut package_temp: Option<f32> = None;
+        let mut cpu_generic_temp: Option<f32> = None;
+        let mut core_temp: Option<f32> = None;
+        let mut tctl_temp: Option<f32> = None;
+        
         for component in &self.components {
             let label = component.label().to_lowercase();
-            if label.contains("cpu") || label.contains("package") || label.contains("core") 
-                || label.contains("tctl") || label.contains("tdie") {
-                self.cpu_temp = component.temperature();
-                break;
+            let temp = component.temperature();
+            
+            if label.contains("tdie") {
+                tdie_temp = Some(temp);
+            } else if label.contains("tccd") {
+                tccd_temps.push(temp);
+            } else if label.contains("package") {
+                package_temp = Some(temp);
+            } else if label.contains("cpu") {
+                cpu_generic_temp = Some(temp);
+            } else if label.contains("core") && core_temp.is_none() {
+                core_temp = Some(temp);
+            } else if label.contains("tctl") {
+                tctl_temp = Some(temp);
             }
         }
         
-        // Try to find GPU temperature
+        // Average Tccd readings if we have multiple CCDs
+        let tccd_avg = if !tccd_temps.is_empty() {
+            Some(tccd_temps.iter().sum::<f32>() / tccd_temps.len() as f32)
+        } else {
+            None
+        };
+        
+        // Pick best available: Tdie > Tccd avg > Package > CPU > Core > Tctl
+        self.cpu_temp = tdie_temp
+            .or(tccd_avg)
+            .or(package_temp)
+            .or(cpu_generic_temp)
+            .or(core_temp)
+            .or(tctl_temp)
+            .unwrap_or(0.0);
+        
+        // ---- GPU Temperature Detection ----
         // Search through all components for first matching GPU sensor
         self.gpu_temp = 0.0;
         for component in &self.components {
@@ -157,6 +200,9 @@ impl TemperatureMonitor {
 /// └─────────────────┘
 /// ```
 pub fn draw_temp_circle(cr: &cairo::Context, x: f64, y: f64, radius: f64, temp: f32, max_temp: f32) {
+    // Save Cairo state so line_width and source don't leak to callers
+    cr.save().expect("Failed to save");
+    
     let center_x = x + radius;
     let center_y = y + radius;
     
@@ -193,4 +239,7 @@ pub fn draw_temp_circle(cr: &cairo::Context, x: f64, y: f64, radius: f64, temp: 
     cr.set_source_rgb(0.0, 0.0, 0.0);
     cr.set_line_width(2.0);
     cr.stroke().expect("Failed to stroke");
+    
+    // Restore Cairo state (resets line_width, source, etc.)
+    cr.restore().expect("Failed to restore");
 }
