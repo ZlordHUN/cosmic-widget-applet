@@ -1,5 +1,7 @@
 <div align="center">
 
+WARNING - This project was vibecoded out of boredom. However, I fully intend or rewriting it from scratch without the use of AI.
+
 # COSMIC Widget
 
 ![Icon](resources/icon.svg)
