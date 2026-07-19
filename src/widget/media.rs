@@ -46,6 +46,8 @@ const MAX_ARTWORK_DIMENSION: u32 = 4096;
 const LEGACY_ARTWORK_DIMENSION: u32 = 512;
 const MIN_YOUTUBE_THUMBNAIL_WIDTH: u32 = 320;
 const MIN_YOUTUBE_THUMBNAIL_HEIGHT: u32 = 180;
+const TIMELINE_REFRESH_RETRY: Duration = Duration::from_secs(2);
+const MAX_TIMELINE_REFRESH_ATTEMPTS: u8 = 3;
 
 // ============================================================================
 // Album Art Cache
@@ -400,6 +402,14 @@ struct PositionTracker {
     status: PlaybackStatus,
 }
 
+#[derive(Debug, Clone)]
+struct TimelineRefresh {
+    track: TrackSignature,
+    attempted_at: Instant,
+    attempts: u8,
+    complete: bool,
+}
+
 fn update_tracked_position(
     trackers: &mut HashMap<PlayerId, PositionTracker>,
     player_id: &PlayerId,
@@ -470,6 +480,14 @@ fn update_tracked_position(
     );
 
     first_sample
+}
+
+fn merge_mpris_proxy_timeline(primary: &mut MediaInfo, proxy: &MediaInfo) {
+    if proxy.duration > 0 {
+        primary.position = proxy.position.min(proxy.duration);
+        primary.duration = proxy.duration;
+    }
+    primary.can_seek |= proxy.can_seek;
 }
 
 // ============================================================================
@@ -666,7 +684,7 @@ impl MediaMonitor {
         log::info!("Starting multi-player media monitor");
         let mut artwork_by_player: HashMap<PlayerId, TrackArtwork> = HashMap::new();
         let mut position_trackers: HashMap<PlayerId, PositionTracker> = HashMap::new();
-        let mut timeline_refreshes: HashMap<PlayerId, TrackSignature> = HashMap::new();
+        let mut timeline_refreshes: HashMap<PlayerId, TimelineRefresh> = HashMap::new();
         let emby_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(3))
             .user_agent("cosmic-widget-applet/0.1")
@@ -722,7 +740,10 @@ impl MediaMonitor {
             }
 
             // 3. Enumerate MPRIS players
-            if let Some(mpris_players) = Self::get_mpris_players() {
+            if let Some(mut mpris_players) = Self::get_mpris_players() {
+                // Query the proxy last so it can supplement, rather than
+                // duplicate, the real player that it mirrors.
+                mpris_players.sort_by_key(|name| Self::is_playerctld_mpris_player(name));
                 for bus_name in mpris_players {
                     if has_cider_api_player && Self::is_cider_mpris_player(&bus_name) {
                         continue;
@@ -732,15 +753,46 @@ impl MediaMonitor {
                         let player_id = PlayerId::Mpris(bus_name.clone());
                         let track = TrackSignature::from(&info);
 
-                        if Self::is_firefox_mpris_player(&bus_name)
+                        let incomplete_firefox_timeline = Self::is_firefox_mpris_player(&bus_name)
                             && info.status == PlaybackStatus::Playing
                             && info.position == 0
-                            && info.duration == 0
-                            && timeline_refreshes.get(&player_id) != Some(&track)
-                        {
-                            timeline_refreshes.insert(player_id.clone(), track);
+                            && info.duration == 0;
+                        let should_refresh = incomplete_firefox_timeline
+                            && timeline_refreshes.get(&player_id).is_none_or(|refresh| {
+                                refresh.track != track
+                                    || (!refresh.complete
+                                        && refresh.attempts < MAX_TIMELINE_REFRESH_ATTEMPTS
+                                        && refresh.attempted_at.elapsed()
+                                            >= TIMELINE_REFRESH_RETRY)
+                            });
+
+                        if should_refresh {
+                            let previous_attempts = timeline_refreshes
+                                .get(&player_id)
+                                .filter(|refresh| refresh.track == track)
+                                .map_or(0, |refresh| refresh.attempts);
                             if let Some(refreshed) = Self::refresh_mpris_timeline(&bus_name) {
+                                let complete = refreshed.duration > 0;
                                 info = refreshed;
+                                timeline_refreshes.insert(
+                                    player_id.clone(),
+                                    TimelineRefresh {
+                                        track: TrackSignature::from(&info),
+                                        attempted_at: Instant::now(),
+                                        attempts: previous_attempts + 1,
+                                        complete,
+                                    },
+                                );
+                            } else {
+                                timeline_refreshes.insert(
+                                    player_id.clone(),
+                                    TimelineRefresh {
+                                        track,
+                                        attempted_at: Instant::now(),
+                                        attempts: previous_attempts + 1,
+                                        complete: false,
+                                    },
+                                );
                             }
                         }
 
@@ -781,6 +833,18 @@ impl MediaMonitor {
                             }
                         }
 
+                        if Self::is_playerctld_mpris_player(&bus_name)
+                            && let Some((_, primary)) = players.iter_mut().find(|(id, primary)| {
+                                matches!(id, PlayerId::Mpris(primary_bus)
+                                    if !Self::is_playerctld_mpris_player(primary_bus))
+                                    && TrackSignature::from(&*primary)
+                                        == TrackSignature::from(&info)
+                            })
+                        {
+                            merge_mpris_proxy_timeline(primary, &info);
+                            continue;
+                        }
+
                         players.push((player_id, info));
                     }
                 }
@@ -788,6 +852,7 @@ impl MediaMonitor {
 
             position_trackers.retain(|id, _| players.iter().any(|(player_id, _)| player_id == id));
             artwork_by_player.retain(|id, _| players.iter().any(|(player_id, _)| player_id == id));
+            timeline_refreshes.retain(|id, _| players.iter().any(|(player_id, _)| player_id == id));
 
             // Sort: playing first, then by player name
             players.sort_by(|a, b| {
@@ -1093,14 +1158,26 @@ impl MediaMonitor {
             .is_some_and(|identity| identity.eq_ignore_ascii_case("firefox"))
     }
 
+    fn is_playerctld_mpris_player(bus_name: &str) -> bool {
+        bus_name
+            .strip_prefix("org.mpris.MediaPlayer2.")
+            .is_some_and(|identity| identity.eq_ignore_ascii_case("playerctld"))
+    }
+
     fn refresh_mpris_timeline(bus_name: &str) -> Option<MediaInfo> {
         log::info!("Refreshing incomplete Firefox MPRIS timeline");
         if !Self::send_mpris_method(bus_name, "Pause") {
             return None;
         }
 
-        std::thread::sleep(Duration::from_millis(200));
-        let mut refreshed = Self::try_mpris_player(bus_name);
+        let mut refreshed = None;
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(150));
+            refreshed = Self::try_mpris_player(bus_name);
+            if refreshed.as_ref().is_some_and(|info| info.duration > 0) {
+                break;
+            }
+        }
         let resumed = Self::send_mpris_method(bus_name, "Play");
         if !resumed {
             log::warn!("Failed to resume Firefox after refreshing its MPRIS timeline");
@@ -2031,6 +2108,29 @@ impl MediaMonitor {
     }
 
     fn mpris_seek(&self, bus_name: &str, position_us: u64) -> bool {
+        let track_id = Self::query_mpris_property(bus_name, "Metadata")
+            .and_then(|metadata| metadata.get("data").cloned())
+            .and_then(|metadata| Self::mpris_metadata_string(&metadata, "mpris:trackid"));
+
+        if let Some(track_id) = track_id {
+            let absolute_seek = Command::new("dbus-send")
+                .args([
+                    "--session",
+                    "--print-reply",
+                    &format!("--dest={bus_name}"),
+                    "/org/mpris/MediaPlayer2",
+                    "org.mpris.MediaPlayer2.Player.SetPosition",
+                    &format!("objpath:{track_id}"),
+                    &format!("int64:{position_us}"),
+                ])
+                .output()
+                .is_ok_and(|output| output.status.success());
+
+            if absolute_seek {
+                return true;
+            }
+        }
+
         let current_pos = Self::query_mpris_property(bus_name, "Position")
             .and_then(|position| position.get("data").and_then(serde_json::Value::as_i64))
             .unwrap_or(0);
@@ -2056,8 +2156,8 @@ impl MediaMonitor {
 mod tests {
     use super::{
         AlbumArt, HashMap, Instant, MediaInfo, MediaMonitor, MultiPlayerState, PlaybackStatus,
-        PlayerId, PositionTracker, TrackArtwork, TrackSignature, preferred_player_id,
-        update_tracked_position,
+        PlayerId, PositionTracker, TrackArtwork, TrackSignature, merge_mpris_proxy_timeline,
+        preferred_player_id, update_tracked_position,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -2072,6 +2172,35 @@ mod tests {
             duration: 600_000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recognizes_playerctld_as_an_mpris_proxy() {
+        assert!(MediaMonitor::is_playerctld_mpris_player(
+            "org.mpris.MediaPlayer2.playerctld"
+        ));
+        assert!(!MediaMonitor::is_playerctld_mpris_player(
+            "org.mpris.MediaPlayer2.firefox.instance_1_560"
+        ));
+    }
+
+    #[test]
+    fn proxy_timeline_augments_the_real_player() {
+        let mut firefox = media(PlaybackStatus::Playing, 15_000, "Video");
+        firefox.player_name = "Firefox".to_string();
+        firefox.duration = 617_000;
+        firefox.can_seek = false;
+        let mut proxy = media(PlaybackStatus::Playing, 356_000, "Video");
+        proxy.player_name = "Playerctld".to_string();
+        proxy.duration = 617_000;
+        proxy.can_seek = true;
+
+        merge_mpris_proxy_timeline(&mut firefox, &proxy);
+
+        assert_eq!(firefox.player_name, "Firefox");
+        assert_eq!(firefox.position, 356_000);
+        assert_eq!(firefox.duration, 617_000);
+        assert!(firefox.can_seek);
     }
 
     fn artwork(source_width: u32, source_height: u32) -> AlbumArt {

@@ -42,6 +42,7 @@ pub fn widget_view<'a>(
     notification_scroll_translation: f32,
     surface_height: u32,
     media_seek_preview: Option<f64>,
+    media_timeline_hovered: bool,
 ) -> Element<'a, super::Message> {
     let spacing = theme::system_preference().cosmic().spacing;
     let now_timestamp = now.timestamp().max(0) as u64;
@@ -103,6 +104,7 @@ pub fn widget_view<'a>(
                 spacing.space_xs,
                 spacing.space_xs,
                 spacing.space_xxs,
+                media_timeline_hovered,
             )),
             _ => None,
         };
@@ -653,6 +655,7 @@ fn media_view<'a>(
     section_spacing: u16,
     content_spacing: u16,
     detail_spacing: u16,
+    timeline_hovered: bool,
 ) -> Element<'a, super::Message> {
     if let Some((_, info)) = stats
         .media
@@ -667,6 +670,7 @@ fn media_view<'a>(
                 seek_preview,
                 content_spacing,
                 detail_spacing,
+                timeline_hovered,
             ))
             .into();
     }
@@ -682,6 +686,7 @@ fn media_content<'a>(
     seek_preview: Option<f64>,
     _content_spacing: u16,
     detail_spacing: u16,
+    timeline_hovered: bool,
 ) -> Element<'a, super::Message> {
     let progress = seek_preview
         .unwrap_or_else(|| info.progress())
@@ -746,15 +751,15 @@ fn media_content<'a>(
         .push(media_artwork(info.album_art.as_ref()))
         .push(metadata);
     let progress_control: Element<'a, super::Message> = if info.can_seek && info.duration > 0 {
-        widget::slider(0.0..=1.0, progress, super::Message::MediaSeekChanged)
+        let slider = widget::slider(0.0..=1.0, progress, super::Message::MediaSeekChanged)
             .step(0.001)
             .height(20)
             .class(theme::style::iced::Slider::Custom {
-                active: Rc::new(|theme| {
+                active: Rc::new(move |theme| {
                     media_seek_style(
                         theme,
                         cosmic::iced::widget::slider::Status::Active,
-                        false,
+                        timeline_hovered,
                     )
                 }),
                 hovered: Rc::new(|theme| {
@@ -772,7 +777,11 @@ fn media_content<'a>(
                     )
                 }),
             })
-            .on_release(super::Message::CommitMediaSeek)
+            .on_release(super::Message::CommitMediaSeek);
+
+        widget::mouse_area(slider)
+            .on_enter(super::Message::MediaTimelineHoverChanged(true))
+            .on_exit(super::Message::MediaTimelineHoverChanged(false))
             .into()
     } else {
         widget::progress_bar::linear::Linear::new()

@@ -227,6 +227,7 @@ struct App {
     dismissing_notifications: Vec<DismissingNotification>,
     notification_scroll: ScrollAnimation,
     media_seek_preview: Option<f64>,
+    media_timeline_hovered: bool,
     pending_playback: Option<PendingPlayback>,
 }
 
@@ -242,6 +243,7 @@ pub enum Message {
     PlayPauseMedia,
     NextMedia,
     SelectMediaPlayer(PlayerId),
+    MediaTimelineHoverChanged(bool),
     MediaSeekChanged(f64),
     CommitMediaSeek,
     NotificationScrolled(f32),
@@ -312,6 +314,7 @@ impl App {
                 dismissing_notifications: Vec::new(),
                 notification_scroll: ScrollAnimation::default(),
                 media_seek_preview: None,
+                media_timeline_hovered: false,
                 pending_playback: None,
             },
             create_surface,
@@ -635,6 +638,7 @@ impl App {
             }
             Message::SelectMediaPlayer(player_id) => {
                 self.media_seek_preview = None;
+                self.media_timeline_hovered = false;
                 self.pending_playback = None;
                 self.sampler.select_media_player(&player_id);
                 self.snapshot.media = self.sampler.media_state();
@@ -643,6 +647,9 @@ impl App {
                     &mut self.pending_playback,
                     Instant::now(),
                 );
+            }
+            Message::MediaTimelineHoverChanged(hovered) => {
+                self.media_timeline_hovered = hovered;
             }
             Message::MediaSeekChanged(progress) => {
                 self.media_seek_preview = Some(progress.clamp(0.0, 1.0));
@@ -671,6 +678,7 @@ impl App {
             self.notification_scroll.translation(),
             self.surface_height,
             self.media_seek_preview,
+            self.media_timeline_hovered,
         )
     }
 
