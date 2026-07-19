@@ -24,8 +24,8 @@
 use crate::config::Config;
 use crate::fl;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
-use cosmic::iced::{window::Id, Limits, Subscription};
-use cosmic::iced_winit::commands::popup::{destroy_popup, get_popup};
+use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
+use cosmic::iced::{Limits, Subscription, window::Id};
 use cosmic::prelude::*;
 use cosmic::widget;
 use futures_util::SinkExt;
@@ -43,23 +43,23 @@ pub struct AppModel {
     /// COSMIC runtime core - provides access to system integration features
     /// like window management, styling, and configuration watching.
     core: cosmic::Core,
-    
+
     /// Window ID of the currently open popup, if any.
     /// Used to track and close the popup when clicking elsewhere.
     popup: Option<Id>,
-    
+
     /// Current configuration loaded from cosmic-config.
     /// Updated via subscription when settings change externally.
     config: Config,
-    
+
     /// Handle to cosmic-config for saving configuration changes.
     /// None if config system failed to initialize.
     config_handler: Option<cosmic_config::Config>,
-    
+
     /// Text input state for the update interval field.
     /// Kept separate to allow editing without immediately saving.
     interval_input: String,
-    
+
     /// Whether the widget process is currently running.
     /// Updated when opening the popup and after toggle operations.
     widget_running: bool,
@@ -77,19 +77,19 @@ pub struct AppModel {
 pub enum Message {
     /// User clicked the panel icon - toggle popup visibility.
     TogglePopup,
-    
+
     /// Popup window was closed (clicked outside or pressed escape).
     PopupClosed(Id),
-    
+
     /// Subscription channel initialized (used for async setup).
     SubscriptionChannel,
-    
+
     /// Configuration changed externally (e.g., from settings app).
     UpdateConfig(Config),
-    
+
     /// User clicked "Show/Hide Widget" in the popup menu.
     ToggleWidget,
-    
+
     /// User clicked "Configure" in the popup menu.
     OpenSettings,
 }
@@ -110,7 +110,7 @@ impl AppModel {
             }
         }
     }
-    
+
     /// Checks if the widget process is currently running.
     ///
     /// Uses `pgrep` to search for the `cosmic-widget` process.
@@ -121,6 +121,7 @@ impl AppModel {
     /// `true` if the widget process is found, `false` otherwise.
     fn check_widget_running() -> bool {
         if let Ok(output) = std::process::Command::new("pgrep")
+            .args(["-r", "R,S,D,T,t,W,I"])
             .arg("-x")
             .arg("cosmic-widget")
             .output()
@@ -172,7 +173,7 @@ impl cosmic::Application for AppModel {
     ) -> (Self, Task<cosmic::Action<Self::Message>>) {
         // Initialize cosmic-config handler for this app's configuration
         let config_handler = cosmic_config::Config::new(Self::APP_ID, Config::VERSION).ok();
-        
+
         // Load existing config or use defaults if none exists
         let config = config_handler
             .as_ref()
@@ -184,22 +185,33 @@ impl cosmic::Application for AppModel {
 
         // Initialize text input with current interval value
         let interval_input = format!("{}", config.update_interval_ms);
-        
+
         // Auto-start widget if configured to do so
         // Note: We add a small delay to give the compositor time to fully initialize
         // its layer-shell input routing. Without this, the widget may not receive
         // pointer events when started too early at boot.
         let widget_running = if config.widget_autostart {
-            log::info!("Auto-start enabled, launching widget with 2s delay for compositor init");
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                if let Err(e) = std::process::Command::new("cosmic-widget").spawn() {
-                    log::error!("Failed to auto-start widget: {}", e);
-                } else {
-                    log::info!("Widget auto-started successfully after delay");
-                }
-            });
-            // Assume it will start successfully (we'll verify later)
+            if Self::check_widget_running() {
+                log::info!("Auto-start enabled, but the widget is already running");
+            } else {
+                log::info!(
+                    "Auto-start enabled, launching widget with 2s delay for compositor init"
+                );
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    // The panel may have restarted more than once during this
+                    // delay. Re-check immediately before spawning; the widget's
+                    // instance lock closes the remaining race between checks.
+                    if AppModel::check_widget_running() {
+                        log::info!("Widget started while autostart was waiting; skipping launch");
+                    } else if let Err(e) = std::process::Command::new("cosmic-widget").spawn() {
+                        log::error!("Failed to auto-start widget: {}", e);
+                    } else {
+                        log::info!("Widget auto-started successfully after delay");
+                    }
+                });
+            }
             true
         } else {
             // Check if widget is already running (user may have started it manually)
@@ -249,25 +261,23 @@ impl cosmic::Application for AppModel {
     fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
         // Dynamic text based on widget state
         let widget_text = if self.widget_running {
-            fl!("hide-widget")  // From i18n: "Hide Widget"
+            fl!("hide-widget") // From i18n: "Hide Widget"
         } else {
-            fl!("show-widget")  // From i18n: "Show Widget"
+            fl!("show-widget") // From i18n: "Show Widget"
         };
 
         let content_list = widget::list_column()
-            .padding(5)
-            .spacing(0)
             // Widget toggle button
             .add(widget::settings::item(
                 widget_text,
                 widget::button::icon(widget::icon::from_name("applications-system-symbolic"))
-                    .on_press(Message::ToggleWidget)
+                    .on_press(Message::ToggleWidget),
             ))
             // Settings button
             .add(widget::settings::item(
-                fl!("configure"),  // From i18n: "Configure"
+                fl!("configure"), // From i18n: "Configure"
                 widget::button::icon(widget::icon::from_name("preferences-system-symbolic"))
-                    .on_press(Message::OpenSettings)
+                    .on_press(Message::OpenSettings),
             ));
 
         self.core.applet.popup_container(content_list).into()
@@ -283,14 +293,16 @@ impl cosmic::Application for AppModel {
 
         Subscription::batch(vec![
             // Placeholder subscription channel for future async features
-            Subscription::run_with_id(
-                std::any::TypeId::of::<MySubscription>(),
-                cosmic::iced::stream::channel(4, move |mut channel| async move {
-                    _ = channel.send(Message::SubscriptionChannel).await;
-                    // Keep the subscription alive indefinitely
-                    futures_util::future::pending().await
-                }),
-            ),
+            Subscription::run_with(std::any::TypeId::of::<MySubscription>(), |_| {
+                cosmic::iced::stream::channel(
+                    4,
+                    move |mut channel: cosmic::iced::futures::channel::mpsc::Sender<Message>| async move {
+                        _ = channel.send(Message::SubscriptionChannel).await;
+                        // Keep the subscription alive indefinitely
+                        futures_util::future::pending().await
+                    },
+                )
+            }),
             // Watch for configuration changes from the settings app
             // This keeps the applet in sync when settings are modified externally
             self.core()
@@ -308,12 +320,12 @@ impl cosmic::Application for AppModel {
             Message::SubscriptionChannel => {
                 // Placeholder for future async initialization
             }
-            
+
             Message::UpdateConfig(config) => {
                 // External config change (from settings app) - update our copy
                 self.config = config;
             }
-            
+
             Message::ToggleWidget => {
                 if self.widget_running {
                     // Kill the widget process
@@ -324,7 +336,7 @@ impl cosmic::Application for AppModel {
                         .arg("cosmic-widget")
                         .spawn();
                     self.widget_running = false;
-                    
+
                     // Disable auto-start since user explicitly hid the widget
                     self.config.widget_autostart = false;
                     self.save_config();
@@ -333,7 +345,7 @@ impl cosmic::Application for AppModel {
                     log::info!("Launching widget");
                     if std::process::Command::new("cosmic-widget").spawn().is_ok() {
                         self.widget_running = true;
-                        
+
                         // Enable auto-start since user explicitly showed the widget
                         self.config.widget_autostart = true;
                         self.save_config();
@@ -343,12 +355,12 @@ impl cosmic::Application for AppModel {
                     }
                 }
             }
-            
+
             Message::OpenSettings => {
                 // Launch the settings application as a separate process
                 let _ = std::process::Command::new("cosmic-widget-settings").spawn();
             }
-            
+
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
                     // Popup is open - close it
@@ -357,31 +369,31 @@ impl cosmic::Application for AppModel {
                     // Popup is closed - open it
                     // First refresh widget status (it may have been killed externally)
                     self.widget_running = Self::check_widget_running();
-                    
+
                     // Create a new popup window
                     let new_id = Id::unique();
                     self.popup.replace(new_id);
-                    
+
                     // Configure popup positioning and size constraints
                     let mut popup_settings = self.core.applet.get_popup_settings(
                         self.core.main_window_id().unwrap(),
                         new_id,
-                        None,  // No keyboard interactivity
-                        None,  // Default anchor
-                        None,  // Default gravity
+                        None, // No keyboard interactivity
+                        None, // Default anchor
+                        None, // Default gravity
                     );
-                    
+
                     // Set size limits for the popup
                     popup_settings.positioner.size_limits = Limits::NONE
                         .max_width(372.0)
                         .min_width(300.0)
                         .min_height(200.0)
                         .max_height(1080.0);
-                    
+
                     get_popup(popup_settings)
-                }
+                };
             }
-            
+
             Message::PopupClosed(id) => {
                 // Clear popup state when closed
                 if self.popup.as_ref() == Some(&id) {
@@ -395,7 +407,7 @@ impl cosmic::Application for AppModel {
     /// Apply COSMIC applet styling.
     ///
     /// This ensures the applet matches the system theme and other applets.
-    fn style(&self) -> Option<cosmic::iced_runtime::Appearance> {
+    fn style(&self) -> Option<cosmic::iced::theme::Style> {
         Some(cosmic::applet::style())
     }
 }

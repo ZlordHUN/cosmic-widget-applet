@@ -65,7 +65,7 @@ use std::time::{Duration, Instant};
 /// - `codename`: Short device codename for deduplication (e.g., "MX MCHNCL M")
 /// - `is_loading`: True while waiting for first real data (showing cached)
 /// - `is_connected`: False if device is paired but powered off/out of range
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BatteryDevice {
     /// Device product name from Solaar/HeadsetControl
     pub name: String,
@@ -135,7 +135,7 @@ impl BatteryMonitor {
     pub fn new() -> Self {
         // Initialize with 31 seconds ago to force immediate first update
         let last_update = Instant::now() - Duration::from_secs(31);
-        
+
         // Load cached battery devices to show immediately
         // This provides instant display while real data loads
         let cache = super::cache::WidgetCache::load();
@@ -144,31 +144,31 @@ impl BatteryMonitor {
             .iter()
             .map(|d| BatteryDevice {
                 name: d.name.clone(),
-                level: None,  // No cached level, will show "loading"
+                level: None, // No cached level, will show "loading"
                 status: None,
                 kind: d.kind.clone(),
                 codename: None,
-                is_loading: true,  // Mark as loading until real data arrives
+                is_loading: true, // Mark as loading until real data arrives
                 is_connected: false,
             })
             .collect();
-        
+
         let devices = Arc::new(Mutex::new(cached_devices));
         let update_requested = Arc::new(Mutex::new(true)); // Request initial update immediately
-        
+
         // Spawn background thread for battery updates
         // This avoids blocking the main render loop on slow CLI tools
         let devices_clone = Arc::clone(&devices);
         let update_requested_clone = Arc::clone(&update_requested);
-        
+
         std::thread::spawn(move || {
             let mut is_first_update = true;
-            
+
             // Perform immediate first update on startup
             match query_solaar() {
                 Ok(new_devices) => {
                     *devices_clone.lock().unwrap() = new_devices.clone();
-                    
+
                     // Update cache after first successful update
                     if is_first_update && !new_devices.is_empty() {
                         let mut cache = super::cache::WidgetCache::load();
@@ -180,14 +180,14 @@ impl BatteryMonitor {
                     // On error, keep cached data - tool may not be installed
                 }
             }
-            
+
             // Clear the initial update request flag
             *update_requested_clone.lock().unwrap() = false;
-            
+
             // Main background loop - check for update requests every 5 seconds
             loop {
                 std::thread::sleep(Duration::from_secs(5));
-                
+
                 // Check if update is needed (atomic check-and-clear)
                 let requested = {
                     let mut req = update_requested_clone.lock().unwrap();
@@ -198,12 +198,12 @@ impl BatteryMonitor {
                         false
                     }
                 };
-                
+
                 if requested {
                     match query_solaar() {
                         Ok(new_devices) => {
                             *devices_clone.lock().unwrap() = new_devices.clone();
-                            
+
                             // Update cache after first successful update
                             if is_first_update && !new_devices.is_empty() {
                                 let mut cache = super::cache::WidgetCache::load();
@@ -218,7 +218,7 @@ impl BatteryMonitor {
                 }
             }
         });
-            
+
         Self {
             devices,
             last_update,
@@ -274,11 +274,11 @@ impl BatteryMonitor {
 /// Combined list of all discovered devices, or empty list on failure.
 fn query_solaar() -> Result<Vec<BatteryDevice>, String> {
     let mut all_devices = Vec::new();
-    
+
     // ========================================================================
     // Solaar Query (Logitech devices)
     // ========================================================================
-    
+
     // Try JSON output if available (newer Solaar versions)
     // JSON is more reliable and structured than text output
     if let Ok(output) = Command::new("solaar").arg("show").arg("--json").output() {
@@ -306,14 +306,19 @@ fn query_solaar() -> Result<Vec<BatteryDevice>, String> {
             }
         }
     }
-    
+
     // ========================================================================
     // HeadsetControl Query (gaming headsets)
     // ========================================================================
-    
+
     // HeadsetControl supports many gaming headset brands
     // -b: battery only, -o json: JSON output format
-    if let Ok(output) = Command::new("headsetcontrol").arg("-b").arg("-o").arg("json").output() {
+    if let Ok(output) = Command::new("headsetcontrol")
+        .arg("-b")
+        .arg("-o")
+        .arg("json")
+        .output()
+    {
         if output.status.success() {
             if let Ok(text) = String::from_utf8(output.stdout) {
                 if let Ok(headset_devices) = parse_headsetcontrol_json(&text) {
@@ -322,7 +327,7 @@ fn query_solaar() -> Result<Vec<BatteryDevice>, String> {
             }
         }
     }
-    
+
     Ok(all_devices)
 }
 
@@ -397,7 +402,15 @@ fn extract_device_from_json(value: &serde_json::Value) -> Option<BatteryDevice> 
         (None, None)
     };
 
-    Some(BatteryDevice { name, level, status, kind, codename: None, is_loading: false, is_connected: true })
+    Some(BatteryDevice {
+        name,
+        level,
+        status,
+        kind,
+        codename: None,
+        is_loading: false,
+        is_connected: true,
+    })
 }
 
 /// Extract battery level and status from a JSON battery object.
@@ -440,28 +453,28 @@ fn extract_battery_fields(value: &serde_json::Value) -> (Option<u8>, Option<Stri
 /// ```
 fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
     let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    
+
     let mut devices = Vec::new();
-    
+
     if let Some(device_list) = value.get("devices").and_then(|v| v.as_array()) {
         for device_obj in device_list {
             // Check if device query was successful
             if let Some(status) = device_obj.get("status").and_then(|v| v.as_str()) {
                 if status != "success" {
-                    continue;  // Skip failed device queries
+                    continue; // Skip failed device queries
                 }
             }
-            
+
             // Extract device name
             let name = device_obj
                 .get("device")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown Headset")
                 .to_string();
-            
+
             // All headsets are kind "headset"
             let kind = Some("headset".to_string());
-            
+
             // Extract battery information
             let (level, battery_status) = if let Some(battery) = device_obj.get("battery") {
                 let status = battery.get("status").and_then(|v| v.as_str());
@@ -469,29 +482,28 @@ fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
                     if v >= 0 && v <= 100 {
                         u8::try_from(v).ok()
                     } else {
-                        None  // -1 means reading failed, treat as no level
+                        None // -1 means reading failed, treat as no level
                     }
                 });
-                
-                // HeadsetControl battery status:
-                // - BATTERY_AVAILABLE: battery level was successfully read
-                // - BATTERY_UNAVAILABLE: device present but couldn't read level (timing issue)
-                let status_text = if status == Some("BATTERY_AVAILABLE") && level.is_some() {
-                    Some("discharging".to_string())
-                } else {
-                    None  // No status if we couldn't read the level
+
+                // HeadsetControl API 1.4 distinguishes an available battery
+                // from one that is actively charging.
+                let status_text = match (status, level) {
+                    (Some("BATTERY_CHARGING"), Some(_)) => Some("charging".to_string()),
+                    (Some("BATTERY_AVAILABLE"), Some(_)) => Some("discharging".to_string()),
+                    _ => None,
                 };
-                
+
                 (level, status_text)
             } else {
                 (None, None)
             };
-            
+
             // Device is connected if HeadsetControl successfully queried it
             // is_loading should be false - we're not "loading", we just couldn't read the battery
             let is_connected = true;
             let is_loading = false;
-            
+
             devices.push(BatteryDevice {
                 name,
                 level,
@@ -503,7 +515,7 @@ fn parse_headsetcontrol_json(text: &str) -> Result<Vec<BatteryDevice>, String> {
             });
         }
     }
-    
+
     Ok(devices)
 }
 
@@ -572,7 +584,7 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
                 current_kind = Some(kind_value.trim().to_string());
             }
         }
-        
+
         // Look for codename (e.g., "Codename: MX MCHNCL M")
         // This helps deduplicate devices that appear multiple times with different names
         if trimmed.starts_with("Codename") {
@@ -590,19 +602,20 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
                 if let Some(name) = current_name.clone() {
                     // Device is connected if it has a battery level
                     let is_connected = level.is_some();
-                    
+
                     // Check for duplicates by name or codename (same device can appear multiple times)
                     // Logitech devices paired to multiple slots show up with different names but same codename
                     let existing_idx = devices.iter().position(|d: &BatteryDevice| {
-                        d.name == name || (current_codename.is_some() && current_codename == d.codename)
+                        d.name == name
+                            || (current_codename.is_some() && current_codename == d.codename)
                     });
-                    
+
                     if let Some(idx) = existing_idx {
                         // If existing device is disconnected but this one is connected, replace it
                         if !devices[idx].is_connected && is_connected {
-                            devices[idx] = BatteryDevice { 
-                                name, 
-                                level, 
+                            devices[idx] = BatteryDevice {
+                                name,
+                                level,
                                 status,
                                 kind: current_kind.clone(),
                                 codename: current_codename.clone(),
@@ -612,9 +625,9 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
                         }
                     } else {
                         // New device, add it
-                        devices.push(BatteryDevice { 
-                            name, 
-                            level, 
+                        devices.push(BatteryDevice {
+                            name,
+                            level,
                             status,
                             kind: current_kind.clone(),
                             codename: current_codename.clone(),
@@ -627,8 +640,13 @@ fn parse_solaar_text(text: &str) -> Vec<BatteryDevice> {
         }
 
         // Detect when we're leaving a device section (new receiver or device)
-        if !line.starts_with("  ") || (line.starts_with("  ") && !line.starts_with("    ") && line.contains("Receiver")) {
-            if !trimmed.is_empty() && !trimmed.starts_with("Has") && !trimmed.starts_with("Notifications") {
+        if !line.starts_with("  ")
+            || (line.starts_with("  ") && !line.starts_with("    ") && line.contains("Receiver"))
+        {
+            if !trimmed.is_empty()
+                && !trimmed.starts_with("Has")
+                && !trimmed.starts_with("Notifications")
+            {
                 in_device_section = false;
             }
         }
@@ -670,3 +688,39 @@ fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
     (level, status)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_headsetcontrol_json;
+
+    fn headsetcontrol_output(status: &str, level: i64) -> String {
+        format!(
+            r#"{{
+                "devices": [{{
+                    "status": "success",
+                    "device": "Test Headset",
+                    "battery": {{"status": "{status}", "level": {level}}}
+                }}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn maps_headsetcontrol_charging_status() {
+        let devices =
+            parse_headsetcontrol_json(&headsetcontrol_output("BATTERY_CHARGING", 98)).unwrap();
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].level, Some(98));
+        assert_eq!(devices[0].status.as_deref(), Some("charging"));
+    }
+
+    #[test]
+    fn maps_headsetcontrol_available_status_to_discharging() {
+        let devices =
+            parse_headsetcontrol_json(&headsetcontrol_output("BATTERY_AVAILABLE", 73)).unwrap();
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].level, Some(73));
+        assert_eq!(devices[0].status.as_deref(), Some("discharging"));
+    }
+}

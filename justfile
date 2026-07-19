@@ -61,6 +61,10 @@ run-widget *args:
 run-settings *args:
     env RUST_BACKTRACE=full cargo run --release --bin cosmic-monitor-settings {{args}}
 
+# Run the experimental libcosmic/Iced widget
+run-iced-widget *args:
+    env RUST_BACKTRACE=full cargo run --release --bin cosmic-widget-iced {{args}}
+
 # Installs files
 install:
     install -Dm0755 {{ cargo-target-dir / 'release' / name }} {{bin-dst}}
@@ -97,4 +101,3 @@ tag version:
     git add Cargo.lock
     git commit -m 'release: {{version}}'
     git tag -a {{version}} -m ''
-

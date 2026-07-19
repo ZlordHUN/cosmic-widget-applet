@@ -18,6 +18,10 @@ path = "src/widget_main.rs"
 name = "cosmic-widget-settings"
 path = "src/settings_main.rs"
 
+[[bin]]
+name = "cosmic-widget-iced"
+path = "src/iced_widget_main.rs"
+
 [dependencies]
 futures-util = "0.3.31"
 i18n-embed-fl = "0.10"

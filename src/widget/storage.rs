@@ -38,10 +38,15 @@
 //! - Background thread: Runs `lsblk` every 10 seconds to update model names
 //! - Shared state: `disk_models` HashMap protected by Arc<Mutex>
 
-use sysinfo::Disks;
-use std::process::Command;
 use std::collections::HashMap;
+use std::ffi::CString;
+use std::fs;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+use sysinfo::Disks;
 
 // ============================================================================
 // Disk Information Struct
@@ -51,7 +56,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// This struct holds all data needed to display a disk in the widget,
 /// including human-readable names and usage statistics.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DiskInfo {
     /// Display name for the disk (model name, "Home", "System", or mount name)
     pub name: String,
@@ -94,6 +99,9 @@ pub struct StorageMonitor {
     /// Map of device name → model name (e.g., "nvme0n1" → "Samsung 970 EVO")
     /// Updated by background thread via lsblk
     disk_models: Arc<Mutex<HashMap<String, String>>>,
+    /// Remote storage discovered through desktop mounts such as GVFS SFTP/SMB.
+    /// Updated in the background because an unavailable network mount can be slow.
+    remote_disks: Arc<Mutex<Vec<DiskInfo>>>,
     /// Flag to track first update for cache saving
     is_first_update: bool,
     /// Counter for periodic full disk list refresh (to detect new mounts)
@@ -113,7 +121,7 @@ impl StorageMonitor {
     /// hardware rarely changes during runtime.
     pub fn new() -> Self {
         let disk_models = Arc::new(Mutex::new(HashMap::new()));
-        
+
         // Load cached disk info to show immediately
         // This provides instant display while real data loads
         let cache = super::cache::WidgetCache::load();
@@ -123,37 +131,45 @@ impl StorageMonitor {
             .map(|d| DiskInfo {
                 name: d.name.clone(),
                 mount_point: d.mount_point.clone(),
-                used_percentage: 0.0,  // Will be updated on first refresh
+                used_percentage: 0.0, // Will be updated on first refresh
                 total_space: 0,
                 available_space: 0,
-                is_loading: true,  // Mark as loading until real data arrives
+                is_loading: true, // Mark as loading until real data arrives
             })
             .collect();
-        
-        // Spawn background thread to update disk models from lsblk
-        // This avoids blocking the main thread on shell commands
+        let remote_disks = Arc::new(Mutex::new(
+            disk_info
+                .iter()
+                .filter(|disk| disk.mount_point.contains("/gvfs/"))
+                .cloned()
+                .collect(),
+        ));
+
+        // Fetch local model names and remote filesystem capacity off the sampler
+        // thread. A disconnected network filesystem can otherwise stall all stats.
         let disk_models_clone = Arc::clone(&disk_models);
+        let remote_disks_clone = Arc::clone(&remote_disks);
         std::thread::spawn(move || {
             loop {
-                // Fetch disk models from lsblk
                 if let Some(models) = Self::fetch_disk_models() {
                     *disk_models_clone.lock().unwrap() = models;
                 }
-                
-                // Refresh every 10 seconds (disk models don't change often)
+                *remote_disks_clone.lock().unwrap() = Self::fetch_remote_disks();
+
                 std::thread::sleep(std::time::Duration::from_secs(10));
             }
         });
-        
+
         Self {
             disks: Disks::new_with_refreshed_list(),
             disk_info,
             disk_models,
+            remote_disks,
             is_first_update: true,
             update_counter: 0,
         }
     }
-    
+
     /// Fetch disk model names from lsblk (called from background thread).
     ///
     /// Runs `lsblk -ndo NAME,VENDOR,MODEL` to get human-readable device names.
@@ -172,12 +188,13 @@ impl StorageMonitor {
     /// ```
     fn fetch_disk_models() -> Option<HashMap<String, String>> {
         let mut models = HashMap::new();
-        
+
         // Run lsblk to get device vendor and model
         // -n: no header, -d: no partition info, -o: output columns
         if let Ok(output) = Command::new("lsblk")
             .args(&["-ndo", "NAME,VENDOR,MODEL"])
-            .output() {
+            .output()
+        {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
@@ -190,8 +207,55 @@ impl StorageMonitor {
                 }
             }
         }
-        
+
         Some(models)
+    }
+
+    /// Discover remote filesystems mounted by the desktop through GVFS.
+    ///
+    /// `sysinfo` exposes the GVFS FUSE container rather than the individual
+    /// SFTP/SMB connections, so each connection directory must be queried.
+    fn fetch_remote_disks() -> Vec<DiskInfo> {
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
+                libc::geteuid()
+            })));
+        let gvfs_dir = runtime_dir.join("gvfs");
+        let Ok(entries) = fs::read_dir(gvfs_dir) else {
+            return Vec::new();
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| Self::remote_disk_from_mount(&entry.path()))
+            .collect()
+    }
+
+    fn remote_disk_from_mount(mount_path: &Path) -> Option<DiskInfo> {
+        let mount_name = mount_path.file_name()?.to_str()?;
+        if !is_gvfs_remote_mount(mount_name) {
+            return None;
+        }
+
+        let qnap_data_path = qnap_data_path(mount_path);
+        let stats_path = qnap_data_path.as_deref().unwrap_or(mount_path);
+        let (total_space, available_space) = filesystem_space(stats_path)?;
+        if total_space == 0 {
+            return None;
+        }
+
+        let used_percentage =
+            ((total_space - available_space) as f64 / total_space as f64 * 100.0) as f32;
+
+        Some(DiskInfo {
+            name: remote_display_name(mount_name, qnap_data_path.is_some()),
+            mount_point: stats_path.to_string_lossy().into_owned(),
+            used_percentage,
+            total_space,
+            available_space,
+            is_loading: false,
+        })
     }
 
     /// Update disk information from sysinfo.
@@ -235,15 +299,15 @@ impl StorageMonitor {
             // Normal update: just refresh existing disk data (fast, no FD leak)
             self.disks.refresh();
         }
-        
+
         self.disk_info.clear();
-        
+
         // Get disk models from cache (updated by background thread)
         let disk_models = self.disk_models.lock().unwrap().clone();
-        
+
         for disk in &self.disks {
             let mount_point = disk.mount_point().to_string_lossy().to_string();
-            
+
             // ================================================================
             // Mount Point Filtering
             // ================================================================
@@ -251,25 +315,27 @@ impl StorageMonitor {
             // Only show root, /home, and top-level /mnt or /media mounts
             let is_root = mount_point == "/";
             let is_home = mount_point == "/home";
-            let is_top_level_mount = mount_point.starts_with("/mnt/") || mount_point.starts_with("/media/");
-            
+            let is_top_level_mount =
+                mount_point.starts_with("/mnt/") || mount_point.starts_with("/media/");
+
             // Skip boot partitions, snap mounts, and other system partitions
-            if mount_point.starts_with("/boot") 
+            if mount_point.starts_with("/boot")
                 || mount_point.starts_with("/snap")
                 || mount_point.starts_with("/run")
                 || mount_point.starts_with("/sys")
                 || mount_point.starts_with("/proc")
                 || mount_point.starts_with("/dev")
                 || mount_point.starts_with("/tmp")
-                || mount_point.starts_with("/var/snap") {
+                || mount_point.starts_with("/var/snap")
+            {
                 continue;
             }
-            
+
             // Only include root, /home, or external mounts
             if !is_root && !is_home && !is_top_level_mount {
                 continue;
             }
-            
+
             // ================================================================
             // Space Calculation
             // ================================================================
@@ -281,13 +347,13 @@ impl StorageMonitor {
             } else {
                 0.0
             };
-            
+
             // ================================================================
             // Device Name Resolution
             // ================================================================
             // Get the device name (e.g., sda, nvme0n1, sdb)
             let device_name = disk.name().to_string_lossy().to_string();
-            
+
             // Extract the base disk name (without partition number)
             // e.g., /dev/sda1 -> sda, /dev/nvme0n1p1 -> nvme0n1
             let base_device = if let Some(dev) = device_name.strip_prefix("/dev/") {
@@ -302,21 +368,23 @@ impl StorageMonitor {
             } else {
                 &device_name
             };
-            
+
             // ================================================================
             // Display Name Resolution
             // ================================================================
             // Try to get a better label for the disk
             let display_name = if mount_point == "/" {
                 // For root, try to get model name or use "System"
-                disk_models.get(base_device)
+                disk_models
+                    .get(base_device)
                     .map(|m| m.clone())
                     .unwrap_or_else(|| "System".to_string())
             } else if mount_point == "/home" {
                 "Home".to_string()
             } else {
                 // For external drives, try to get the model name
-                disk_models.get(base_device)
+                disk_models
+                    .get(base_device)
                     .map(|m| m.clone())
                     .unwrap_or_else(|| {
                         // Fallback to mount point name (e.g., "USB_Drive" from /mnt/USB_Drive)
@@ -327,7 +395,7 @@ impl StorageMonitor {
                             .to_string()
                     })
             };
-            
+
             self.disk_info.push(DiskInfo {
                 name: display_name,
                 mount_point,
@@ -337,7 +405,17 @@ impl StorageMonitor {
                 is_loading: false,
             });
         }
-        
+
+        for remote_disk in self.remote_disks.lock().unwrap().iter() {
+            if !self
+                .disk_info
+                .iter()
+                .any(|disk| disk.mount_point == remote_disk.mount_point)
+            {
+                self.disk_info.push(remote_disk.clone());
+            }
+        }
+
         // Update cache after first successful update
         // This saves disk names for instant display on next startup
         if self.is_first_update && !self.disk_info.is_empty() {
@@ -345,5 +423,110 @@ impl StorageMonitor {
             cache.update_disks(&self.disk_info);
             self.is_first_update = false;
         }
+    }
+}
+
+fn is_gvfs_remote_mount(name: &str) -> bool {
+    ["sftp:", "smb-share:", "dav:", "davs:", "ftp:", "nfs:"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// QNAP SFTP connections expose the small system filesystem at their root.
+/// Prefer the user-facing NAS share, then the primary data volume, so the
+/// displayed capacity describes storage rather than the appliance OS.
+fn qnap_data_path(mount_path: &Path) -> Option<PathBuf> {
+    let share_dir = mount_path.join("share");
+    let primary_volume = share_dir.join("CACHEDEV1_DATA");
+    if !primary_volume.is_dir() {
+        return None;
+    }
+
+    let nas_share = share_dir.join("NAS");
+    if nas_share.is_dir() {
+        Some(nas_share)
+    } else {
+        let public_share = share_dir.join("Public");
+        Some(if public_share.is_dir() {
+            public_share
+        } else {
+            primary_volume
+        })
+    }
+}
+
+fn remote_display_name(mount_name: &str, is_qnap: bool) -> String {
+    let attributes = mount_name
+        .split_once(':')
+        .map(|(_, attributes)| attributes)
+        .unwrap_or_default();
+    let value = |key: &str| {
+        attributes.split(',').find_map(|attribute| {
+            let (attribute_key, value) = attribute.split_once('=')?;
+            (attribute_key == key).then(|| {
+                urlencoding::decode(value)
+                    .map(|value| value.into_owned())
+                    .unwrap_or_else(|_| value.to_string())
+            })
+        })
+    };
+    let host = value("host").or_else(|| value("server"));
+
+    if is_qnap {
+        return host
+            .map(|host| format!("QNAP NAS  ({host})"))
+            .unwrap_or_else(|| "QNAP NAS".to_string());
+    }
+
+    match (value("share"), host) {
+        (Some(share), Some(host)) => format!("{share} ({host})"),
+        (Some(share), None) => share,
+        (None, Some(host)) => host,
+        (None, None) => "Network storage".to_string(),
+    }
+}
+
+fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    let block_size = if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    } as u64;
+
+    Some((
+        (stats.f_blocks as u64).saturating_mul(block_size),
+        (stats.f_bavail as u64).saturating_mul(block_size),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_gvfs_remote_mount, remote_display_name};
+
+    #[test]
+    fn recognizes_supported_gvfs_network_mounts() {
+        assert!(is_gvfs_remote_mount("sftp:host=192.0.2.9"));
+        assert!(is_gvfs_remote_mount(
+            "smb-share:server=qnap.local,share=Media"
+        ));
+        assert!(!is_gvfs_remote_mount("mtp:host=phone"));
+    }
+
+    #[test]
+    fn names_qnap_and_smb_storage() {
+        assert_eq!(
+            remote_display_name("sftp:host=192.0.2.9", true),
+            "QNAP NAS  (192.0.2.9)"
+        );
+        assert_eq!(
+            remote_display_name("smb-share:server=qnap.local,share=Media", false),
+            "Media (qnap.local)"
+        );
     }
 }

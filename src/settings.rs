@@ -28,11 +28,11 @@
 
 use crate::config::{Config, WidgetSection};
 use crate::fl;
+use cosmic::Application;
+use cosmic::Element;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::prelude::*;
 use cosmic::widget;
-use cosmic::Application;
-use cosmic::Element;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -117,17 +117,16 @@ impl WidgetCache {
 pub struct SettingsApp {
     /// COSMIC runtime core for window management and styling
     core: cosmic::app::Core,
-    
+
     /// Current configuration (modified as user changes settings)
     config: Config,
-    
+
     /// Handle to cosmic-config for saving configuration
     config_handler: Option<cosmic_config::Config>,
-    
+
     // Text input states - these hold the current text in input fields,
     // which may be invalid (e.g., non-numeric). Only valid values are
     // written to config.
-    
     /// Update interval input (milliseconds)
     interval_input: String,
     /// Widget X position input (pixels)
@@ -159,7 +158,7 @@ pub enum Message {
     // === Config sync ===
     /// Configuration changed externally - update our view
     UpdateConfig(Config),
-    
+
     // === Utilization toggles ===
     /// Toggle CPU usage monitoring
     ToggleCpu(bool),
@@ -173,7 +172,7 @@ pub enum Message {
     ToggleStorage(bool),
     /// Toggle GPU usage monitoring
     ToggleGpu(bool),
-    
+
     // === Temperature toggles ===
     /// Toggle CPU temperature display
     ToggleCpuTemp(bool),
@@ -181,7 +180,7 @@ pub enum Message {
     ToggleGpuTemp(bool),
     /// Toggle between circular gauge and text temperature display
     ToggleCircularTempDisplay(bool),
-    
+
     // === Clock/Date toggles ===
     /// Toggle clock display
     ToggleClock(bool),
@@ -189,11 +188,11 @@ pub enum Message {
     ToggleDate(bool),
     /// Toggle between 24-hour and 12-hour time format
     Toggle24HourTime(bool),
-    
+
     // === Display option toggles ===
     /// Toggle percentage values on utilization bars
     TogglePercentages(bool),
-    
+
     // === Battery toggles ===
     /// Toggle battery section visibility
     ToggleBatterySection(bool),
@@ -201,19 +200,19 @@ pub enum Message {
     ToggleSolaarIntegration(bool),
     /// Remove a cached battery device by index
     RemoveCachedDevice(usize),
-    
+
     // === Notification settings ===
     /// Toggle notifications section
     ToggleNotifications(bool),
     /// Update max notifications count (text input)
     UpdateMaxNotifications(String),
-    
+
     // === Media player settings ===
     /// Toggle media player section
     ToggleMedia(bool),
     /// Update Cider API token (text input)
     UpdateCiderApiToken(String),
-    
+
     // === Interval and position ===
     /// Update polling interval (text input)
     UpdateInterval(String),
@@ -221,7 +220,7 @@ pub enum Message {
     UpdateX(String),
     /// Update widget Y position (text input)
     UpdateY(String),
-    
+
     // === Weather settings ===
     /// Toggle weather display
     ToggleWeather(bool),
@@ -229,19 +228,19 @@ pub enum Message {
     UpdateWeatherApiKey(String),
     /// Update weather location (text input)
     UpdateWeatherLocation(String),
-    
+
     // === Widget behavior ===
     /// Toggle auto-start widget when panel loads
     ToggleWidgetAutostart(bool),
     /// Toggle debug logging to file
     ToggleLogging(bool),
-    
+
     // === Section reordering ===
     /// Move a section up in the order list
     MoveSectionUp(usize),
     /// Move a section down in the order list
     MoveSectionDown(usize),
-    
+
     // === Actions ===
     /// Save config and restart the widget
     SaveAndApply,
@@ -264,6 +263,15 @@ impl SettingsApp {
                 eprintln!("Failed to save config: {}", err);
             }
         }
+    }
+
+    fn check_widget_running() -> bool {
+        std::process::Command::new("pgrep")
+            .args(["-r", "R,S,D,T,t,W,I"])
+            .arg("-x")
+            .arg("cosmic-widget")
+            .output()
+            .is_ok_and(|output| !output.stdout.is_empty())
     }
 }
 
@@ -303,11 +311,8 @@ impl Application for SettingsApp {
         _flags: Self::Flags,
     ) -> (Self, Task<cosmic::Action<Self::Message>>) {
         // Load config from the main app's config path (not the settings app path)
-        let config_handler = cosmic_config::Config::new(
-            "com.github.zoliviragh.CosmicWidget",
-            Config::VERSION,
-        )
-        .ok();
+        let config_handler =
+            cosmic_config::Config::new("com.github.zoliviragh.CosmicWidget", Config::VERSION).ok();
 
         let mut config = config_handler
             .as_ref()
@@ -320,25 +325,49 @@ impl Application for SettingsApp {
         // === Config Migration ===
         // When new sections are added to the app, existing configs won't have them.
         // This ensures users don't lose access to new features.
-        
+
         // Add Battery section if missing (added in v1.x)
-        if !config.section_order.iter().any(|s| matches!(s, WidgetSection::Battery)) {
-            if let Some(storage_pos) = config.section_order.iter().position(|s| matches!(s, WidgetSection::Storage)) {
-                config.section_order.insert(storage_pos + 1, WidgetSection::Battery);
-            } else if let Some(weather_pos) = config.section_order.iter().position(|s| matches!(s, WidgetSection::Weather)) {
-                config.section_order.insert(weather_pos, WidgetSection::Battery);
+        if !config
+            .section_order
+            .iter()
+            .any(|s| matches!(s, WidgetSection::Battery))
+        {
+            if let Some(storage_pos) = config
+                .section_order
+                .iter()
+                .position(|s| matches!(s, WidgetSection::Storage))
+            {
+                config
+                    .section_order
+                    .insert(storage_pos + 1, WidgetSection::Battery);
+            } else if let Some(weather_pos) = config
+                .section_order
+                .iter()
+                .position(|s| matches!(s, WidgetSection::Weather))
+            {
+                config
+                    .section_order
+                    .insert(weather_pos, WidgetSection::Battery);
             } else {
                 config.section_order.push(WidgetSection::Battery);
             }
         }
 
         // Add Notifications section if missing
-        if !config.section_order.iter().any(|s| matches!(s, WidgetSection::Notifications)) {
+        if !config
+            .section_order
+            .iter()
+            .any(|s| matches!(s, WidgetSection::Notifications))
+        {
             config.section_order.push(WidgetSection::Notifications);
         }
 
         // Add Media section if missing
-        if !config.section_order.iter().any(|s| matches!(s, WidgetSection::Media)) {
+        if !config
+            .section_order
+            .iter()
+            .any(|s| matches!(s, WidgetSection::Media))
+        {
             config.section_order.push(WidgetSection::Media);
         }
 
@@ -357,7 +386,7 @@ impl Application for SettingsApp {
         let weather_location_input = config.weather_location.clone();
         let max_notifications_input = config.max_notifications.to_string();
         let cider_api_token_input = config.cider_api_token.clone();
-        
+
         // Load cached battery devices from widget's cache file
         let cache = WidgetCache::load();
         let cached_devices = cache.battery_devices.clone();
@@ -395,13 +424,12 @@ impl Application for SettingsApp {
     /// - Widget Position
     /// - Advanced (logging)
     fn view(&self) -> Element<Self::Message> {
-        let mut content = widget::column()
+        let mut content = widget::column::with_capacity(48)
             .spacing(12)
             .padding(24)
             // === Header ===
             .push(widget::text::title1(fl!("app-title")))
             .push(widget::divider::horizontal::default())
-            
             // === Monitoring Options Section ===
             .push(widget::text::heading(fl!("monitoring-options")))
             .push(widget::settings::item(
@@ -425,7 +453,6 @@ impl Application for SettingsApp {
                 widget::toggler(self.config.show_disk).on_toggle(Message::ToggleDisk),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Storage Display Section ===
             .push(widget::text::heading(fl!("storage-display")))
             .push(widget::settings::item(
@@ -433,7 +460,6 @@ impl Application for SettingsApp {
                 widget::toggler(self.config.show_storage).on_toggle(Message::ToggleStorage),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Temperature Display Section ===
             .push(widget::text::heading(fl!("temperature-display")))
             .push(widget::settings::item(
@@ -446,10 +472,10 @@ impl Application for SettingsApp {
             ))
             .push(widget::settings::item(
                 fl!("use-circular-temp-display"),
-                widget::toggler(self.config.use_circular_temp_display).on_toggle(Message::ToggleCircularTempDisplay),
+                widget::toggler(self.config.use_circular_temp_display)
+                    .on_toggle(Message::ToggleCircularTempDisplay),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Widget Display Section (Clock/Date) ===
             .push(widget::text::heading(fl!("widget-display")))
             .push(widget::settings::item(
@@ -465,7 +491,6 @@ impl Application for SettingsApp {
                 widget::toggler(self.config.use_24hour_time).on_toggle(Message::Toggle24HourTime),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Display Options Section ===
             .push(widget::text::heading(fl!("display-options")))
             .push(widget::settings::item(
@@ -473,43 +498,41 @@ impl Application for SettingsApp {
                 widget::toggler(self.config.show_percentages).on_toggle(Message::TogglePercentages),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Battery Section ===
             .push(widget::text::heading("Battery"))
             .push(widget::settings::item(
                 "Show battery section",
-                widget::toggler(self.config.show_battery)
-                    .on_toggle(Message::ToggleBatterySection),
+                widget::toggler(self.config.show_battery).on_toggle(Message::ToggleBatterySection),
             ))
             .push(widget::settings::item(
                 "Enable Solaar integration",
                 widget::toggler(self.config.enable_solaar_integration)
                     .on_toggle(Message::ToggleSolaarIntegration),
             ));
-        
+
         // Display cached battery devices with remove buttons
         if !self.cached_devices.is_empty() {
             content = content.push(widget::text::body("Cached Devices:"));
-            
+
             for (index, device) in self.cached_devices.iter().enumerate() {
                 let device_kind = device.kind.as_deref().unwrap_or("device");
                 let device_label = format!("{} ({})", device.name, device_kind);
-                
+
                 content = content.push(
-                    widget::row()
+                    widget::row::with_capacity(3)
                         .spacing(8)
                         .padding([4, 16])
                         .push(widget::text::body(device_label))
-                        .push(widget::horizontal_space())
+                        .push(widget::space().width(cosmic::iced::Length::Fill))
                         .push(
                             widget::button::icon(widget::icon::from_name("user-trash-symbolic"))
                                 .on_press(Message::RemoveCachedDevice(index))
-                                .padding(4)
-                        )
+                                .padding(4),
+                        ),
                 );
             }
         }
-        
+
         content = content
             // === Update Interval ===
             .push(widget::settings::item(
@@ -517,14 +540,12 @@ impl Application for SettingsApp {
                 widget::text_input("", &self.interval_input).on_input(Message::UpdateInterval),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Weather Display Section ===
             // Uses Open-Meteo API (free, no API key required)
             .push(widget::text::heading(fl!("weather-display")))
             .push(widget::settings::item(
                 fl!("show-weather"),
-                widget::toggler(self.config.show_weather)
-                    .on_toggle(Message::ToggleWeather),
+                widget::toggler(self.config.show_weather).on_toggle(Message::ToggleWeather),
             ))
             .push(widget::settings::item(
                 fl!("weather-location"),
@@ -532,7 +553,6 @@ impl Application for SettingsApp {
                     .on_input(Message::UpdateWeatherLocation),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Notifications Section ===
             .push(widget::text::heading("Notifications"))
             .push(widget::settings::item(
@@ -546,26 +566,25 @@ impl Application for SettingsApp {
                     .on_input(Message::UpdateMaxNotifications),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Media Player Section ===
             .push(widget::text::heading("Media Player"))
             .push(widget::settings::item(
                 "Show Media Player",
-                widget::toggler(self.config.show_media)
-                    .on_toggle(Message::ToggleMedia),
+                widget::toggler(self.config.show_media).on_toggle(Message::ToggleMedia),
             ))
             .push(widget::settings::item(
                 "Cider API Token",
                 widget::text_input("Leave empty if auth disabled", &self.cider_api_token_input)
                     .on_input(Message::UpdateCiderApiToken),
             ))
-            .push(widget::text::body("Displays currently playing track from Cider (Apple Music client)"))
+            .push(widget::text::body(
+                "Displays currently playing track from Cider (Apple Music client)",
+            ))
             .push(widget::divider::horizontal::default())
-            
             // === Layout Order Section ===
             .push(widget::text::heading(fl!("layout-order")))
             .push(widget::text::body(fl!("layout-order-description")));
-        
+
         // Render section order list with up/down move buttons
         for (index, section) in self.config.section_order.iter().enumerate() {
             // Up button (disabled if at top)
@@ -574,34 +593,31 @@ impl Application for SettingsApp {
                     .on_press(Message::MoveSectionUp(index))
                     .padding(4)
             } else {
-                widget::button::icon(widget::icon::from_name("go-up-symbolic"))
-                    .padding(4)
+                widget::button::icon(widget::icon::from_name("go-up-symbolic")).padding(4)
             };
-            
+
             // Down button (disabled if at bottom)
             let down_button = if index < self.config.section_order.len() - 1 {
                 widget::button::icon(widget::icon::from_name("go-down-symbolic"))
                     .on_press(Message::MoveSectionDown(index))
                     .padding(4)
             } else {
-                widget::button::icon(widget::icon::from_name("go-down-symbolic"))
-                    .padding(4)
+                widget::button::icon(widget::icon::from_name("go-down-symbolic")).padding(4)
             };
-            
+
             content = content.push(
-                widget::row()
+                widget::row::with_capacity(4)
                     .spacing(8)
                     .padding([4, 8])
                     .push(up_button)
                     .push(down_button)
                     .push(widget::text::body(section.label()))
-                    .push(widget::horizontal_space())
+                    .push(widget::space().width(cosmic::iced::Length::Fill)),
             );
         }
-        
+
         content = content
             .push(widget::divider::horizontal::default())
-            
             // === Widget Position Section ===
             .push(widget::text::heading("Widget Position"))
             .push(widget::settings::item(
@@ -618,26 +634,25 @@ impl Application for SettingsApp {
                 widget::text_input("", &self.y_input).on_input(Message::UpdateY),
             ))
             .push(widget::divider::horizontal::default())
-            
             // === Advanced Section ===
             .push(widget::text::heading("Advanced"))
             .push(widget::settings::item(
                 "Enable Debug Logging",
-                widget::toggler(self.config.enable_logging)
-                    .on_toggle(Message::ToggleLogging),
+                widget::toggler(self.config.enable_logging).on_toggle(Message::ToggleLogging),
             ))
-            .push(widget::text::body("Writes debug logs to /tmp/cosmic-widget.log"))
-            
+            .push(widget::text::body(
+                "Writes debug logs to /tmp/cosmic-widget.log",
+            ))
             // === Save & Apply Button ===
             .push(
-                widget::row()
+                widget::row::with_capacity(3)
                     .spacing(8)
-                    .push(widget::column().width(cosmic::iced::Length::Fill))
+                    .push(widget::space().width(cosmic::iced::Length::Fill))
                     .push(
                         widget::button::suggested("Save & Apply Settings")
-                            .on_press(Message::SaveAndApply)
+                            .on_press(Message::SaveAndApply),
                     )
-                    .push(widget::column().width(cosmic::iced::Length::Fill))
+                    .push(widget::space().width(cosmic::iced::Length::Fill)),
             );
 
         // Wrap in scrollable container for smaller screens
@@ -659,16 +674,16 @@ impl Application for SettingsApp {
             Message::UpdateConfig(config) => {
                 self.config = config;
             }
-            
+
             // === Window Close ===
             Message::CloseRequested => {
                 // Disable widget movement when settings closes
                 self.config.widget_movable = false;
                 self.save_config();
-                return cosmic::iced::window::get_latest()
+                return cosmic::iced::window::latest()
                     .and_then(|id| cosmic::iced::window::close(id));
             }
-            
+
             // === Simple Toggle Messages ===
             // Each toggle updates config and saves immediately
             Message::ToggleCpu(enabled) => {
@@ -731,7 +746,7 @@ impl Application for SettingsApp {
                 self.config.enable_solaar_integration = enabled;
                 self.save_config();
             }
-            
+
             // === Battery Device Cache ===
             Message::RemoveCachedDevice(index) => {
                 if index < self.cached_devices.len() {
@@ -742,7 +757,7 @@ impl Application for SettingsApp {
                     cache.save();
                 }
             }
-            
+
             // === Notification Settings ===
             Message::ToggleNotifications(enabled) => {
                 self.config.show_notifications = enabled;
@@ -757,7 +772,7 @@ impl Application for SettingsApp {
                     }
                 }
             }
-            
+
             // === Media Settings ===
             Message::ToggleMedia(enabled) => {
                 self.config.show_media = enabled;
@@ -768,7 +783,7 @@ impl Application for SettingsApp {
                 self.config.cider_api_token = value;
                 self.save_config();
             }
-            
+
             // === Interval Setting ===
             Message::UpdateInterval(value) => {
                 self.interval_input = value.clone();
@@ -780,7 +795,7 @@ impl Application for SettingsApp {
                     }
                 }
             }
-            
+
             // === Position Settings ===
             Message::UpdateX(value) => {
                 self.x_input = value.clone();
@@ -796,7 +811,7 @@ impl Application for SettingsApp {
                     self.save_config();
                 }
             }
-            
+
             // === Weather Settings ===
             Message::ToggleWeather(enabled) => {
                 self.config.show_weather = enabled;
@@ -820,7 +835,7 @@ impl Application for SettingsApp {
                 self.config.weather_location = value;
                 self.save_config();
             }
-            
+
             // === Section Reordering ===
             Message::MoveSectionUp(index) => {
                 if index > 0 && index < self.config.section_order.len() {
@@ -834,32 +849,44 @@ impl Application for SettingsApp {
                     self.save_config();
                 }
             }
-            
+
             // === Save & Apply Action ===
             Message::SaveAndApply => {
                 // Ensure all settings are persisted
                 self.save_config();
-                
+
                 // Restart widget to apply changes that require restart
                 eprintln!("Save & Apply clicked! Restarting widget with current settings.");
-                
-                // Kill existing widget process
+
+                // Stop only the standalone widget. Using `-f` here also matched
+                // this settings process and the panel applet because their
+                // command lines contain "cosmic-widget".
                 match std::process::Command::new("pkill")
-                    .arg("-f")
+                    .arg("-x")
                     .arg("cosmic-widget")
-                    .status() {
+                    .status()
+                {
                     Ok(status) => eprintln!("pkill status: {:?}", status),
                     Err(e) => eprintln!("pkill error: {:?}", e),
                 }
-                
-                // Brief delay for process cleanup
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                
-                // Spawn new widget using installed binary (from PATH)
-                match std::process::Command::new("cosmic-widget")
-                    .spawn() {
-                    Ok(child) => eprintln!("Widget spawned with PID: {:?}", child.id()),
-                    Err(e) => eprintln!("Spawn error: {:?}", e),
+
+                // Wait for the old process to release its instance lock before
+                // starting the replacement.
+                let wait_started = std::time::Instant::now();
+                while Self::check_widget_running()
+                    && wait_started.elapsed() < std::time::Duration::from_secs(2)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                if Self::check_widget_running() {
+                    eprintln!("Widget did not stop within 2 seconds; restart cancelled");
+                } else {
+                    // Spawn new widget using installed binary (from PATH)
+                    match std::process::Command::new("cosmic-widget").spawn() {
+                        Ok(child) => eprintln!("Widget spawned with PID: {:?}", child.id()),
+                        Err(e) => eprintln!("Spawn error: {:?}", e),
+                    }
                 }
             }
         }
