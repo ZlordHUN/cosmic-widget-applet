@@ -17,8 +17,9 @@
 //! ## Update Frequency
 //!
 //! - Minimum interval: 2 minutes (120 seconds)
-//! - Background thread polls for requests every 10 seconds
+//! - Update requests wake the background worker immediately
 //! - First update triggers immediately on startup
+//! - Cached data is displayed while the live refresh completes
 //!
 //! ## Icon System
 //!
@@ -29,9 +30,12 @@
 //!
 //! - Missing location: Silently skips updates
 //! - API failure: Keeps previous data, logs error
-//! - Network timeout: 5 second limit to prevent blocking
+//! - Network timeout: 5 second limit to prevent a stalled request
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -129,7 +133,7 @@ struct CurrentWeather {
 ///
 /// # Serialization
 ///
-/// Implements Serialize/Deserialize for potential caching (not currently used).
+/// Implements Serialize/Deserialize so the last successful reading can be cached.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherData {
     /// Current temperature in Celsius
@@ -148,6 +152,43 @@ pub struct WeatherData {
     pub icon: String,
     /// City name returned by API
     pub location: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolvedLocation {
+    query: String,
+    latitude: f64,
+    longitude: f64,
+    display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WeatherCache {
+    location: ResolvedLocation,
+    data: WeatherData,
+}
+
+impl WeatherCache {
+    fn path() -> PathBuf {
+        let mut path = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        path.push("cosmic-widget-applet");
+        let _ = fs::create_dir_all(&path);
+        path.push("weather.json");
+        path
+    }
+
+    fn load(query: &str) -> Option<Self> {
+        let content = fs::read_to_string(Self::path()).ok()?;
+        let cache: Self = serde_json::from_str(&content).ok()?;
+        (cache.location.query == query).then_some(cache)
+    }
+
+    fn save(&self) {
+        let Ok(json) = serde_json::to_string(self) else {
+            return;
+        };
+        let _ = fs::write(Self::path(), json);
+    }
 }
 
 impl Default for WeatherData {
@@ -230,14 +271,14 @@ fn wmo_to_description_and_icon(code: u8, is_day: bool) -> (String, String) {
 /// Monitors weather conditions via Open-Meteo API.
 ///
 /// Fetches weather data in a background thread to avoid blocking the render loop.
-/// Updates are rate-limited to once every 10 minutes to respect API quotas.
+/// Updates are rate-limited to once every 2 minutes to respect API quotas.
 ///
 /// # Threading Model
 ///
 /// - `weather_data`: Shared state with latest weather info
 /// - `location`: Shared config, can be updated from settings
-/// - `update_requested`: Flag to trigger background fetch
-/// - Background thread checks for requests every 10 seconds
+/// - `update_sender`: Bounded channel that wakes the worker immediately
+/// - The last coordinates and reading are restored from disk on startup
 ///
 /// # Configuration
 ///
@@ -250,9 +291,9 @@ pub struct WeatherMonitor {
     /// Location query string (city name or "city,country")
     location: Arc<Mutex<String>>,
     /// Cached coordinates from last geocoding lookup
-    cached_coords: Arc<Mutex<Option<(f64, f64, String)>>>,
-    /// Flag to signal background thread that an update is needed
-    update_requested: Arc<Mutex<bool>>,
+    cached_location: Arc<Mutex<Option<ResolvedLocation>>>,
+    /// Wakes the background worker as soon as an update is requested.
+    update_sender: SyncSender<()>,
     /// API key (kept for backward compatibility, but no longer required)
     #[allow(dead_code)]
     api_key: Arc<Mutex<String>>,
@@ -268,109 +309,130 @@ impl WeatherMonitor {
     ///
     /// # Initialization
     ///
-    /// 1. Sets `last_update` to 11 minutes ago to trigger immediate first update
+    /// 1. Sets `last_update` beyond the rate limit to trigger an immediate refresh
     /// 2. Spawns background thread for API requests
-    /// 3. Background thread polls for update requests every 10 seconds
+    /// 3. Background thread blocks until an update request arrives
     pub fn new(api_key: String, location: String) -> Self {
-        // Initialize last_update to 11 minutes ago to force immediate first update
-        // (Rate limit is 10 minutes, so 11 minutes ensures first update triggers)
-        let last_update = Instant::now() - std::time::Duration::from_secs(660);
+        // Start beyond the rate limit so the first caller queues a live refresh.
+        let last_update = Instant::now() - std::time::Duration::from_secs(121);
 
         let api_key = Arc::new(Mutex::new(api_key));
         let location = Arc::new(Mutex::new(location));
-        let update_requested = Arc::new(Mutex::new(false));
-        let weather_data = Arc::new(Mutex::new(None));
-        let cached_coords: Arc<Mutex<Option<(f64, f64, String)>>> = Arc::new(Mutex::new(None));
+        let cached_weather = WeatherCache::load(&location.lock().unwrap());
+        let weather_data = Arc::new(Mutex::new(
+            cached_weather.as_ref().map(|cache| cache.data.clone()),
+        ));
+        let cached_location = Arc::new(Mutex::new(
+            cached_weather.map(|cache| cache.location),
+        ));
+        let (update_sender, update_receiver) = sync_channel(1);
 
         // Spawn background thread for weather updates
         // This avoids blocking the main render loop on network requests
         let location_clone = Arc::clone(&location);
-        let update_requested_clone = Arc::clone(&update_requested);
         let weather_data_clone = Arc::clone(&weather_data);
-        let cached_coords_clone = Arc::clone(&cached_coords);
+        let cached_location_clone = Arc::clone(&cached_location);
 
         std::thread::spawn(move || {
-            loop {
-                // Poll for update requests every 10 seconds
-                std::thread::sleep(std::time::Duration::from_secs(10));
+            let client = match reqwest::blocking::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(2))
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    log::error!("Failed to initialize weather HTTP client: {error}");
+                    return;
+                }
+            };
 
-                // Check if update is needed (atomic check-and-clear)
-                let requested = {
-                    let mut req = update_requested_clone.lock().unwrap();
-                    if *req {
-                        *req = false;
-                        true
-                    } else {
-                        false
-                    }
-                };
+            while update_receiver.recv().is_ok() {
+                let location = location_clone.lock().unwrap().clone();
 
-                if requested {
-                    let location = location_clone.lock().unwrap().clone();
+                if !location.is_empty() {
+                    log::info!(
+                        "Background: Fetching weather data for location: {}",
+                        location
+                    );
 
-                    if !location.is_empty() {
-                        log::info!(
-                            "Background: Fetching weather data for location: {}",
-                            location
-                        );
+                    // Get coordinates from the persistent cache or geocoding API.
+                    let cached = {
+                        let guard = cached_location_clone.lock().unwrap();
+                        guard.clone()
+                    };
 
-                        // Get coordinates (from cache or geocoding API)
-                        let cached = {
-                            let guard = cached_coords_clone.lock().unwrap();
-                            guard.clone()
-                        };
-
-                        let coords: Option<(f64, f64, String)> = match cached {
-                            Some((lat, lon, ref cached_loc)) if *cached_loc == location => {
-                                log::debug!(
-                                    "Using cached coordinates for {}: ({}, {})",
-                                    location,
-                                    lat,
-                                    lon
-                                );
-                                Some((lat, lon, cached_loc.clone()))
-                            }
-                            _ => {
-                                log::info!("Geocoding location: {}", location);
-                                match Self::geocode_location(&location) {
-                                    Ok((lat, lon, name)) => {
-                                        log::info!(
-                                            "Geocoded {} to ({}, {}) - {}",
-                                            location,
-                                            lat,
-                                            lon,
-                                            name
-                                        );
-                                        let result = (lat, lon, location.clone());
-                                        *cached_coords_clone.lock().unwrap() = Some(result.clone());
-                                        Some((lat, lon, name))
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to geocode location {}: {}",
-                                            location,
-                                            e
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                        };
-
-                        if let Some((lat, lon, ref location_name)) = coords {
-                            match Self::fetch_weather_static(lat, lon, location_name) {
-                                Ok(data) => {
+                    let resolved = match cached {
+                        Some(cached) if cached.query == location => {
+                            log::debug!(
+                                "Using cached coordinates for {}: ({}, {})",
+                                location,
+                                cached.latitude,
+                                cached.longitude
+                            );
+                            Some(cached)
+                        }
+                        _ => {
+                            log::info!("Geocoding location: {}", location);
+                            match Self::geocode_location(&client, &location) {
+                                Ok((lat, lon, name)) => {
                                     log::info!(
-                                        "Background: Weather data fetched: {}°C, {} (icon: {})",
-                                        data.temperature,
-                                        data.description,
-                                        data.icon
+                                        "Geocoded {} to ({}, {}) - {}",
+                                        location,
+                                        lat,
+                                        lon,
+                                        name
                                     );
-                                    *weather_data_clone.lock().unwrap() = Some(data);
+                                    let resolved = ResolvedLocation {
+                                        query: location.clone(),
+                                        latitude: lat,
+                                        longitude: lon,
+                                        display_name: name,
+                                    };
+                                    *cached_location_clone.lock().unwrap() =
+                                        Some(resolved.clone());
+                                    Some(resolved)
                                 }
                                 Err(e) => {
-                                    log::error!("Background: Failed to fetch weather: {}", e);
+                                    log::error!(
+                                        "Failed to geocode location {}: {}",
+                                        location,
+                                        e
+                                    );
+                                    None
                                 }
+                            }
+                        }
+                    };
+
+                    if let Some(resolved) = resolved {
+                        match Self::fetch_weather_static(
+                            &client,
+                            resolved.latitude,
+                            resolved.longitude,
+                            &resolved.display_name,
+                        ) {
+                            Ok(data) => {
+                                log::info!(
+                                    "Background: Weather data fetched: {}°C, {} (icon: {})",
+                                    data.temperature,
+                                    data.description,
+                                    data.icon
+                                );
+                                let is_current_location = location_clone
+                                    .lock()
+                                    .map(|current| *current == location)
+                                    .unwrap_or(false);
+                                if is_current_location {
+                                    *weather_data_clone.lock().unwrap() = Some(data.clone());
+                                    WeatherCache {
+                                        location: resolved,
+                                        data,
+                                    }
+                                    .save();
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Background: Failed to fetch weather: {}", e);
                             }
                         }
                     }
@@ -383,8 +445,8 @@ impl WeatherMonitor {
             last_update,
             api_key,
             location,
-            cached_coords,
-            update_requested,
+            cached_location,
+            update_sender,
         }
     }
 
@@ -392,12 +454,12 @@ impl WeatherMonitor {
     ///
     /// Rate-limited to once every 2 minutes (120 seconds). Open-Meteo allows
     /// up to 10,000 calls/day for non-commercial use. The actual API call
-    /// runs in the background thread - this just sets a flag.
+    /// runs in the background thread; this queues a wake-up signal.
     ///
     /// # Skipped When
     ///
     /// - Location is empty or not configured
-    /// - Less than 10 minutes since last update
+    /// - Less than 2 minutes since last update
     pub fn update(&mut self) {
         // Only update if we have a location
         {
@@ -419,23 +481,28 @@ impl WeatherMonitor {
             return;
         }
 
-        log::info!("Requesting weather update from background thread");
-        *self.update_requested.lock().unwrap() = true;
-        self.last_update = Instant::now();
+        match self.update_sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {
+                log::info!("Requesting weather update from background thread");
+                self.last_update = Instant::now();
+            }
+            Err(TrySendError::Disconnected(())) => {
+                log::error!("Weather background worker is unavailable");
+            }
+        }
     }
 
     /// Geocode a location name to coordinates using Open-Meteo Geocoding API.
-    fn geocode_location(location: &str) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
+    fn geocode_location(
+        client: &reqwest::blocking::Client,
+        location: &str,
+    ) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
         let location = location.trim_matches('"');
 
         let url = format!(
             "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
             urlencoding::encode(location)
         );
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
 
         let response: GeocodingResponse = client.get(&url).send()?.json()?;
 
@@ -468,6 +535,7 @@ impl WeatherMonitor {
     /// GET https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=...
     /// ```
     fn fetch_weather_static(
+        client: &reqwest::blocking::Client,
         lat: f64,
         lon: f64,
         location: &str,
@@ -478,11 +546,6 @@ impl WeatherMonitor {
             "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,is_day&temperature_unit=celsius",
             lat, lon
         );
-
-        // Use a client with timeout to prevent blocking indefinitely
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
 
         let response: OpenMeteoResponse = client.get(&url).send()?.json()?;
 
@@ -510,13 +573,17 @@ impl WeatherMonitor {
     }
 
     /// Update the location query (called when settings change).
-    /// Clears the cached coordinates to force a new geocoding lookup.
+    /// Restores matching cached data or clears the previous location's data.
     pub fn set_location(&mut self, location: String) {
         let old_location = self.location.lock().unwrap().clone();
         if old_location != location {
+            let cached_weather = WeatherCache::load(&location);
             *self.location.lock().unwrap() = location;
-            *self.cached_coords.lock().unwrap() = None; // Clear cache on location change
-            *self.weather_data.lock().unwrap() = None;
+            *self.cached_location.lock().unwrap() = cached_weather
+                .as_ref()
+                .map(|cache| cache.location.clone());
+            *self.weather_data.lock().unwrap() =
+                cached_weather.map(|cache| cache.data);
             self.last_update = Instant::now() - std::time::Duration::from_secs(121);
         }
     }

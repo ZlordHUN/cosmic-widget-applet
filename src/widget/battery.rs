@@ -3,13 +3,16 @@
 //! # Battery Monitoring Module (External Devices)
 //!
 //! This module monitors battery levels for external peripherals like wireless mice,
-//! keyboards, and headsets. It uses external CLI tools rather than system battery
-//! APIs since these are for USB dongles, not laptop batteries.
+//! keyboards, and headsets. The Audeze Maxwell and supported Logitech devices
+//! use native Linux interfaces; other proprietary devices use established CLI
+//! backends.
 //!
 //! ## Supported Tools
 //!
-//! - **Solaar**: Logitech device manager for Unifying/Bolt receivers
-//! - **HeadsetControl**: Battery status for gaming headsets (SteelSeries, Corsair, etc.)
+//! - **Native HID**: Audeze Maxwell and Logitech Bolt battery/charging state
+//! - **Linux power_supply**: Logitech devices exposed by the kernel HID++ driver
+//! - **Solaar**: Fallback for unsupported Logitech receivers and devices
+//! - **HeadsetControl**: Remaining supported gaming headsets
 //!
 //! ## Data Flow
 //!
@@ -23,12 +26,12 @@
 //!
 //! ## Architecture
 //!
-//! The monitor uses a background thread to periodically call Solaar and HeadsetControl:
+//! The monitor uses a background thread for native and external device queries:
 //!
 //! 1. **Startup**: Load cached device names for instant display
 //! 2. **First update**: Immediately query tools in background thread
-//! 3. **Periodic updates**: Request updates every 30 seconds via `update()`
-//! 4. **Background execution**: Actual tool queries run in separate thread to avoid blocking
+//! 3. **Native updates**: Query Maxwell and Logitech devices every 5 seconds
+//! 4. **External updates**: Request Solaar/HeadsetControl updates every 30 seconds
 //!
 //! ## Parsing Strategies
 //!
@@ -46,6 +49,13 @@
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[path = "battery/audeze_maxwell.rs"]
+mod audeze_maxwell;
+#[path = "battery/logitech.rs"]
+mod logitech;
+
+const MAXWELL_DEVICE_NAME: &str = "Audeze Maxwell";
 
 // ============================================================================
 // Battery Device Struct
@@ -163,10 +173,46 @@ impl BatteryMonitor {
 
         std::thread::spawn(move || {
             let mut is_first_update = true;
+            let mut native_maxwell_authoritative = false;
+            let mut native_maxwell = None;
+            let mut logitech_monitor = logitech::Monitor::new();
+            let mut native_logitech = query_native_logitech(&mut logitech_monitor);
+
+            if !native_logitech.is_empty() {
+                log::info!(
+                    "Using native monitoring for {} Logitech device(s)",
+                    native_logitech.len()
+                );
+                merge_native_logitech(
+                    &mut devices_clone.lock().unwrap(),
+                    &native_logitech,
+                );
+            }
+
+            match query_native_maxwell() {
+                Ok(state) => {
+                    if state.is_some() {
+                        log::info!("Using native HID monitoring for Audeze Maxwell");
+                    }
+                    native_maxwell_authoritative = true;
+                    native_maxwell = state;
+                    merge_native_maxwell(
+                        &mut devices_clone.lock().unwrap(),
+                        native_maxwell.clone(),
+                    );
+                }
+                Err(error) => {
+                    log::warn!("Native Audeze Maxwell query failed: {error}");
+                }
+            }
 
             // Perform immediate first update on startup
-            match query_solaar() {
-                Ok(new_devices) => {
+            match query_external_devices() {
+                Ok(mut new_devices) => {
+                    if native_maxwell_authoritative {
+                        merge_native_maxwell(&mut new_devices, native_maxwell.clone());
+                    }
+                    merge_native_logitech(&mut new_devices, &native_logitech);
                     *devices_clone.lock().unwrap() = new_devices.clone();
 
                     // Update cache after first successful update
@@ -188,6 +234,21 @@ impl BatteryMonitor {
             loop {
                 std::thread::sleep(Duration::from_secs(5));
 
+                if let Ok(state) = query_native_maxwell() {
+                    native_maxwell_authoritative = true;
+                    native_maxwell = state;
+                    merge_native_maxwell(
+                        &mut devices_clone.lock().unwrap(),
+                        native_maxwell.clone(),
+                    );
+                }
+
+                native_logitech = query_native_logitech(&mut logitech_monitor);
+                merge_native_logitech(
+                    &mut devices_clone.lock().unwrap(),
+                    &native_logitech,
+                );
+
                 // Check if update is needed (atomic check-and-clear)
                 let requested = {
                     let mut req = update_requested_clone.lock().unwrap();
@@ -200,8 +261,12 @@ impl BatteryMonitor {
                 };
 
                 if requested {
-                    match query_solaar() {
-                        Ok(new_devices) => {
+                    match query_external_devices() {
+                        Ok(mut new_devices) => {
+                            if native_maxwell_authoritative {
+                                merge_native_maxwell(&mut new_devices, native_maxwell.clone());
+                            }
+                            merge_native_logitech(&mut new_devices, &native_logitech);
                             *devices_clone.lock().unwrap() = new_devices.clone();
 
                             // Update cache after first successful update
@@ -259,6 +324,72 @@ impl BatteryMonitor {
 }
 
 // ============================================================================
+// Native Device Queries
+// ============================================================================
+
+fn query_native_maxwell() -> Result<Option<BatteryDevice>, String> {
+    audeze_maxwell::query().map(|state| {
+        state.map(|state| BatteryDevice {
+            name: MAXWELL_DEVICE_NAME.to_string(),
+            level: state.level,
+            status: Some(if state.charging {
+                "charging".to_string()
+            } else {
+                "discharging".to_string()
+            }),
+            kind: Some("headset".to_string()),
+            codename: None,
+            is_loading: false,
+            is_connected: true,
+        })
+    })
+}
+
+fn merge_native_maxwell(
+    devices: &mut Vec<BatteryDevice>,
+    native_maxwell: Option<BatteryDevice>,
+) {
+    if let Some(device) = native_maxwell {
+        replace_device_in_place(devices, device);
+    } else {
+        devices.retain(|device| !device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME));
+    }
+}
+
+fn query_native_logitech(monitor: &mut logitech::Monitor) -> Vec<BatteryDevice> {
+    monitor
+        .query()
+        .into_iter()
+        .map(|state| BatteryDevice {
+            name: state.name,
+            level: state.level,
+            status: state.status,
+            kind: state.kind,
+            codename: None,
+            is_loading: false,
+            is_connected: state.connected,
+        })
+        .collect()
+}
+
+fn merge_native_logitech(devices: &mut Vec<BatteryDevice>, native_devices: &[BatteryDevice]) {
+    for native in native_devices {
+        replace_device_in_place(devices, native.clone());
+    }
+}
+
+fn replace_device_in_place(devices: &mut Vec<BatteryDevice>, replacement: BatteryDevice) {
+    if let Some(existing) = devices
+        .iter_mut()
+        .find(|device| device.name.eq_ignore_ascii_case(&replacement.name))
+    {
+        *existing = replacement;
+    } else {
+        devices.push(replacement);
+    }
+}
+
+// ============================================================================
 // External Tool Query Functions
 // ============================================================================
 
@@ -272,7 +403,7 @@ impl BatteryMonitor {
 /// # Returns
 ///
 /// Combined list of all discovered devices, or empty list on failure.
-fn query_solaar() -> Result<Vec<BatteryDevice>, String> {
+fn query_external_devices() -> Result<Vec<BatteryDevice>, String> {
     let mut all_devices = Vec::new();
 
     // ========================================================================
@@ -690,7 +821,9 @@ fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_headsetcontrol_json;
+    use super::{
+        BatteryDevice, merge_native_logitech, merge_native_maxwell, parse_headsetcontrol_json,
+    };
 
     fn headsetcontrol_output(status: &str, level: i64) -> String {
         format!(
@@ -722,5 +855,87 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].level, Some(73));
         assert_eq!(devices[0].status.as_deref(), Some("discharging"));
+    }
+
+    #[test]
+    fn native_maxwell_replaces_the_cli_copy() {
+        let mut devices = vec![
+            BatteryDevice {
+                name: "G309 LIGHTSPEED".to_string(),
+                level: Some(100),
+                status: Some("discharging".to_string()),
+                kind: Some("mouse".to_string()),
+                codename: None,
+                is_loading: false,
+                is_connected: true,
+            },
+            BatteryDevice {
+                name: "Audeze Maxwell".to_string(),
+                level: Some(25),
+                status: Some("discharging".to_string()),
+                kind: Some("headset".to_string()),
+                codename: None,
+                is_loading: false,
+                is_connected: true,
+            },
+        ];
+        let native = BatteryDevice {
+            level: Some(96),
+            status: Some("charging".to_string()),
+            ..devices[1].clone()
+        };
+
+        merge_native_maxwell(&mut devices, Some(native));
+
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[1].level, Some(96));
+        assert_eq!(devices[1].status.as_deref(), Some("charging"));
+        assert_eq!(devices[0].name, "G309 LIGHTSPEED");
+    }
+
+    #[test]
+    fn native_logitech_replaces_matching_solaar_devices_only() {
+        let mut devices = vec![
+            BatteryDevice {
+                name: "G309 LIGHTSPEED".to_string(),
+                level: Some(50),
+                status: Some("discharging".to_string()),
+                kind: Some("mouse".to_string()),
+                codename: None,
+                is_loading: false,
+                is_connected: true,
+            },
+            BatteryDevice {
+                name: "Unsupported Logitech device".to_string(),
+                level: Some(75),
+                status: Some("discharging".to_string()),
+                kind: Some("mouse".to_string()),
+                codename: None,
+                is_loading: false,
+                is_connected: true,
+            },
+        ];
+        let native = BatteryDevice {
+            level: Some(100),
+            ..devices[0].clone()
+        };
+
+        merge_native_logitech(&mut devices, &[native]);
+
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].name, "G309 LIGHTSPEED");
+        assert_eq!(devices[1].name, "Unsupported Logitech device");
+        assert_eq!(
+            devices
+                .iter()
+                .find(|device| device.name == "G309 LIGHTSPEED")
+                .and_then(|device| device.level),
+            Some(100)
+        );
+        assert!(
+            devices
+                .iter()
+                .any(|device| device.name == "Unsupported Logitech device")
+        );
     }
 }
