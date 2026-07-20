@@ -1,5 +1,6 @@
 name := 'cosmic-widget-applet'
 widget-name := 'cosmic-widget'
+widget-source-name := 'cosmic-widget-iced'
 settings-name := 'cosmic-widget-settings'
 appid := 'com.github.zoliviragh.CosmicWidget'
 
@@ -68,7 +69,7 @@ run-iced-widget *args:
 # Installs files
 install:
     install -Dm0755 {{ cargo-target-dir / 'release' / name }} {{bin-dst}}
-    install -Dm0755 {{ cargo-target-dir / 'release' / widget-name }} {{widget-bin-dst}}
+    install -Dm0755 {{ cargo-target-dir / 'release' / widget-source-name }} {{widget-bin-dst}}
     install -Dm0755 {{ cargo-target-dir / 'release' / settings-name }} {{settings-bin-dst}}
     install -Dm0644 resources/app.desktop {{desktop-dst}}
     install -Dm0644 resources/widget.desktop {{widget-desktop-dst}}

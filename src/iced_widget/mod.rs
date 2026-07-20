@@ -1349,6 +1349,8 @@ mod tests {
 
     fn notification() -> Notification {
         Notification {
+            id: None,
+            server_owner: None,
             app_name: "System".to_string(),
             summary: "Package manager updated".to_string(),
             body: "System is up to date.".to_string(),

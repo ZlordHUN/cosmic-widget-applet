@@ -22,7 +22,7 @@ This creates three binaries:
 ```bash
 # Install all binaries
 sudo install -Dm755 target/release/cosmic-widget-applet /usr/bin/cosmic-widget-applet
-sudo install -Dm755 target/release/cosmic-widget /usr/bin/cosmic-widget
+sudo install -Dm755 target/release/cosmic-widget-iced /usr/bin/cosmic-widget
 sudo install -Dm755 target/release/cosmic-widget-settings /usr/local/bin/cosmic-widget-settings
 
 # Install desktop files

@@ -73,7 +73,7 @@ sudo just install
 
 # Or install manually
 sudo install -Dm755 target/release/cosmic-widget-applet /usr/local/bin/cosmic-widget-applet
-sudo install -Dm755 target/release/cosmic-widget /usr/local/bin/cosmic-widget
+sudo install -Dm755 target/release/cosmic-widget-iced /usr/local/bin/cosmic-widget
 sudo install -Dm755 target/release/cosmic-widget-settings /usr/local/bin/cosmic-widget-settings
 
 # Install desktop files and icon

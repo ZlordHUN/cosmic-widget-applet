@@ -56,6 +56,7 @@ mod audeze_maxwell;
 mod logitech;
 
 const MAXWELL_DEVICE_NAME: &str = "Audeze Maxwell";
+const MAXWELL_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(2);
 
 // ============================================================================
 // Battery Device Struct
@@ -189,7 +190,7 @@ impl BatteryMonitor {
                 );
             }
 
-            match query_native_maxwell() {
+            match query_native_maxwell(false) {
                 Ok(state) => {
                     if state.is_some() {
                         log::info!("Using native HID monitoring for Audeze Maxwell");
@@ -234,7 +235,10 @@ impl BatteryMonitor {
             loop {
                 std::thread::sleep(Duration::from_secs(5));
 
-                if let Ok(state) = query_native_maxwell() {
+                let was_maxwell_connected = native_maxwell
+                    .as_ref()
+                    .is_some_and(|device| device.is_connected);
+                if let Ok(state) = query_native_maxwell(was_maxwell_connected) {
                     native_maxwell_authoritative = true;
                     native_maxwell = state;
                     merge_native_maxwell(
@@ -327,22 +331,32 @@ impl BatteryMonitor {
 // Native Device Queries
 // ============================================================================
 
-fn query_native_maxwell() -> Result<Option<BatteryDevice>, String> {
-    audeze_maxwell::query().map(|state| {
-        state.map(|state| BatteryDevice {
-            name: MAXWELL_DEVICE_NAME.to_string(),
-            level: state.level,
-            status: Some(if state.charging {
+fn query_native_maxwell(was_connected: bool) -> Result<Option<BatteryDevice>, String> {
+    let mut state = audeze_maxwell::query()?;
+    let is_connected = state
+        .as_ref()
+        .is_some_and(|state| state.connected);
+
+    if is_connected != was_connected {
+        std::thread::sleep(MAXWELL_CONNECTION_SETTLE_DELAY);
+        state = audeze_maxwell::query()?;
+    }
+
+    Ok(state.map(|state| BatteryDevice {
+        name: MAXWELL_DEVICE_NAME.to_string(),
+        level: state.level,
+        status: state.connected.then(|| {
+            if state.charging {
                 "charging".to_string()
             } else {
                 "discharging".to_string()
-            }),
-            kind: Some("headset".to_string()),
-            codename: None,
-            is_loading: false,
-            is_connected: true,
-        })
-    })
+            }
+        }),
+        kind: Some("headset".to_string()),
+        codename: None,
+        is_loading: false,
+        is_connected: state.connected,
+    }))
 }
 
 fn merge_native_maxwell(

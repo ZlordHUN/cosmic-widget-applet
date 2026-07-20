@@ -40,6 +40,7 @@ const fn packet(bytes: &[u8]) -> [u8; MESSAGE_SIZE] {
 pub(super) struct BatteryState {
     pub(super) level: Option<u8>,
     pub(super) charging: bool,
+    pub(super) connected: bool,
 }
 
 #[derive(Debug)]
@@ -56,7 +57,7 @@ pub(super) fn query() -> Result<Option<BatteryState>, String> {
     }) else {
         return Ok(None);
     };
-    let charging = devices.iter().any(|device| {
+    let wired_headset_present = devices.iter().any(|device| {
         device.vendor_id == VENDOR_ID && WIRED_PRODUCT_IDS.contains(&device.product_id)
     });
 
@@ -70,13 +71,44 @@ pub(super) fn query() -> Result<Option<BatteryState>, String> {
         status_responses.push(send_request(&mut handle, request)?);
     }
     let battery_response = send_request(&mut handle, &BATTERY_REQUEST)?;
-    let level = parse_battery_response(&battery_response).or_else(|| {
+
+    Ok(Some(parse_battery_state(
+        &status_responses,
+        &battery_response,
+        wired_headset_present,
+    )))
+}
+
+fn parse_battery_state(
+    status_responses: &[[u8; MESSAGE_SIZE]],
+    battery_response: &[u8],
+    wired_headset_present: bool,
+) -> BatteryState {
+    // The dongle remains enumerated and can retain its last battery report after
+    // the headset powers off. The first status response marks a live link with a
+    // nonzero byte at index 1; never expose stale level or charging state without it.
+    let connected = status_responses
+        .first()
+        .is_some_and(|response| response[1] != 0);
+    if !connected {
+        return BatteryState {
+            level: None,
+            charging: false,
+            connected: false,
+        };
+    }
+
+    let level = parse_battery_response(battery_response).or_else(|| {
         status_responses
             .iter()
             .find_map(|response| parse_battery_response(response))
     });
 
-    Ok(Some(BatteryState { level, charging }))
+    BatteryState {
+        level,
+        charging: wired_headset_present,
+        connected: true,
+    }
 }
 
 fn enumerate_hidraw() -> io::Result<Vec<HidrawDevice>> {
@@ -160,7 +192,10 @@ const fn hid_ioc_get_input(length: usize) -> libc::c_ulong {
 
 #[cfg(test)]
 mod tests {
-    use super::{MESSAGE_SIZE, hid_ioc_get_input, parse_battery_response, parse_hid_id, query};
+    use super::{
+        MESSAGE_SIZE, hid_ioc_get_input, parse_battery_response, parse_battery_state,
+        parse_hid_id, query,
+    };
 
     #[test]
     fn parses_maxwell_hid_identity() {
@@ -186,11 +221,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_stale_battery_report_when_the_headset_is_offline() {
+        let status_responses = [[0; MESSAGE_SIZE]; 5];
+        let mut battery_response = [0; MESSAGE_SIZE];
+        battery_response[10..15].copy_from_slice(&[0xd6, 0x0c, 0x00, 0x00, 100]);
+
+        let state = parse_battery_state(&status_responses, &battery_response, true);
+
+        assert_eq!(state.level, None);
+        assert!(!state.charging);
+        assert!(!state.connected);
+    }
+
+    #[test]
+    fn accepts_battery_and_charging_only_with_a_live_headset_link() {
+        let mut status_responses = [[0; MESSAGE_SIZE]; 5];
+        status_responses[0][1] = 1;
+        let mut battery_response = [0; MESSAGE_SIZE];
+        battery_response[10..15].copy_from_slice(&[0xd6, 0x0c, 0x00, 0x00, 84]);
+
+        let state = parse_battery_state(&status_responses, &battery_response, true);
+
+        assert_eq!(state.level, Some(84));
+        assert!(state.charging);
+        assert!(state.connected);
+    }
+
+    #[test]
     #[ignore = "requires a connected Audeze Maxwell"]
     fn reads_connected_maxwell() {
         let state = query().expect("native Maxwell query failed");
         let state = state.expect("Maxwell dongle was not found");
-        assert!(state.level.is_some_and(|level| level <= 100));
+        if state.connected {
+            assert!(state.level.is_some_and(|level| level <= 100));
+        } else {
+            assert_eq!(state.level, None);
+            assert!(!state.charging);
+        }
         println!("Maxwell native battery state: {state:?}");
     }
 }

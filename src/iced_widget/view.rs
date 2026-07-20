@@ -1065,16 +1065,16 @@ fn feels_like_badge(value: f32) -> Element<'static, super::Message> {
 
 fn weather_icon_name(icon: &str) -> &'static str {
     match icon {
-        "01d" => "weather-clear-large",
-        "01n" => "weather-clear-night-large",
-        "02d" => "weather-few-clouds-large",
-        "02n" => "weather-few-clouds-night-large",
-        "03d" | "03n" | "04d" | "04n" => "weather-overcast-large",
-        "09d" | "09n" | "10d" | "10n" => "weather-showers-large",
-        "11d" | "11n" => "weather-storm-large",
-        "13d" | "13n" => "weather-snow-large",
-        "50d" | "50n" => "weather-fog-large",
-        _ => "weather-severe-alert-large",
+        "01d" => "weather-clear-symbolic",
+        "01n" => "weather-clear-night-symbolic",
+        "02d" => "weather-few-clouds-symbolic",
+        "02n" => "weather-few-clouds-night-symbolic",
+        "03d" | "03n" | "04d" | "04n" => "weather-overcast-symbolic",
+        "09d" | "09n" | "10d" | "10n" => "weather-showers-symbolic",
+        "11d" | "11n" => "weather-storm-symbolic",
+        "13d" | "13n" => "weather-snow-symbolic",
+        "50d" | "50n" => "weather-fog-symbolic",
+        _ => "weather-severe-alert-symbolic",
     }
 }
 
@@ -1393,9 +1393,13 @@ mod tests {
 
     #[test]
     fn weather_visuals_use_cosmic_condition_icons_and_compact_units() {
-        assert_eq!(weather_icon_name("01n"), "weather-clear-night-large");
-        assert_eq!(weather_icon_name("04d"), "weather-overcast-large");
-        assert_eq!(weather_icon_name("13d"), "weather-snow-large");
+        assert_eq!(
+            weather_icon_name("01n"),
+            "weather-clear-night-symbolic"
+        );
+        assert_eq!(weather_icon_name("02d"), "weather-few-clouds-symbolic");
+        assert_eq!(weather_icon_name("04d"), "weather-overcast-symbolic");
+        assert_eq!(weather_icon_name("13d"), "weather-snow-symbolic");
         assert_eq!(format_weather_temperature(3.2), "3.2\u{b0}C");
         assert_eq!(format_weather_temperature(1.0), "1\u{b0}C");
     }
