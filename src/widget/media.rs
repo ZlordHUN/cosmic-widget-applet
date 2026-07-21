@@ -34,8 +34,9 @@
 
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[path = "media/cider.rs"]
 mod cider;
@@ -50,6 +51,10 @@ const TIMELINE_REFRESH_RETRY: Duration = Duration::from_secs(2);
 const MAX_TIMELINE_REFRESH_ATTEMPTS: u8 = 3;
 const ARTWORK_QUEUE_CAPACITY: usize = 32;
 const MAX_CONCURRENT_ARTWORK_REQUESTS: usize = 4;
+const MAX_CACHED_ARTWORKS: usize = 20;
+const MAX_ARTWORK_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ARTWORK_CACHE_PIXELS: u64 = 32 * 1024 * 1024;
+const MEDIA_CONTROL_QUEUE_CAPACITY: usize = 32;
 
 // ============================================================================
 // Album Art Cache
@@ -64,6 +69,8 @@ pub struct AlbumArt {
     pub source_height: u32,
     /// Stable Iced handle backed by the original encoded image bytes.
     pub iced_handle: cosmic::iced::widget::image::Handle,
+    /// Size of the encoded image retained by the Iced handle.
+    encoded_bytes: usize,
 }
 
 impl AlbumArt {
@@ -86,30 +93,106 @@ impl std::fmt::Debug for AlbumArt {
 /// Keyed by artwork URL to avoid re-downloading the same image.
 /// Limited to prevent unbounded memory growth.
 struct ArtworkCache {
-    /// URL → decoded artwork mapping
-    cache: HashMap<String, AlbumArt>,
-    /// Maximum number of cached artworks
-    max_size: usize,
+    cache: HashMap<String, CachedArtwork>,
+    max_entries: usize,
+    max_encoded_bytes: usize,
+    max_source_pixels: u64,
+    encoded_bytes: usize,
+    source_pixels: u64,
+    access_generation: u64,
+}
+
+struct CachedArtwork {
+    artwork: AlbumArt,
+    last_accessed: u64,
 }
 
 impl ArtworkCache {
-    fn new(max_size: usize) -> Self {
+    fn new(max_entries: usize) -> Self {
+        Self::with_limits(
+            max_entries,
+            MAX_ARTWORK_CACHE_BYTES,
+            MAX_ARTWORK_CACHE_PIXELS,
+        )
+    }
+
+    fn with_limits(max_entries: usize, max_encoded_bytes: usize, max_source_pixels: u64) -> Self {
         Self {
             cache: HashMap::new(),
-            max_size,
+            max_entries,
+            max_encoded_bytes,
+            max_source_pixels,
+            encoded_bytes: 0,
+            source_pixels: 0,
+            access_generation: 0,
         }
     }
 
-    fn get(&self, url: &str) -> Option<AlbumArt> {
-        self.cache.get(url).cloned()
+    fn get(&mut self, url: &str) -> Option<AlbumArt> {
+        let generation = self.next_generation();
+        let cached = self.cache.get_mut(url)?;
+        cached.last_accessed = generation;
+        Some(cached.artwork.clone())
     }
 
     fn insert(&mut self, url: String, art: AlbumArt) {
-        // Simple eviction: clear cache if at capacity
-        if self.cache.len() >= self.max_size {
-            self.cache.clear();
+        let encoded_bytes = art.encoded_bytes;
+        let source_pixels = art.source_pixel_count();
+        if self.max_entries == 0
+            || encoded_bytes > self.max_encoded_bytes
+            || source_pixels > self.max_source_pixels
+        {
+            return;
         }
-        self.cache.insert(url, art);
+
+        if let Some(previous) = self.cache.remove(&url) {
+            self.remove_weight(&previous.artwork);
+        }
+
+        while !self.cache.is_empty()
+            && (self.cache.len() >= self.max_entries
+                || self.encoded_bytes.saturating_add(encoded_bytes) > self.max_encoded_bytes
+                || self.source_pixels.saturating_add(source_pixels) > self.max_source_pixels)
+        {
+            self.evict_least_recently_used();
+        }
+
+        let generation = self.next_generation();
+        self.encoded_bytes = self.encoded_bytes.saturating_add(encoded_bytes);
+        self.source_pixels = self.source_pixels.saturating_add(source_pixels);
+        self.cache.insert(
+            url,
+            CachedArtwork {
+                artwork: art,
+                last_accessed: generation,
+            },
+        );
+    }
+
+    fn next_generation(&mut self) -> u64 {
+        self.access_generation = self.access_generation.wrapping_add(1);
+        self.access_generation
+    }
+
+    fn evict_least_recently_used(&mut self) {
+        let Some(url) = self
+            .cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_accessed)
+            .map(|(url, _)| url.clone())
+        else {
+            return;
+        };
+        if let Some(evicted) = self.cache.remove(&url) {
+            self.remove_weight(&evicted.artwork);
+        }
+    }
+
+    fn remove_weight(&mut self, artwork: &AlbumArt) {
+        self.encoded_bytes = self.encoded_bytes.saturating_sub(artwork.encoded_bytes);
+        self.source_pixels = self
+            .source_pixels
+            .saturating_sub(artwork.source_pixel_count());
     }
 }
 
@@ -188,6 +271,203 @@ struct EmbyControl {
     server_url: String,
     access_token: String,
     session_id: String,
+}
+
+enum MediaControlCommand {
+    CiderCommand {
+        endpoint: &'static str,
+        token: Option<String>,
+    },
+    CiderSeek {
+        position_seconds: u64,
+        token: Option<String>,
+    },
+    Emby {
+        control: EmbyControl,
+        command: &'static str,
+        query: Option<(&'static str, u64)>,
+    },
+    Mpris {
+        bus_name: String,
+        action: MprisControlAction,
+    },
+}
+
+enum MprisControlAction {
+    PlayPause,
+    Next,
+    Previous,
+    Seek(u64),
+}
+
+#[derive(Clone)]
+struct MediaControlWorker {
+    commands: std::sync::mpsc::SyncSender<MediaControlCommand>,
+}
+
+impl MediaControlWorker {
+    fn new(cider: cider::Client, mpris: mpris::Monitor) -> Self {
+        let (commands, receiver) = std::sync::mpsc::sync_channel(MEDIA_CONTROL_QUEUE_CAPACITY);
+        if let Err(error) = std::thread::Builder::new()
+            .name("media-controls".to_string())
+            .spawn(move || Self::run(receiver, cider, mpris))
+        {
+            log::warn!("Failed to start media control worker: {error}");
+        }
+        Self { commands }
+    }
+
+    fn enqueue(&self, command: MediaControlCommand) -> bool {
+        match self.commands.try_send(command) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                log::warn!("Media control queue is full; dropping command");
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                log::warn!("Media control worker is unavailable");
+                false
+            }
+        }
+    }
+
+    fn run(
+        receiver: std::sync::mpsc::Receiver<MediaControlCommand>,
+        cider: cider::Client,
+        mpris: mpris::Monitor,
+    ) {
+        let emby_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .user_agent("cosmic-widget-applet/0.1")
+            .build()
+            .ok();
+
+        while let Ok(command) = receiver.recv() {
+            match command {
+                MediaControlCommand::CiderCommand { endpoint, token } => {
+                    if !cider.command(endpoint, token.as_deref()) {
+                        log::debug!("Cider {endpoint} command failed");
+                    }
+                }
+                MediaControlCommand::CiderSeek {
+                    position_seconds,
+                    token,
+                } => {
+                    if !cider.seek(position_seconds, token.as_deref()) {
+                        log::debug!("Cider seek command failed");
+                    }
+                }
+                MediaControlCommand::Emby {
+                    control,
+                    command,
+                    query,
+                } => {
+                    let Some(client) = emby_client.as_ref() else {
+                        log::warn!("Emby control client is unavailable");
+                        continue;
+                    };
+                    let url = MediaMonitor::emby_api_url(
+                        &control.server_url,
+                        &format!("Sessions/{}/Playing/{command}", control.session_id),
+                    );
+                    let mut request = client
+                        .post(url)
+                        .header("X-Emby-Token", control.access_token);
+                    if let Some((key, value)) = query {
+                        request = request.query(&[(key, value)]);
+                    }
+                    if let Err(error) = request
+                        .send()
+                        .and_then(reqwest::blocking::Response::error_for_status)
+                    {
+                        log::warn!("Emby {command} command failed: {error}");
+                    }
+                }
+                MediaControlCommand::Mpris { bus_name, action } => {
+                    let succeeded = match action {
+                        MprisControlAction::PlayPause => mpris.play_pause(&bus_name),
+                        MprisControlAction::Next => mpris.next(&bus_name),
+                        MprisControlAction::Previous => mpris.previous(&bus_name),
+                        MprisControlAction::Seek(position_us) => mpris.seek(&bus_name, position_us),
+                    };
+                    if !succeeded {
+                        log::warn!("Native MPRIS control failed for {bus_name}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EmbyLevelDbFile {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Default)]
+struct EmbyCredentialDiscovery {
+    files: Option<Vec<EmbyLevelDbFile>>,
+    credentials: Option<EmbyCredentials>,
+    #[cfg(test)]
+    scan_count: usize,
+}
+
+impl EmbyCredentialDiscovery {
+    fn refresh(&mut self) -> Option<EmbyCredentials> {
+        let Some(leveldb_dir) = dirs::config_dir().map(|directory| {
+            directory
+                .join("Emby Theater")
+                .join("Local Storage")
+                .join("leveldb")
+        }) else {
+            return self.credentials.clone();
+        };
+        self.refresh_from(&leveldb_dir)
+    }
+
+    fn refresh_from(&mut self, leveldb_dir: &Path) -> Option<EmbyCredentials> {
+        let Ok(files) = Self::leveldb_files(leveldb_dir) else {
+            return self.credentials.clone();
+        };
+        if self.files.as_ref() == Some(&files) {
+            return self.credentials.clone();
+        }
+
+        #[cfg(test)]
+        {
+            self.scan_count += 1;
+        }
+        if let Some(credentials) = MediaMonitor::scan_emby_credentials(&files) {
+            self.credentials = Some(credentials);
+        }
+        self.files = Some(files);
+        self.credentials.clone()
+    }
+
+    fn leveldb_files(leveldb_dir: &Path) -> std::io::Result<Vec<EmbyLevelDbFile>> {
+        let mut files = std::fs::read_dir(leveldb_dir)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("log" | "ldb")
+                ) {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                Some(EmbyLevelDbFile {
+                    path,
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                })
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
+    }
 }
 
 #[derive(Deserialize)]
@@ -431,9 +711,8 @@ impl ArtworkLoader {
                 };
 
                 runtime.block_on(async move {
-                    let permits = Arc::new(tokio::sync::Semaphore::new(
-                        MAX_CONCURRENT_ARTWORK_REQUESTS,
-                    ));
+                    let permits =
+                        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ARTWORK_REQUESTS));
                     while let Some(request) = request_rx.recv().await {
                         let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
                             break;
@@ -722,7 +1001,6 @@ fn preferred_player_id(
 ///
 /// - `player_state`: All players' info (Arc<Mutex>)
 /// - `cider_token`: Shared API token, can be updated from settings
-/// - `artwork_cache`: Shared cache for decoded album artwork
 /// - `selected_player`: User's player selection
 #[derive(Clone)]
 pub struct MediaMonitor {
@@ -730,16 +1008,12 @@ pub struct MediaMonitor {
     player_state: Arc<Mutex<MultiPlayerState>>,
     /// Cider API token for authentication (optional)
     cider_token: Arc<Mutex<Option<String>>>,
-    /// Cache for downloaded album artwork
-    artwork_cache: Arc<Mutex<ArtworkCache>>,
     /// Currently selected player ID (persists across updates)
     selected_player: Arc<Mutex<Option<PlayerId>>>,
     /// Connection details for the active local Emby Theater session.
     emby_control: Arc<Mutex<Option<EmbyControl>>>,
-    /// Native MPRIS session-bus monitor and controller.
-    mpris: mpris::Monitor,
-    /// Persistent native client for Cider's local HTTP API.
-    cider: cider::Client,
+    /// Ordered, nonblocking playback command queue.
+    controls: MediaControlWorker,
 }
 
 impl MediaMonitor {
@@ -748,11 +1022,12 @@ impl MediaMonitor {
         let player_state = Arc::new(Mutex::new(MultiPlayerState::default()));
         let token = api_token.filter(|t| !t.is_empty());
         let cider_token = Arc::new(Mutex::new(token));
-        let artwork_cache = Arc::new(Mutex::new(ArtworkCache::new(20)));
+        let artwork_cache = Arc::new(Mutex::new(ArtworkCache::new(MAX_CACHED_ARTWORKS)));
         let selected_player = Arc::new(Mutex::new(None));
         let emby_control = Arc::new(Mutex::new(None));
         let mpris = mpris::Monitor::new();
         let cider = cider::Client::new();
+        let controls = MediaControlWorker::new(cider.clone(), mpris.clone());
 
         // Spawn background thread to monitor all players
         let state_clone = Arc::clone(&player_state);
@@ -778,11 +1053,9 @@ impl MediaMonitor {
         Self {
             player_state,
             cider_token,
-            artwork_cache,
             selected_player,
             emby_control,
-            mpris,
-            cider,
+            controls,
         }
     }
 
@@ -806,7 +1079,8 @@ impl MediaMonitor {
             .user_agent("cosmic-widget-applet/0.1")
             .build()
             .ok();
-        let mut emby_credentials = Self::discover_emby_credentials();
+        let mut emby_discovery = EmbyCredentialDiscovery::default();
+        let mut emby_credentials = emby_discovery.refresh();
         let mut last_emby_discovery = Instant::now();
 
         loop {
@@ -819,7 +1093,7 @@ impl MediaMonitor {
 
             // 1. Query the native Emby Theater session through Emby Server.
             if last_emby_discovery.elapsed() >= Duration::from_secs(30) {
-                emby_credentials = Self::discover_emby_credentials().or(emby_credentials);
+                emby_credentials = emby_discovery.refresh();
                 last_emby_discovery = Instant::now();
             }
             let emby_player = emby_client.as_ref().and_then(|client| {
@@ -1008,26 +1282,13 @@ impl MediaMonitor {
     }
 
     fn discover_emby_credentials() -> Option<EmbyCredentials> {
-        let leveldb_dir = dirs::config_dir()?
-            .join("Emby Theater")
-            .join("Local Storage")
-            .join("leveldb");
-        let mut files = std::fs::read_dir(leveldb_dir)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                matches!(
-                    path.extension().and_then(|extension| extension.to_str()),
-                    Some("log" | "ldb")
-                )
-            })
-            .collect::<Vec<_>>();
-        files.sort();
+        EmbyCredentialDiscovery::default().refresh()
+    }
 
+    fn scan_emby_credentials(files: &[EmbyLevelDbFile]) -> Option<EmbyCredentials> {
         files
-            .into_iter()
-            .filter_map(|path| std::fs::read(path).ok())
+            .iter()
+            .filter_map(|file| std::fs::read(&file.path).ok())
             .filter_map(|bytes| Self::parse_emby_credentials(&bytes))
             .max_by_key(|credentials| credentials.last_accessed)
     }
@@ -1055,9 +1316,7 @@ impl MediaMonitor {
             .filter_map(|server| {
                 let configured_user_id = server.user_id.as_deref();
                 let user = configured_user_id
-                    .and_then(|user_id| {
-                        server.users.iter().find(|user| user.user_id == user_id)
-                    })
+                    .and_then(|user_id| server.users.iter().find(|user| user.user_id == user_id))
                     .or_else(|| server.users.first())?;
                 if user.access_token.is_empty() {
                     return None;
@@ -1226,10 +1485,7 @@ impl MediaMonitor {
 
         Some(format!(
             "{}?maxWidth={max_width}&quality=90&tag={}",
-            Self::emby_api_url(
-                server_url,
-                &format!("Items/{item_id}/Images/{image_type}")
-            ),
+            Self::emby_api_url(server_url, &format!("Items/{item_id}/Images/{image_type}")),
             urlencoding::encode(tag),
         ))
     }
@@ -1357,9 +1613,7 @@ impl MediaMonitor {
             .map(|video_id| {
                 ["maxresdefault", "hqdefault", "mqdefault"]
                     .into_iter()
-                    .map(|variant| {
-                        format!("https://i.ytimg.com/vi/{video_id}/{variant}.jpg")
-                    })
+                    .map(|variant| format!("https://i.ytimg.com/vi/{video_id}/{variant}.jpg"))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1513,8 +1767,7 @@ impl MediaMonitor {
 
     /// Download and decode album artwork from URL.
     ///
-    /// Reads the encoded image and creates a stable Iced handle plus a bounded
-    /// compatibility buffer for the legacy Cairo renderer.
+    /// Reads the encoded image and creates a stable Iced handle.
     /// Handles both http(s):// and file:// URLs.
     async fn download_artwork(client: &reqwest::Client, url: &str) -> Option<AlbumArt> {
         log::info!("Downloading album art from: {}", url);
@@ -1569,9 +1822,13 @@ impl MediaMonitor {
             return None;
         }
 
-        let image = image::load_from_memory(&image_data).ok()?;
-        let source_width = image.width();
-        let source_height = image.height();
+        let encoded_bytes = image_data.len();
+        let (source_width, source_height) =
+            image::ImageReader::new(std::io::Cursor::new(image_data.as_slice()))
+                .with_guessed_format()
+                .ok()?
+                .into_dimensions()
+                .ok()?;
         if source_width == 0
             || source_height == 0
             || source_width > MAX_ARTWORK_DIMENSION
@@ -1587,6 +1844,7 @@ impl MediaMonitor {
             source_width,
             source_height,
             iced_handle: cosmic::iced::widget::image::Handle::from_bytes(image_data),
+            encoded_bytes,
         })
     }
 
@@ -1765,7 +2023,7 @@ impl MediaMonitor {
     fn send_emby_playstate_command(
         &self,
         session_id: &str,
-        command: &str,
+        command: &'static str,
         query: Option<(&'static str, u64)>,
     ) -> bool {
         let Some(control) = self
@@ -1777,47 +2035,21 @@ impl MediaMonitor {
         else {
             return false;
         };
-        let command = command.to_string();
-        std::thread::spawn(move || {
-            let Ok(client) = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(3))
-                .user_agent("cosmic-widget-applet/0.1")
-                .build()
-            else {
-                return;
-            };
-            let url = Self::emby_api_url(
-                &control.server_url,
-                &format!("Sessions/{}/Playing/{command}", control.session_id),
-            );
-            let mut request = client
-                .post(url)
-                .header("X-Emby-Token", control.access_token);
-            if let Some((key, value)) = query {
-                request = request.query(&[(key, value)]);
-            }
-            if let Err(error) = request.send().and_then(reqwest::blocking::Response::error_for_status)
-            {
-                log::warn!("Emby {command} command failed: {error}");
-            }
-        });
-        true
+        self.controls.enqueue(MediaControlCommand::Emby {
+            control,
+            command,
+            query,
+        })
     }
 
-    fn send_cider_command(&self, endpoint: &str) -> bool {
+    fn send_cider_command(&self, endpoint: &'static str) -> bool {
         let token = self.cider_token.lock().unwrap().clone();
-        self.cider.command(endpoint, token.as_deref())
+        self.controls
+            .enqueue(MediaControlCommand::CiderCommand { endpoint, token })
     }
 
     fn cider_play_pause(&self) {
-        // State is already toggled by play_pause() caller
-        // Just send command in background to avoid blocking
-        self.send_cider_command_async("playpause");
-    }
-
-    fn send_cider_command_async(&self, endpoint: &str) {
-        let token = self.cider_token.lock().unwrap().clone();
-        self.cider.command_async(endpoint, token);
+        self.send_cider_command("playpause");
     }
 
     fn cider_next(&self) {
@@ -1830,8 +2062,10 @@ impl MediaMonitor {
 
     fn cider_seek(&self, position_seconds: f64) -> bool {
         let token = self.cider_token.lock().unwrap().clone();
-        self.cider
-            .seek(position_seconds.max(0.0) as u64, token.as_deref())
+        self.controls.enqueue(MediaControlCommand::CiderSeek {
+            position_seconds: position_seconds.max(0.0) as u64,
+            token,
+        })
     }
 
     // ========================================================================
@@ -1840,30 +2074,41 @@ impl MediaMonitor {
 
     fn mpris_play_pause(&self, bus_name: &str) {
         log::info!("Sending PlayPause to MPRIS player: {}", bus_name);
-        if !self.mpris.play_pause(bus_name) {
-            log::warn!("Native MPRIS PlayPause failed for {bus_name}");
-        }
+        self.controls.enqueue(MediaControlCommand::Mpris {
+            bus_name: bus_name.to_string(),
+            action: MprisControlAction::PlayPause,
+        });
     }
 
     fn mpris_next(&self, bus_name: &str) {
-        self.mpris.next(bus_name);
+        self.controls.enqueue(MediaControlCommand::Mpris {
+            bus_name: bus_name.to_string(),
+            action: MprisControlAction::Next,
+        });
     }
 
     fn mpris_previous(&self, bus_name: &str) {
-        self.mpris.previous(bus_name);
+        self.controls.enqueue(MediaControlCommand::Mpris {
+            bus_name: bus_name.to_string(),
+            action: MprisControlAction::Previous,
+        });
     }
 
     fn mpris_seek(&self, bus_name: &str, position_us: u64) -> bool {
-        self.mpris.seek(bus_name, position_us)
+        self.controls.enqueue(MediaControlCommand::Mpris {
+            bus_name: bus_name.to_string(),
+            action: MprisControlAction::Seek(position_us),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AlbumArt, ArtworkCache, ArtworkRequest, HashMap, Instant, MediaInfo, MediaMonitor,
-        MultiPlayerState, PlaybackStatus, PlayerId, PositionTracker, TrackArtwork, TrackSignature,
-        merge_mpris_proxy_timeline, preferred_player_id, update_tracked_position,
+        AlbumArt, ArtworkCache, ArtworkRequest, EmbyCredentialDiscovery, HashMap, Instant,
+        MediaInfo, MediaMonitor, MultiPlayerState, PlaybackStatus, PlayerId, PositionTracker,
+        TrackArtwork, TrackSignature, merge_mpris_proxy_timeline, preferred_player_id,
+        update_tracked_position,
     };
     use std::time::Duration;
 
@@ -1912,12 +2157,46 @@ mod tests {
         AlbumArt {
             source_width,
             source_height,
-            iced_handle: cosmic::iced::widget::image::Handle::from_rgba(
-                1,
-                1,
-                vec![0, 0, 0, 255],
-            ),
+            iced_handle: cosmic::iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+            encoded_bytes: 4,
         }
+    }
+
+    fn weighted_artwork(source_width: u32, source_height: u32, encoded_bytes: usize) -> AlbumArt {
+        AlbumArt {
+            encoded_bytes,
+            ..artwork(source_width, source_height)
+        }
+    }
+
+    #[test]
+    fn artwork_cache_evicts_the_least_recently_used_entry() {
+        let mut cache = ArtworkCache::with_limits(2, 100, 10_000);
+        cache.insert("first".to_string(), weighted_artwork(10, 10, 4));
+        cache.insert("second".to_string(), weighted_artwork(10, 10, 4));
+        assert!(cache.get("first").is_some());
+
+        cache.insert("third".to_string(), weighted_artwork(10, 10, 4));
+
+        assert!(cache.get("first").is_some());
+        assert!(cache.get("second").is_none());
+        assert!(cache.get("third").is_some());
+    }
+
+    #[test]
+    fn artwork_cache_enforces_encoded_byte_and_pixel_budgets() {
+        let mut cache = ArtworkCache::with_limits(4, 7, 150);
+        cache.insert("first".to_string(), weighted_artwork(10, 10, 4));
+        cache.insert("second".to_string(), weighted_artwork(10, 10, 4));
+
+        assert!(cache.get("first").is_none());
+        assert!(cache.get("second").is_some());
+        assert_eq!(cache.encoded_bytes, 4);
+        assert_eq!(cache.source_pixels, 100);
+
+        cache.insert("oversized".to_string(), weighted_artwork(20, 20, 4));
+        assert!(cache.get("oversized").is_none());
+        assert!(cache.get("second").is_some());
     }
 
     #[test]
@@ -1943,20 +2222,11 @@ mod tests {
     #[test]
     fn completed_artwork_is_cached_but_only_applied_to_its_original_track() {
         let player_id = PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".to_string());
-        let old_track = TrackSignature::from(&media(
-            PlaybackStatus::Playing,
-            0,
-            "Previous video",
-        ));
-        let current_track = TrackSignature::from(&media(
-            PlaybackStatus::Playing,
-            0,
-            "Current video",
-        ));
-        let mut selections = HashMap::from([(
-            player_id.clone(),
-            TrackArtwork::new(current_track.clone()),
-        )]);
+        let old_track = TrackSignature::from(&media(PlaybackStatus::Playing, 0, "Previous video"));
+        let current_track =
+            TrackSignature::from(&media(PlaybackStatus::Playing, 0, "Current video"));
+        let mut selections =
+            HashMap::from([(player_id.clone(), TrackArtwork::new(current_track.clone()))]);
         let mut cache = ArtworkCache::new(4);
 
         MediaMonitor::accept_completed_artwork(
@@ -2218,6 +2488,31 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_emby_leveldb_files_are_not_rescanned() {
+        let directory = std::env::temp_dir().join(format!(
+            "cosmic-widget-emby-discovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let leveldb = directory.join("000001.log");
+        std::fs::write(
+            &leveldb,
+            br#"{"Servers":[{"LocalAddress":"http://nas:8096","RemoteAddress":null,"ManualAddress":null,"UserId":"user-1","Users":[{"UserId":"user-1","AccessToken":"token"}],"DateLastAccessed":30}]}"#,
+        )
+        .unwrap();
+        let mut discovery = EmbyCredentialDiscovery::default();
+
+        let first = discovery.refresh_from(&directory).unwrap();
+        let second = discovery.refresh_from(&directory).unwrap();
+
+        assert_eq!(first.access_token, "token");
+        assert_eq!(second.access_token, "token");
+        assert_eq!(discovery.scan_count, 1);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     #[ignore = "requires an Emby Theater profile with a saved server"]
     fn discovers_live_emby_credentials() {
         let credentials = MediaMonitor::discover_emby_credentials()
@@ -2295,9 +2590,11 @@ mod tests {
         .expect("inactive session sentinel values should deserialize");
 
         assert_eq!(session.playlist_index, Some(-1));
-        assert!(session
-            .play_state
-            .is_some_and(|state| state.position_ticks.is_none()));
+        assert!(
+            session
+                .play_state
+                .is_some_and(|state| state.position_ticks.is_none())
+        );
     }
 
     #[test]

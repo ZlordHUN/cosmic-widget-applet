@@ -37,6 +37,7 @@ pub fn widget_view<'a>(
     expanded_notification_group: Option<&'a str>,
     expanded_notification: Option<&'a super::NotificationKey>,
     notification_group_progress: f32,
+    notification_group_expanded: bool,
     notification_progress: f32,
     dismissing_notifications: &'a [super::DismissingNotification],
     notification_scroll_translation: f32,
@@ -91,6 +92,7 @@ pub fn widget_view<'a>(
                 expanded_notification_group,
                 expanded_notification,
                 notification_group_progress,
+                notification_group_expanded,
                 notification_progress,
                 dismissing_notifications,
                 notification_scroll_translation,
@@ -300,6 +302,7 @@ fn notifications_view<'a>(
     expanded_notification_group: Option<&'a str>,
     expanded_notification: Option<&'a super::NotificationKey>,
     notification_group_progress: f32,
+    notification_group_expanded: bool,
     notification_progress: f32,
     dismissing_notifications: &'a [super::DismissingNotification],
     notification_scroll_translation: f32,
@@ -367,7 +370,7 @@ fn notifications_view<'a>(
             list = list.push(notification_list_entry(
                 notification_group_item(
                     &group,
-                    group_mounted && notification_group_progress >= 0.5,
+                    group_mounted && notification_group_expanded,
                     item_spacing,
                 ),
                 super::NOTIFICATION_ITEM_HEIGHT as f32,
@@ -376,6 +379,8 @@ fn notifications_view<'a>(
             ));
             has_entries = true;
             if group_mounted {
+                let mut group_items = widget::column::with_capacity(group.notifications.len());
+                let mut group_height = 0.0;
                 for notification in group.notifications {
                     let expanded = expanded_notification
                         .is_some_and(|selected| selected.matches(notification));
@@ -389,9 +394,9 @@ fn notifications_view<'a>(
                     } else {
                         0.0
                     };
-                    let item_height = (super::NOTIFICATION_ITEM_HEIGHT as f32 + extra_height)
-                        * notification_group_progress.clamp(0.0, 1.0);
-                    list = list.push(notification_list_entry(
+                    let item_height = super::NOTIFICATION_ITEM_HEIGHT as f32 + extra_height;
+                    group_height += item_height;
+                    group_items = group_items.push(notification_list_entry(
                         notification_item(
                             notification,
                             expanded,
@@ -400,11 +405,18 @@ fn notifications_view<'a>(
                             item_spacing,
                         ),
                         item_height,
-                        has_entries,
+                        true,
                         dismissal_progress,
                     ));
-                    has_entries = true;
                 }
+                list = list.push(
+                    widget::container(group_items)
+                        .width(Length::Fill)
+                        .height(Length::Fixed(
+                            group_height * notification_group_progress.clamp(0.0, 1.0),
+                        ))
+                        .clip(true),
+                );
             }
         }
 

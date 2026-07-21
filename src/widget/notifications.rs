@@ -50,8 +50,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_DIRECTORY: &str = "cosmic-widget-applet";
 const CACHE_FILENAME: &str = "notifications.json";
@@ -59,7 +60,8 @@ const COSMIC_NOTIFICATION_HISTORY_LIMIT: usize = 200;
 const NOTIFICATIONS_SERVICE: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
-const COSMIC_HISTORY_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+const COSMIC_HISTORY_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+const COSMIC_HISTORY_EVENT_DEBOUNCE: Duration = Duration::from_secs(1);
 const NOTIFICATION_MONITOR_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 // ============================================================================
@@ -94,6 +96,11 @@ struct NotificationCache {
     notifications: Vec<Notification>,
 }
 
+enum NotificationDbusCommand {
+    RefreshHistory,
+    Close(Vec<(u32, String)>),
+}
+
 // ============================================================================
 // Notification Monitor Struct
 // ============================================================================
@@ -106,14 +113,15 @@ struct NotificationCache {
 ///
 /// # Threading Model
 ///
-/// - Background thread: Decodes monitored D-Bus messages and updates the list
+/// - Monitor thread: Decodes monitored D-Bus messages and updates the list
+/// - Command thread: Reuses one connection for dismissals and history reconciliation
 /// - Main thread: Reads notification list for rendering
 /// - Shared state: `notifications` Vec protected by Mutex
 ///
 /// # Resource Usage
 ///
-/// - Spawns one persistent background thread
-/// - Maintains one native session-bus monitor connection
+/// - Spawns two persistent background threads
+/// - Maintains one monitor connection and one ordinary session-bus connection
 #[derive(Clone)]
 pub struct NotificationMonitor {
     /// Shared notification list, newest first
@@ -121,6 +129,7 @@ pub struct NotificationMonitor {
     cache_path: Arc<PathBuf>,
     session_key: Arc<String>,
     locally_dismissed: Arc<Mutex<HashSet<(u32, String)>>>,
+    dbus_commands: Sender<NotificationDbusCommand>,
 }
 
 impl NotificationMonitor {
@@ -171,6 +180,7 @@ impl NotificationMonitor {
         }
         let notifications = Arc::new(Mutex::new(cached));
         let locally_dismissed = Arc::new(Mutex::new(HashSet::new()));
+        let (dbus_commands, dbus_command_receiver) = std::sync::mpsc::channel();
 
         // Spawn background thread to monitor D-Bus
         // This runs for the lifetime of the application
@@ -178,6 +188,7 @@ impl NotificationMonitor {
         let cache_path_clone = Arc::clone(&cache_path);
         let session_key_clone = Arc::clone(&session_key);
         let max_count = retention_limit;
+        let dbus_commands_clone = dbus_commands.clone();
 
         std::thread::spawn(move || {
             Self::monitor_notifications(
@@ -185,6 +196,7 @@ impl NotificationMonitor {
                 max_count,
                 &cache_path_clone,
                 &session_key_clone,
+                dbus_commands_clone,
             );
         });
 
@@ -193,12 +205,13 @@ impl NotificationMonitor {
         let session_key_clone = Arc::clone(&session_key);
         let locally_dismissed_clone = Arc::clone(&locally_dismissed);
         std::thread::spawn(move || {
-            Self::synchronize_cosmic_history(
+            Self::run_dbus_worker(
                 notifications_clone,
                 locally_dismissed_clone,
                 &cache_path_clone,
                 &session_key_clone,
                 cosmic_history_connection,
+                dbus_command_receiver,
             );
         });
 
@@ -207,34 +220,60 @@ impl NotificationMonitor {
             cache_path,
             session_key,
             locally_dismissed,
+            dbus_commands,
         }
     }
 
-    fn synchronize_cosmic_history(
+    fn run_dbus_worker(
         notifications: Arc<Mutex<Vec<Notification>>>,
         locally_dismissed: Arc<Mutex<HashSet<(u32, String)>>>,
         cache_path: &Path,
         session_key: &str,
         mut connection: Option<zbus::blocking::Connection>,
+        commands: Receiver<NotificationDbusCommand>,
     ) {
+        let mut refresh_due = None;
+        let mut next_reconciliation = Instant::now() + COSMIC_HISTORY_RECONCILE_INTERVAL;
+        let mut history_supported = true;
+
         loop {
-            std::thread::sleep(COSMIC_HISTORY_SYNC_INTERVAL);
-            if connection.is_none() {
-                connection = match zbus::blocking::Connection::session() {
-                    Ok(connection) => Some(connection),
-                    Err(error) => {
-                        log::debug!("Failed to reconnect COSMIC notification history: {error}");
-                        continue;
-                    }
-                };
+            let deadline = refresh_due.map_or(next_reconciliation, |due: Instant| {
+                due.min(next_reconciliation)
+            });
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            match commands.recv_timeout(timeout) {
+                Ok(command) => {
+                    Self::handle_dbus_command(command, &mut connection, &mut refresh_due)
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            while let Ok(command) = commands.try_recv() {
+                Self::handle_dbus_command(command, &mut connection, &mut refresh_due);
             }
 
-            let Some(history_connection) = connection.as_ref() else {
+            let now = Instant::now();
+            let event_refresh_due = refresh_due.is_some_and(|due| now >= due);
+            if !event_refresh_due && now < next_reconciliation {
                 continue;
-            };
+            }
+            refresh_due = None;
+            next_reconciliation = now + COSMIC_HISTORY_RECONCILE_INTERVAL;
+
+            if !history_supported {
+                continue;
+            }
+
+            if !ensure_notification_connection(&mut connection) {
+                continue;
+            }
+            let history_connection = connection.as_ref().expect("connection was ensured");
             let mut history = match load_cosmic_notification_history(history_connection) {
                 Ok(Some(history)) => history,
-                Ok(None) => return,
+                Ok(None) => {
+                    history_supported = false;
+                    continue;
+                }
                 Err(error) => {
                     log::debug!("Failed to synchronize COSMIC notification history: {error}");
                     if matches!(error, zbus::Error::InputOutput(_)) {
@@ -265,6 +304,7 @@ impl NotificationMonitor {
         max_count: usize,
         cache_path: &Path,
         session_key: &str,
+        dbus_commands: Sender<NotificationDbusCommand>,
     ) {
         loop {
             if let Err(error) = Self::monitor_notification_connection(
@@ -272,6 +312,7 @@ impl NotificationMonitor {
                 max_count,
                 cache_path,
                 session_key,
+                &dbus_commands,
             ) {
                 log::warn!("Native notification monitor disconnected: {error}");
             }
@@ -284,6 +325,7 @@ impl NotificationMonitor {
         max_count: usize,
         cache_path: &Path,
         session_key: &str,
+        dbus_commands: &Sender<NotificationDbusCommand>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use zbus::blocking::MessageIterator;
 
@@ -323,11 +365,10 @@ impl NotificationMonitor {
                         log::info!("COSMIC closed notification {id}");
                     }
                 }
-                if let Err(error) =
-                    persist_cached_notifications(cache_path, session_key, &notifs)
-                {
+                if let Err(error) = persist_cached_notifications(cache_path, session_key, &notifs) {
                     log::warn!("Failed to persist notification update: {error}");
                 }
+                let _ = dbus_commands.send(NotificationDbusCommand::RefreshHistory);
             }
         }
 
@@ -350,7 +391,7 @@ impl NotificationMonitor {
         let mut notifs = self.notifications.lock().unwrap();
         let remote = remote_notification_ids(&notifs);
         self.suppress_remote_notifications(&remote);
-        close_remote_notifications(remote);
+        self.close_remote_notifications(remote);
         notifs.clear();
         self.persist(&notifs);
         log::info!("Cleared all notifications");
@@ -371,7 +412,7 @@ impl NotificationMonitor {
                 .collect::<Vec<_>>(),
         );
         self.suppress_remote_notifications(&remote);
-        close_remote_notifications(remote);
+        self.close_remote_notifications(remote);
         notifs.retain(|n| n.app_name != app_name);
         self.persist(&notifs);
         log::info!("Cleared notifications for app: {}", app_name);
@@ -396,7 +437,7 @@ impl NotificationMonitor {
             .into_iter()
             .collect();
         self.suppress_remote_notifications(&remote);
-        close_remote_notifications(remote);
+        self.close_remote_notifications(remote);
         notifs.retain(|n| !(n.app_name == app_name && n.timestamp == timestamp));
         self.persist(&notifs);
         log::info!("Removed notification: {} at {}", app_name, timestamp);
@@ -416,11 +457,35 @@ impl NotificationMonitor {
             .unwrap()
             .extend(notifications.iter().cloned());
     }
+
+    fn close_remote_notifications(&self, notifications: Vec<(u32, String)>) {
+        if !notifications.is_empty()
+            && self
+                .dbus_commands
+                .send(NotificationDbusCommand::Close(notifications))
+                .is_err()
+        {
+            log::warn!("Notification D-Bus worker is unavailable");
+        }
+    }
+
+    fn handle_dbus_command(
+        command: NotificationDbusCommand,
+        connection: &mut Option<zbus::blocking::Connection>,
+        refresh_due: &mut Option<Instant>,
+    ) {
+        match command {
+            NotificationDbusCommand::RefreshHistory => {}
+            NotificationDbusCommand::Close(notifications) => {
+                close_remote_notifications(connection, &notifications);
+            }
+        }
+        *refresh_due = Some(Instant::now() + COSMIC_HISTORY_EVENT_DEBOUNCE);
+    }
 }
 
 fn open_notification_monitor_connection()
-    -> Result<zbus::blocking::Connection, Box<dyn std::error::Error>>
-{
+-> Result<zbus::blocking::Connection, Box<dyn std::error::Error>> {
     use zbus::MatchRule;
     use zbus::blocking::Connection;
     use zbus::message::Type as MessageType;
@@ -517,9 +582,7 @@ impl NotificationMessageParser {
             }
             MessageType::MethodReturn => {
                 let Some(key) = header.destination().zip(header.reply_serial()).map(
-                    |(destination, reply_serial)| {
-                        (destination.to_string(), reply_serial.get())
-                    },
+                    |(destination, reply_serial)| (destination.to_string(), reply_serial.get()),
                 ) else {
                     return Ok(None);
                 };
@@ -538,9 +601,7 @@ impl NotificationMessageParser {
             }
             MessageType::Error => {
                 if let Some(key) = header.destination().zip(header.reply_serial()).map(
-                    |(destination, reply_serial)| {
-                        (destination.to_string(), reply_serial.get())
-                    },
+                    |(destination, reply_serial)| (destination.to_string(), reply_serial.get()),
                 ) {
                     self.pending.remove(&key);
                 }
@@ -615,38 +676,61 @@ fn apply_local_dismissal_suppression(
         .collect::<HashSet<_>>();
     locally_dismissed.retain(|id| history_ids.contains(id));
     history.retain(|notification| {
-        remote_notification_id(notification)
-            .is_none_or(|id| !locally_dismissed.contains(&id))
+        remote_notification_id(notification).is_none_or(|id| !locally_dismissed.contains(&id))
     });
 }
 
-fn close_remote_notifications(notifications: Vec<(u32, String)>) {
-    if notifications.is_empty() {
-        return;
+fn ensure_notification_connection(connection: &mut Option<zbus::blocking::Connection>) -> bool {
+    if connection.is_none() {
+        *connection = match zbus::blocking::Connection::session() {
+            Ok(connection) => Some(connection),
+            Err(error) => {
+                log::debug!("Failed to reconnect notification D-Bus worker: {error}");
+                None
+            }
+        };
     }
-    std::thread::spawn(move || {
-        if let Err(error) = close_remote_notifications_inner(&notifications) {
-            log::warn!("Failed to close COSMIC notification: {error}");
+    connection.is_some()
+}
+
+fn close_remote_notifications(
+    connection: &mut Option<zbus::blocking::Connection>,
+    notifications: &[(u32, String)],
+) {
+    for attempt in 0..2 {
+        if !ensure_notification_connection(connection) {
+            return;
         }
-    });
+        let active_connection = connection.as_ref().expect("connection was ensured");
+        match close_remote_notifications_inner(active_connection, notifications) {
+            Ok(()) => return,
+            Err(error) if matches!(error, zbus::Error::InputOutput(_)) && attempt == 0 => {
+                *connection = None;
+            }
+            Err(error) => {
+                log::warn!("Failed to close COSMIC notification: {error}");
+                return;
+            }
+        }
+    }
 }
 
 fn close_remote_notifications_inner(
+    connection: &zbus::blocking::Connection,
     notifications: &[(u32, String)],
-) -> Result<(), Box<dyn std::error::Error>> {
-    use zbus::blocking::{Connection, Proxy};
+) -> zbus::Result<()> {
+    use zbus::blocking::Proxy;
     use zbus::names::OwnedUniqueName;
 
-    let connection = Connection::session()?;
     let bus = Proxy::new(
-        &connection,
+        connection,
         "org.freedesktop.DBus",
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
     )?;
     let current_owner: OwnedUniqueName = bus.call("GetNameOwner", &NOTIFICATIONS_SERVICE)?;
     let notifications_proxy = Proxy::new(
-        &connection,
+        connection,
         NOTIFICATIONS_SERVICE,
         NOTIFICATIONS_PATH,
         NOTIFICATIONS_INTERFACE,
@@ -785,15 +869,15 @@ fn persist_cached_notifications(
 mod tests {
     use super::{
         NOTIFICATIONS_INTERFACE, NOTIFICATIONS_PATH, NOTIFICATIONS_SERVICE, Notification,
-        NotificationBusEvent, NotificationMessageParser,
-        apply_local_dismissal_suppression, load_cached_notifications,
-        open_notification_monitor_connection, persist_cached_notifications, upsert_notification,
+        NotificationBusEvent, NotificationMessageParser, apply_local_dismissal_suppression,
+        load_cached_notifications, open_notification_monitor_connection,
+        persist_cached_notifications, upsert_notification,
     };
     use std::collections::{HashMap, HashSet};
     use std::sync::mpsc;
     use std::time::Duration;
-    use zbus::blocking::{Connection, MessageIterator, Proxy};
     use zbus::Message;
+    use zbus::blocking::{Connection, MessageIterator, Proxy};
     use zbus::zvariant::OwnedValue;
 
     fn cache_path(name: &str) -> std::path::PathBuf {
@@ -1017,10 +1101,7 @@ mod tests {
 
     #[test]
     fn suppresses_local_dismissals_until_cosmic_removes_them() {
-        let mut dismissed = HashSet::from([
-            (15, ":1.82".to_string()),
-            (99, ":1.12".to_string()),
-        ]);
+        let mut dismissed = HashSet::from([(15, ":1.82".to_string()), (99, ":1.12".to_string())]);
         let mut first = notification("Dismissed locally", 20);
         first.id = Some(15);
         first.server_owner = Some(":1.82".to_string());

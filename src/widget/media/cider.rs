@@ -53,16 +53,6 @@ impl Client {
             .is_ok()
     }
 
-    pub(super) fn command_async(&self, endpoint: &str, token: Option<String>) {
-        let client = self.clone();
-        let endpoint = endpoint.to_string();
-        std::thread::spawn(move || {
-            if !client.command(&endpoint, token.as_deref()) {
-                log::debug!("Cider {endpoint} command failed");
-            }
-        });
-    }
-
     pub(super) fn seek(&self, position_seconds: u64, token: Option<&str>) -> bool {
         self.authenticated(self.http.post(Self::url("seek")), token)
             .timeout(REQUEST_TIMEOUT)

@@ -43,6 +43,7 @@ const MAX_VISIBLE_NOTIFICATION_ROWS: u32 = 4;
 const NOTIFICATION_LINE_HEIGHT: u32 = 17;
 const NOTIFICATION_CHARS_PER_LINE: usize = 32;
 const NOTIFICATION_EXPANSION_DURATION: Duration = Duration::from_millis(220);
+const NOTIFICATION_GROUP_EXPANSION_DURATION: Duration = Duration::from_millis(320);
 const EMPTY_MEDIA_HEIGHT: u32 = 83;
 const MEDIA_SECTION_HEIGHT: u32 = 248;
 const MEDIA_CONTROL_GRACE: Duration = Duration::from_secs(2);
@@ -88,6 +89,9 @@ struct ExpansionAnimation {
     start: f32,
     target: f32,
     started_at: Option<Instant>,
+    duration: Duration,
+    active_duration: Duration,
+    linear: bool,
 }
 
 impl Default for ExpansionAnimation {
@@ -97,16 +101,33 @@ impl Default for ExpansionAnimation {
             start: 0.0,
             target: 0.0,
             started_at: None,
+            duration: NOTIFICATION_EXPANSION_DURATION,
+            active_duration: NOTIFICATION_EXPANSION_DURATION,
+            linear: false,
         }
     }
 }
 
 impl ExpansionAnimation {
+    fn with_duration(duration: Duration) -> Self {
+        Self {
+            duration,
+            active_duration: duration,
+            linear: true,
+            ..Self::default()
+        }
+    }
+
     fn transition_to(&mut self, target: f32, now: Instant) {
         self.advance(now);
         self.start = self.progress;
         self.target = target.clamp(0.0, 1.0);
-        self.started_at = if (self.start - self.target).abs() > f32::EPSILON {
+        let distance = (self.start - self.target).abs();
+        self.started_at = if distance > f32::EPSILON {
+            self.active_duration = self
+                .duration
+                .mul_f32(distance)
+                .max(Duration::from_millis(48));
             Some(now)
         } else {
             None
@@ -120,9 +141,13 @@ impl ExpansionAnimation {
         let linear = now
             .saturating_duration_since(started_at)
             .as_secs_f32()
-            / NOTIFICATION_EXPANSION_DURATION.as_secs_f32();
+            / self.active_duration.as_secs_f32();
         let t = linear.clamp(0.0, 1.0);
-        let eased = t * t * (3.0 - 2.0 * t);
+        let eased = if self.linear {
+            t
+        } else {
+            t * t * (3.0 - 2.0 * t)
+        };
         self.progress = self.start + (self.target - self.start) * eased;
 
         if linear >= 1.0 {
@@ -134,7 +159,14 @@ impl ExpansionAnimation {
     }
 
     fn reset(&mut self) {
-        *self = Self::default();
+        let duration = self.duration;
+        let linear = self.linear;
+        *self = Self {
+            duration,
+            active_duration: duration,
+            linear,
+            ..Self::default()
+        };
     }
 
     fn is_animating(&self) -> bool {
@@ -165,6 +197,14 @@ impl ScrollAnimation {
             self.visual_offset = self.target;
             None
         };
+    }
+
+    fn snap_to(&mut self, offset: f32) {
+        let offset = offset.max(0.0);
+        self.visual_offset = offset;
+        self.start = offset;
+        self.target = offset;
+        self.started_at = None;
     }
 
     fn advance(&mut self, now: Instant) -> bool {
@@ -314,7 +354,9 @@ impl App {
                 corners: None,
                 expanded_notification_group: None,
                 expanded_notification: None,
-                notification_group_expansion: ExpansionAnimation::default(),
+                notification_group_expansion: ExpansionAnimation::with_duration(
+                    NOTIFICATION_GROUP_EXPANSION_DURATION,
+                ),
                 notification_expansion: ExpansionAnimation::default(),
                 dismissing_notifications: Vec::new(),
                 notification_scroll: ScrollAnimation::default(),
@@ -526,6 +568,8 @@ impl App {
             }
             Message::ToggleNotificationGroup { source } => {
                 let now = Instant::now();
+                let current_scroll_offset = self.notification_scroll.target;
+                self.notification_scroll.snap_to(current_scroll_offset);
                 if self.expanded_notification_group.as_deref() == Some(&source) {
                     let target = if self.notification_group_expansion.target > 0.0 {
                         0.0
@@ -607,8 +651,12 @@ impl App {
                 });
             }
             Message::NotificationScrolled(offset) => {
-                self.notification_scroll
-                    .transition_to(offset, Instant::now());
+                if self.notification_group_expansion.is_animating() {
+                    self.notification_scroll.snap_to(offset);
+                } else {
+                    self.notification_scroll
+                        .transition_to(offset, Instant::now());
+                }
             }
             Message::PreviousMedia => {
                 self.media_seek_preview = None;
@@ -678,6 +726,7 @@ impl App {
             self.expanded_notification_group.as_deref(),
             self.expanded_notification.as_ref(),
             self.notification_group_expansion.progress,
+            self.notification_group_expansion.target > 0.0,
             self.notification_expansion.progress,
             &self.dismissing_notifications,
             self.notification_scroll.translation(),
@@ -694,7 +743,7 @@ impl App {
         if self.animations_active() {
             Subscription::batch([
                 stats,
-                iced::time::every(Duration::from_millis(16)).map(|_| Message::AnimationTick),
+                iced::window::frames().map(|_| Message::AnimationTick),
             ])
         } else {
             stats
@@ -1260,6 +1309,44 @@ mod tests {
     }
 
     #[test]
+    fn notification_group_expansion_uses_a_slower_stable_transition() {
+        let started = Instant::now();
+        let mut animation = ExpansionAnimation::with_duration(
+            super::NOTIFICATION_GROUP_EXPANSION_DURATION,
+        );
+
+        animation.transition_to(1.0, started);
+        animation.advance(started + NOTIFICATION_EXPANSION_DURATION);
+        assert!(animation.progress < 1.0);
+        assert!(animation.is_animating());
+
+        animation.advance(started + super::NOTIFICATION_GROUP_EXPANSION_DURATION);
+        assert_eq!(animation.progress, 1.0);
+        assert!(!animation.is_animating());
+    }
+
+    #[test]
+    fn notification_group_expansion_reverses_from_its_current_progress() {
+        let started = Instant::now();
+        let duration = super::NOTIFICATION_GROUP_EXPANSION_DURATION;
+        let mut animation = ExpansionAnimation::with_duration(duration);
+
+        animation.transition_to(1.0, started);
+        animation.advance(started + duration / 2);
+        assert!((animation.progress - 0.5).abs() < 0.01);
+
+        let reversed_at = started + duration / 2;
+        animation.transition_to(0.0, reversed_at);
+        animation.advance(reversed_at + Duration::from_millis(16));
+        assert!(animation.progress <= 0.46);
+
+        animation.advance(reversed_at + duration / 2);
+
+        assert_eq!(animation.progress, 0.0);
+        assert!(animation.is_collapsed());
+    }
+
+    #[test]
     fn notification_group_viewport_grows_with_animation_progress() {
         let mut snapshot = super::SystemSnapshot::default();
         snapshot.notifications = vec![notification(), notification(), notification()];
@@ -1302,6 +1389,18 @@ mod tests {
         assert!((animation.translation() - 30.0).abs() < 0.5);
 
         animation.advance(started + NOTIFICATION_EXPANSION_DURATION);
+        assert_eq!(animation.translation(), 0.0);
+        assert!(!animation.is_animating());
+    }
+
+    #[test]
+    fn notification_scroll_can_snap_during_group_layout_changes() {
+        let started = Instant::now();
+        let mut animation = ScrollAnimation::default();
+        animation.transition_to(60.0, started);
+
+        animation.snap_to(24.0);
+
         assert_eq!(animation.translation(), 0.0);
         assert!(!animation.is_animating());
     }
