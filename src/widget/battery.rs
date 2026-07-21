@@ -3,13 +3,14 @@
 //! # Battery Monitoring Module (External Devices)
 //!
 //! This module monitors battery levels for external peripherals like wireless mice,
-//! keyboards, and headsets. The Audeze Maxwell and supported Logitech devices
-//! use native Linux interfaces; other proprietary devices use established CLI
-//! backends.
+//! keyboards, headsets, and controllers. The Audeze Maxwell, Razer Wolverine,
+//! and supported Logitech devices use native Linux interfaces; other
+//! proprietary devices use established CLI backends.
 //!
 //! ## Supported Tools
 //!
-//! - **Native HID**: Audeze Maxwell and Logitech Bolt battery/charging state
+//! - **Native HID**: Audeze Maxwell, Razer Wolverine, and Logitech Bolt
+//!   battery/charging state
 //! - **Linux power_supply**: Logitech devices exposed by the kernel HID++ driver
 //! - **Solaar**: Fallback for unsupported Logitech receivers and devices
 //! - **HeadsetControl**: Remaining supported gaming headsets
@@ -56,9 +57,13 @@ use std::time::{Duration, Instant};
 mod audeze_maxwell;
 #[path = "battery/logitech.rs"]
 mod logitech;
+#[path = "battery/razer_wolverine.rs"]
+mod razer_wolverine;
 
 const MAXWELL_DEVICE_NAME: &str = "Audeze Maxwell";
+const WOLVERINE_DEVICE_NAME: &str = "Razer Wolverine V3 Pro 8K";
 const MAXWELL_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(2);
+const WOLVERINE_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,7 +84,7 @@ const EXTERNAL_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// - `name`: Device product name (e.g., "G309 LIGHTSPEED", "Arctis Nova 7")
 /// - `level`: Battery percentage 0-100, None if unavailable
 /// - `status`: Text status like "discharging", "charging", "good"
-/// - `kind`: Device type - "mouse", "keyboard", "headset"
+/// - `kind`: Device type - "mouse", "keyboard", "headset", "controller"
 /// - `codename`: Short device codename for deduplication (e.g., "MX MCHNCL M")
 /// - `is_loading`: True while waiting for first real data (showing cached)
 /// - `is_connected`: False if device is paired but powered off/out of range
@@ -133,8 +138,9 @@ impl ExternalProbePlan {
 
 /// Monitors battery levels for external peripherals.
 ///
-/// Native readers handle supported Audeze and Logitech devices. Solaar and
-/// HeadsetControl are retained for discovery and unsupported-device fallbacks.
+/// Native readers handle supported Audeze, Razer, and Logitech devices. Solaar
+/// and HeadsetControl are retained for discovery and unsupported-device
+/// fallbacks.
 ///
 /// # Threading Model
 ///
@@ -212,6 +218,7 @@ impl BatteryMonitor {
             let mut is_first_update = true;
             let mut native_maxwell_authoritative = false;
             let mut native_maxwell = None;
+            let mut native_wolverine = None;
             let mut logitech_monitor = logitech::Monitor::new();
             let mut native_logitech = query_native_logitech(&mut logitech_monitor);
 
@@ -240,6 +247,22 @@ impl BatteryMonitor {
                 }
             }
 
+            match query_native_wolverine(false) {
+                Ok(state) => {
+                    if state.is_some() {
+                        log::info!("Using native HID monitoring for Razer Wolverine V3 Pro 8K");
+                    }
+                    native_wolverine = state;
+                    merge_native_wolverine(
+                        &mut devices_clone.lock().unwrap(),
+                        native_wolverine.clone(),
+                    );
+                }
+                Err(error) => {
+                    log::warn!("Native Razer Wolverine query failed: {error}");
+                }
+            }
+
             // Probe both external backends once for devices that are not covered
             // by the native readers. Inactive backends are only rediscovered
             // periodically after this initial pass.
@@ -263,6 +286,7 @@ impl BatteryMonitor {
                 native_maxwell_authoritative,
                 native_maxwell.clone(),
                 &native_logitech,
+                native_wolverine.clone(),
             );
             let mut devices = devices_clone.lock().unwrap();
             preserve_loading_devices(&mut new_devices, &devices);
@@ -299,6 +323,17 @@ impl BatteryMonitor {
                     merge_native_maxwell(
                         &mut devices_clone.lock().unwrap(),
                         native_maxwell.clone(),
+                    );
+                }
+
+                let was_wolverine_connected = native_wolverine
+                    .as_ref()
+                    .is_some_and(|device| device.is_connected);
+                if let Ok(state) = query_native_wolverine(was_wolverine_connected) {
+                    native_wolverine = state;
+                    merge_native_wolverine(
+                        &mut devices_clone.lock().unwrap(),
+                        native_wolverine.clone(),
                     );
                 }
 
@@ -349,6 +384,7 @@ impl BatteryMonitor {
                         native_maxwell_authoritative,
                         native_maxwell.clone(),
                         &native_logitech,
+                        native_wolverine.clone(),
                     );
                     let mut devices = devices_clone.lock().unwrap();
                     preserve_loading_devices(&mut new_devices, &devices);
@@ -438,6 +474,43 @@ fn merge_native_maxwell(devices: &mut Vec<BatteryDevice>, native_maxwell: Option
         replace_device_in_place(devices, device);
     } else {
         devices.retain(|device| !device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME));
+    }
+}
+
+fn query_native_wolverine(was_connected: bool) -> Result<Option<BatteryDevice>, String> {
+    let mut state = razer_wolverine::query()?;
+    let is_connected = state.as_ref().is_some_and(|state| state.connected);
+
+    if was_connected && !is_connected && state.is_some() {
+        std::thread::sleep(WOLVERINE_CONNECTION_SETTLE_DELAY);
+        state = razer_wolverine::query()?;
+    }
+
+    Ok(state.map(|state| BatteryDevice {
+        name: WOLVERINE_DEVICE_NAME.to_string(),
+        level: state.level,
+        status: state.connected.then(|| {
+            if state.charging {
+                "charging".to_string()
+            } else {
+                "discharging".to_string()
+            }
+        }),
+        kind: Some("controller".to_string()),
+        codename: None,
+        is_loading: false,
+        is_connected: state.connected,
+    }))
+}
+
+fn merge_native_wolverine(
+    devices: &mut Vec<BatteryDevice>,
+    native_wolverine: Option<BatteryDevice>,
+) {
+    if let Some(device) = native_wolverine {
+        replace_device_in_place(devices, device);
+    } else {
+        devices.retain(|device| !device.name.eq_ignore_ascii_case(WOLVERINE_DEVICE_NAME));
     }
 }
 
@@ -614,6 +687,7 @@ fn combined_battery_devices(
     native_maxwell_authoritative: bool,
     native_maxwell: Option<BatteryDevice>,
     native_logitech: &[BatteryDevice],
+    native_wolverine: Option<BatteryDevice>,
 ) -> Vec<BatteryDevice> {
     let mut devices = Vec::new();
     for device in external
@@ -627,6 +701,7 @@ fn combined_battery_devices(
         merge_native_maxwell(&mut devices, native_maxwell);
     }
     merge_native_logitech(&mut devices, native_logitech);
+    merge_native_wolverine(&mut devices, native_wolverine);
     devices
 }
 

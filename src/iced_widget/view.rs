@@ -1287,6 +1287,8 @@ fn device_icon(kind: Option<&str>) -> Element<'static, super::Message> {
         "input-keyboard-symbolic"
     } else if kind.contains("headset") || kind.contains("headphone") {
         "audio-headset-symbolic"
+    } else if kind.contains("controller") || kind.contains("gamepad") {
+        "input-gaming-symbolic"
     } else {
         "preferences-input-devices-symbolic"
     };
