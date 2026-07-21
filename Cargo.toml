@@ -38,6 +38,7 @@ env_logger = "0.11"
 dirs = "5.0"
 zbus = "4.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+nvml-wrapper = "0.12.1"
 
 # Wayland layer-shell dependencies for widget
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }

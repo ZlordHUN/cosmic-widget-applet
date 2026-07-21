@@ -11,7 +11,7 @@
 //! ## Monitoring Modules
 //! These modules collect system information:
 //!
-//! - [`utilization`]: CPU, Memory, and GPU usage monitoring via sysinfo/nvidia-smi
+//! - [`utilization`]: CPU, Memory, and GPU usage monitoring via sysinfo/NVML/sysfs
 //! - [`temperature`]: CPU and GPU temperature readings from hwmon sensors
 //! - [`network`]: Network interface bandwidth monitoring
 //! - [`storage`]: Disk space usage for mounted filesystems
@@ -40,6 +40,7 @@
 // === Monitoring Module Declarations ===
 pub mod utilization;
 pub mod temperature;
+mod nvidia;
 pub mod network;
 pub mod weather;
 pub mod storage;

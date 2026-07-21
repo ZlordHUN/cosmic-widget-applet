@@ -2,21 +2,22 @@
 
 //! # Temperature Monitoring Module
 //!
-//! This module monitors CPU and GPU temperatures using the `sysinfo` crate's
-//! hardware sensor interface. It provides real-time temperature readings and
-//! visual gauge rendering.
+//! This module monitors CPU and GPU temperatures through `sysinfo`, Linux
+//! hwmon, and NVML. It provides real-time temperature readings and visual
+//! gauge rendering without spawning external commands.
 //!
 //! ## Data Sources
 //!
-//! Temperature data comes from Linux hwmon subsystem via sysinfo:
+//! Temperature data comes from NVML and the Linux hwmon subsystem via sysinfo:
 //! - **CPU**: Looks for sensors labeled "cpu", "package", "core", "tctl", or "tdie"
-//! - **GPU**: Looks for sensors labeled "gpu", "nvidia", "amd", "radeon", or "edge"
+//! - **NVIDIA GPU**: Queries NVML directly
+//! - **Other GPUs**: Looks for hwmon labels such as "gpu", "amd", "radeon", or "edge"
 //!
 //! ## Sensor Labels by Vendor
 //!
 //! - **Intel CPU**: "coretemp" driver, labels like "Package id 0", "Core 0"
 //! - **AMD CPU**: "k10temp" driver, labels like "Tctl", "Tdie", "Tccd1"
-//! - **NVIDIA GPU**: "nvidia" driver, label "GPU"
+//! - **NVIDIA GPU**: NVIDIA Management Library
 //! - **AMD GPU**: "amdgpu" driver, label "edge"
 //!
 //! ## Visual Representation
@@ -32,7 +33,7 @@ use sysinfo::Components;
 // Temperature Monitor Struct
 // ============================================================================
 
-/// Monitors CPU and GPU temperatures via sysinfo.
+/// Monitors CPU and GPU temperatures via sysinfo/hwmon and NVML.
 ///
 /// Uses the sysinfo crate to query Linux hwmon sensors. The monitor maintains
 /// a list of all hardware components and searches for temperature sensors
@@ -94,12 +95,8 @@ impl TemperatureMonitor {
     ///
     /// # GPU Detection Priority
     ///
-    /// Matches first sensor containing (case-insensitive):
-    /// 1. "gpu" - Generic GPU label
-    /// 2. "nvidia" - NVIDIA GPU
-    /// 3. "amd" - AMD GPU
-    /// 4. "radeon" - AMD Radeon (older naming)
-    /// 5. "edge" - AMD RDNA/Vega edge sensor
+    /// Uses NVML for NVIDIA hardware, then falls back to the first matching
+    /// hwmon sensor for other GPU vendors.
     pub fn update(&mut self) {
         // Refresh all component data from hwmon
         self.components.refresh();
@@ -152,7 +149,14 @@ impl TemperatureMonitor {
             .unwrap_or(0.0);
         
         // ---- GPU Temperature Detection ----
-        // Search through all components for first matching GPU sensor
+        if super::nvidia::hardware_present() {
+            if let Some(temperature) = super::nvidia::temperature() {
+                self.gpu_temp = temperature;
+                return;
+            }
+        }
+
+        // Search through hwmon components when NVML is unavailable.
         self.gpu_temp = 0.0;
         for component in &self.components {
             let label = component.label().to_lowercase();

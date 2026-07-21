@@ -56,6 +56,12 @@ struct State {
     last_frame: Option<cosmic::iced::time::Instant>,
 }
 
+#[derive(Default)]
+struct TemperatureState {
+    progress: State,
+    cache: canvas::Cache<Renderer>,
+}
+
 impl State {
     fn update(&mut self, target: f32, now: cosmic::iced::time::Instant) -> bool {
         let Some(last_frame) = self.last_frame.replace(now) else {
@@ -189,11 +195,11 @@ where
     Message: Clone,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
+        tree::Tag::of::<TemperatureState>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::default())
+        tree::State::new(TemperatureState::default())
     }
 
     fn size(&self) -> Size<Length> {
@@ -220,10 +226,12 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        if let Event::Window(window::Event::RedrawRequested(now)) = event
-            && tree.state.downcast_mut::<State>().update(self.target, *now)
-        {
-            shell.request_redraw();
+        if let Event::Window(window::Event::RedrawRequested(now)) = event {
+            let state = tree.state.downcast_mut::<TemperatureState>();
+            if state.progress.update(self.target, *now) {
+                state.cache.clear();
+                shell.request_redraw();
+            }
         }
     }
 
@@ -240,36 +248,37 @@ where
         use advanced::Renderer as _;
 
         let bounds = layout.bounds();
-        let current = tree.state.downcast_ref::<State>().current;
+        let state = tree.state.downcast_ref::<TemperatureState>();
+        let current = state.progress.current;
         let meter_style = meter_style(theme);
         let track = meter_style.track_color;
-        let active = indicator_color(theme, self.target * 100.0, meter_style.bar_color);
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let radius = (GAUGE_SIZE - TRACK_WIDTH) / 2.0;
+        let active = indicator_color(theme, current * 100.0, meter_style.bar_color);
+        let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
+            let radius = (GAUGE_SIZE - TRACK_WIDTH) / 2.0;
 
-        stroke_arc(
-            &mut frame,
-            radius,
-            START_ANGLE,
-            START_ANGLE + SWEEP_ANGLE,
-            track,
-            canvas::LineCap::Butt,
-        );
-        fill_arc_cap(&mut frame, radius, START_ANGLE + SWEEP_ANGLE, track);
-        if current > SNAP_THRESHOLD {
             stroke_arc(
-                &mut frame,
+                frame,
                 radius,
                 START_ANGLE,
-                START_ANGLE + SWEEP_ANGLE * current,
-                active,
-                canvas::LineCap::Round,
+                START_ANGLE + SWEEP_ANGLE,
+                track,
+                canvas::LineCap::Butt,
             );
-        } else {
-            fill_arc_cap(&mut frame, radius, START_ANGLE, track);
-        }
+            fill_arc_cap(frame, radius, START_ANGLE + SWEEP_ANGLE, track);
+            if current > SNAP_THRESHOLD {
+                stroke_arc(
+                    frame,
+                    radius,
+                    START_ANGLE,
+                    START_ANGLE + SWEEP_ANGLE * current,
+                    active,
+                    canvas::LineCap::Round,
+                );
+            } else {
+                fill_arc_cap(frame, radius, START_ANGLE, track);
+            }
+        });
 
-        let geometry = frame.into_geometry();
         renderer.with_translation(Vector::new(bounds.x, bounds.y), |renderer| {
             use cosmic::iced::advanced::graphics::geometry::Renderer as _;
 

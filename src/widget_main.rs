@@ -30,7 +30,7 @@
 //! ├──────────────────────────────────────────────────────────────────┤
 //! │  Monitor Modules                                                 │
 //! │  ├── UtilizationMonitor  (CPU, Memory, GPU usage)               │
-//! │  ├── TemperatureMonitor  (CPU/GPU temps from hwmon/nvidia-smi)  │
+//! │  ├── TemperatureMonitor  (CPU/GPU temps from hwmon/NVML)        │
 //! │  ├── StorageMonitor      (disk space from mount points)         │
 //! │  ├── BatteryMonitor      (system + Solaar Bluetooth devices)    │
 //! │  ├── WeatherMonitor      (OpenWeatherMap API)                   │

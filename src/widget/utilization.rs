@@ -12,11 +12,9 @@
 //! GPU utilization is monitored in a background thread to avoid blocking the UI.
 //! The detection order is:
 //!
-//! 1. **NVIDIA**: Uses `nvidia-smi` command if available
-//! 2. **AMD**: Reads from `/sys/class/drm/card*/device/gpu_busy_percent` (preferred)
-//!    or falls back to `radeontop`
-//! 3. **Intel**: Calculates from current/max frequency ratio in sysfs,
-//!    or falls back to `intel_gpu_top`
+//! 1. **NVIDIA**: Queries the NVIDIA Management Library through `nvml-wrapper`
+//! 2. **AMD**: Reads `/sys/class/drm/card*/device/gpu_busy_percent`
+//! 3. **Intel**: Reads current and maximum GPU frequencies from sysfs
 //!
 //! # Usage
 //!
@@ -37,7 +35,6 @@
 //! The `get_gpu_usage()` method safely reads the current value.
 
 use sysinfo::System;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -47,11 +44,11 @@ use std::sync::{Arc, Mutex};
 /// Supported GPU vendors for utilization monitoring.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GpuVendor {
-    /// NVIDIA GPU (uses nvidia-smi)
+    /// NVIDIA GPU (uses NVML)
     Nvidia,
-    /// AMD GPU (uses sysfs or radeontop)
+    /// AMD GPU (uses sysfs)
     Amd,
-    /// Intel integrated/discrete GPU (uses sysfs or intel_gpu_top)
+    /// Intel integrated/discrete GPU (uses sysfs)
     Intel,
     /// No supported GPU detected
     None,
@@ -113,7 +110,7 @@ impl UtilizationMonitor {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     
                     let usage = match gpu_vendor {
-                        GpuVendor::Nvidia => Self::fetch_nvidia_gpu_usage(),
+                        GpuVendor::Nvidia => super::nvidia::utilization(),
                         GpuVendor::Amd => Self::fetch_amd_gpu_usage(),
                         GpuVendor::Intel => Self::fetch_intel_gpu_usage(),
                         GpuVendor::None => None,
@@ -173,77 +170,49 @@ impl UtilizationMonitor {
     
     /// Detect which GPU vendor is present on the system.
     ///
-    /// Checks for:
-    /// 1. nvidia-smi binary (NVIDIA)
-    /// 2. radeontop or rocm-smi (AMD)
-    /// 3. intel_gpu_top (Intel)
-    /// 4. sysfs driver detection (fallback)
+    /// Checks NVML first, then detects AMD or Intel DRM devices through sysfs.
     fn detect_gpu_vendor() -> GpuVendor {
-        // Check for NVIDIA first (most common discrete GPU)
-        if std::path::Path::new("/usr/bin/nvidia-smi").exists() {
+        if super::nvidia::hardware_present() {
             return GpuVendor::Nvidia;
         }
-        
-        // Check for AMD tools
-        if std::path::Path::new("/usr/bin/radeontop").exists() 
-            || std::path::Path::new("/opt/rocm/bin/rocm-smi").exists() {
-            return GpuVendor::Amd;
-        }
-        
-        // Check for Intel tools
-        if std::path::Path::new("/usr/bin/intel_gpu_top").exists() {
-            return GpuVendor::Intel;
-        }
-        
-        // Fallback: Check sysfs for GPU driver information
+
+        let mut amd_found = false;
+        let mut intel_found = false;
         if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                
-                // Look for card devices (card0, card1, etc.), not render nodes
-                if name_str.starts_with("card") && !name_str.contains("-") {
-                    if let Ok(device_path) = std::fs::read_link(entry.path()) {
-                        let device_str = device_path.to_string_lossy();
-                        if device_str.contains("amdgpu") {
-                            return GpuVendor::Amd;
-                        }
-                        if device_str.contains("i915") {
-                            return GpuVendor::Intel;
-                        }
-                    }
+
+                if !name_str.starts_with("card") || name_str.contains('-') {
+                    continue;
+                }
+
+                let vendor = std::fs::read_to_string(entry.path().join("device/vendor"))
+                    .unwrap_or_default();
+                match vendor.trim().to_ascii_lowercase().as_str() {
+                    "0x1002" => amd_found = true,
+                    "0x8086" => intel_found = true,
+                    _ => {}
                 }
             }
         }
-        
-        GpuVendor::None
+
+        if amd_found {
+            GpuVendor::Amd
+        } else if intel_found {
+            GpuVendor::Intel
+        } else {
+            GpuVendor::None
+        }
     }
     
     // ========================================================================
     // GPU Usage Fetching (called from background thread)
     // ========================================================================
     
-    /// Fetch NVIDIA GPU utilization via nvidia-smi.
-    ///
-    /// Parses the CSV output for GPU utilization percentage.
-    fn fetch_nvidia_gpu_usage() -> Option<f32> {
-        let output = Command::new("nvidia-smi")
-            .arg("--query-gpu=utilization.gpu")
-            .arg("--format=csv,noheader,nounits")
-            .output();
-        
-        match output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout.trim().parse::<f32>().ok()
-            }
-            _ => None,
-        }
-    }
-    
     /// Fetch AMD GPU utilization.
     ///
-    /// Prefers sysfs (no external tools needed), falls back to radeontop.
+    /// Reads the kernel driver's utilization value from sysfs.
     fn fetch_amd_gpu_usage() -> Option<f32> {
         // Primary method: Read from sysfs (most reliable, no permissions needed)
         // AMD GPUs expose utilization in /sys/class/drm/card*/device/gpu_busy_percent
@@ -262,41 +231,13 @@ impl UtilizationMonitor {
                 }
             }
         }
-        
-        // Fallback: radeontop (requires permissions)
-        if std::path::Path::new("/usr/bin/radeontop").exists() {
-            let output = Command::new("radeontop")
-                .arg("-d")
-                .arg("-")
-                .arg("-l")
-                .arg("1")
-                .output();
-            
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    // Parse "gpu 45.67%" format
-                    for line in stdout.lines() {
-                        if line.contains("gpu") {
-                            if let Some(percent_str) = line.split_whitespace().nth(1) {
-                                if let Some(num_str) = percent_str.strip_suffix('%') {
-                                    if let Ok(usage) = num_str.parse::<f32>() {
-                                        return Some(usage);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
+
         None
     }
     
     /// Fetch Intel GPU utilization.
     ///
-    /// Calculates from frequency ratio (current/max), falls back to intel_gpu_top.
+    /// Calculates from the current/maximum frequency ratio exposed by sysfs.
     fn fetch_intel_gpu_usage() -> Option<f32> {
         // Primary method: Calculate usage from frequency ratio
         // Intel GPUs expose frequency in sysfs
@@ -326,31 +267,7 @@ impl UtilizationMonitor {
                 }
             }
         }
-        
-        // Fallback: intel_gpu_top (requires CAP_PERFMON or root)
-        if std::path::Path::new("/usr/bin/intel_gpu_top").exists() {
-            let output = Command::new("intel_gpu_top")
-                .arg("-J")
-                .arg("-s")
-                .arg("100")
-                .output();
-            
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    // Simple JSON parsing for "busy" field
-                    if let Some(busy_idx) = stdout.find("\"busy\":") {
-                        let after_busy = &stdout[busy_idx + 8..];
-                        if let Some(end_idx) = after_busy.find(|c: char| !c.is_numeric() && c != '.') {
-                            if let Ok(usage) = after_busy[..end_idx].parse::<f32>() {
-                                return Some(usage);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
+
         None
     }
 }

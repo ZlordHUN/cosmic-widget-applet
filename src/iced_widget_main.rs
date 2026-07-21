@@ -12,6 +12,8 @@ mod iced_widget;
 mod media;
 #[path = "widget/notifications.rs"]
 mod notifications;
+#[path = "widget/nvidia.rs"]
+mod nvidia;
 #[path = "widget/storage.rs"]
 mod storage;
 #[path = "widget/temperature.rs"]

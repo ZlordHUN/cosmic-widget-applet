@@ -57,6 +57,9 @@ mod logitech;
 
 const MAXWELL_DEVICE_NAME: &str = "Audeze Maxwell";
 const MAXWELL_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(2);
+const INITIAL_NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const INITIAL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Battery Device Struct
@@ -108,7 +111,8 @@ pub struct BatteryDevice {
 ///
 /// - `devices`: Shared state protected by Arc<Mutex>
 /// - `update_requested`: Flag to trigger background refresh
-/// - Background thread polls flag every 5 seconds
+/// - Background thread retries unresolved startup readings every second
+/// - Native polling returns to a five-second interval after startup resolves
 /// - Main thread calls `update()` every 30 seconds to set flag
 ///
 /// # Caching
@@ -140,7 +144,8 @@ impl BatteryMonitor {
     ///
     /// # Background Thread Behavior
     ///
-    /// - Sleeps for 5 seconds between checks
+    /// - Sleeps for 1 second while cached startup readings are unresolved
+    /// - Returns to a 5-second native polling interval after resolution
     /// - Only queries tools when `update_requested` flag is set
     /// - On error, keeps previous device snapshot
     pub fn new() -> Self {
@@ -173,6 +178,7 @@ impl BatteryMonitor {
         let update_requested_clone = Arc::clone(&update_requested);
 
         std::thread::spawn(move || {
+            let initial_probe_started = Instant::now();
             let mut is_first_update = true;
             let mut native_maxwell_authoritative = false;
             let mut native_maxwell = None;
@@ -214,10 +220,13 @@ impl BatteryMonitor {
                         merge_native_maxwell(&mut new_devices, native_maxwell.clone());
                     }
                     merge_native_logitech(&mut new_devices, &native_logitech);
-                    *devices_clone.lock().unwrap() = new_devices.clone();
+                    let mut devices = devices_clone.lock().unwrap();
+                    preserve_loading_devices(&mut new_devices, &devices);
+                    *devices = new_devices.clone();
+                    drop(devices);
 
                     // Update cache after first successful update
-                    if is_first_update && !new_devices.is_empty() {
+                    if is_first_update && new_devices.iter().any(|device| !device.is_loading) {
                         let mut cache = super::cache::WidgetCache::load();
                         cache.update_battery_devices(&new_devices);
                         is_first_update = false;
@@ -231,9 +240,17 @@ impl BatteryMonitor {
             // Clear the initial update request flag
             *update_requested_clone.lock().unwrap() = false;
 
-            // Main background loop - check for update requests every 5 seconds
+            // Retry unresolved cached devices quickly during startup, then use the
+            // normal native polling interval. The timeout prevents a broken HID
+            // permission or backend from causing permanent one-second polling.
             loop {
-                std::thread::sleep(Duration::from_secs(5));
+                let poll_interval = {
+                    let mut devices = devices_clone.lock().unwrap();
+                    let elapsed = initial_probe_started.elapsed();
+                    expire_initial_readings(&mut devices, elapsed);
+                    native_poll_interval(&devices, elapsed)
+                };
+                std::thread::sleep(poll_interval);
 
                 let was_maxwell_connected = native_maxwell
                     .as_ref()
@@ -271,10 +288,15 @@ impl BatteryMonitor {
                                 merge_native_maxwell(&mut new_devices, native_maxwell.clone());
                             }
                             merge_native_logitech(&mut new_devices, &native_logitech);
-                            *devices_clone.lock().unwrap() = new_devices.clone();
+                            let mut devices = devices_clone.lock().unwrap();
+                            preserve_loading_devices(&mut new_devices, &devices);
+                            *devices = new_devices.clone();
+                            drop(devices);
 
                             // Update cache after first successful update
-                            if is_first_update && !new_devices.is_empty() {
+                            if is_first_update
+                                && new_devices.iter().any(|device| !device.is_loading)
+                            {
                                 let mut cache = super::cache::WidgetCache::load();
                                 cache.update_battery_devices(&new_devices);
                                 is_first_update = false;
@@ -400,6 +422,38 @@ fn replace_device_in_place(devices: &mut Vec<BatteryDevice>, replacement: Batter
         *existing = replacement;
     } else {
         devices.push(replacement);
+    }
+}
+
+fn preserve_loading_devices(fresh: &mut Vec<BatteryDevice>, previous: &[BatteryDevice]) {
+    for device in previous.iter().filter(|device| device.is_loading) {
+        if !fresh
+            .iter()
+            .any(|fresh| fresh.name.eq_ignore_ascii_case(&device.name))
+        {
+            fresh.push(device.clone());
+        }
+    }
+}
+
+fn expire_initial_readings(devices: &mut [BatteryDevice], elapsed: Duration) {
+    if elapsed < INITIAL_PROBE_TIMEOUT {
+        return;
+    }
+
+    for device in devices.iter_mut().filter(|device| device.is_loading) {
+        device.level = None;
+        device.status = None;
+        device.is_loading = false;
+        device.is_connected = false;
+    }
+}
+
+fn native_poll_interval(devices: &[BatteryDevice], elapsed: Duration) -> Duration {
+    if elapsed < INITIAL_PROBE_TIMEOUT && devices.iter().any(|device| device.is_loading) {
+        INITIAL_NATIVE_POLL_INTERVAL
+    } else {
+        NATIVE_POLL_INTERVAL
     }
 }
 
@@ -836,8 +890,23 @@ fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatteryDevice, merge_native_logitech, merge_native_maxwell, parse_headsetcontrol_json,
+        BatteryDevice, INITIAL_NATIVE_POLL_INTERVAL, INITIAL_PROBE_TIMEOUT, NATIVE_POLL_INTERVAL,
+        expire_initial_readings, merge_native_logitech, merge_native_maxwell, native_poll_interval,
+        parse_headsetcontrol_json, preserve_loading_devices,
     };
+    use std::time::Duration;
+
+    fn battery_device(name: &str, loading: bool) -> BatteryDevice {
+        BatteryDevice {
+            name: name.to_string(),
+            level: None,
+            status: None,
+            kind: None,
+            codename: None,
+            is_loading: loading,
+            is_connected: false,
+        }
+    }
 
     fn headsetcontrol_output(status: &str, level: i64) -> String {
         format!(
@@ -869,6 +938,58 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].level, Some(73));
         assert_eq!(devices[0].status.as_deref(), Some("discharging"));
+    }
+
+    #[test]
+    fn startup_polling_is_fast_only_while_a_cached_reading_is_unresolved() {
+        let mut devices = vec![battery_device("Audeze Maxwell", true)];
+
+        assert_eq!(
+            native_poll_interval(&devices, Duration::from_secs(2)),
+            INITIAL_NATIVE_POLL_INTERVAL
+        );
+
+        devices[0].is_loading = false;
+        assert_eq!(
+            native_poll_interval(&devices, Duration::from_secs(2)),
+            NATIVE_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn unresolved_startup_readings_become_disconnected_after_the_timeout() {
+        let mut devices = vec![BatteryDevice {
+            level: Some(80),
+            status: Some("charging".to_string()),
+            is_loading: true,
+            is_connected: true,
+            ..battery_device("Audeze Maxwell", true)
+        }];
+
+        expire_initial_readings(&mut devices, INITIAL_PROBE_TIMEOUT);
+
+        assert_eq!(devices[0].level, None);
+        assert_eq!(devices[0].status, None);
+        assert!(!devices[0].is_loading);
+        assert!(!devices[0].is_connected);
+        assert_eq!(
+            native_poll_interval(&devices, INITIAL_PROBE_TIMEOUT),
+            NATIVE_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn external_refresh_keeps_only_still_loading_cached_rows() {
+        let previous = vec![
+            battery_device("Audeze Maxwell", true),
+            battery_device("G309 LIGHTSPEED", false),
+        ];
+        let mut fresh = vec![battery_device("G309 LIGHTSPEED", false)];
+
+        preserve_loading_devices(&mut fresh, &previous);
+
+        assert_eq!(fresh.len(), 2);
+        assert!(fresh.iter().any(|device| device.name == "Audeze Maxwell"));
     }
 
     #[test]

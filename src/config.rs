@@ -102,7 +102,7 @@ pub struct Config {
     pub show_memory: bool,
     
     /// Show GPU usage bar and percentage in the Utilization section.
-    /// Supports NVIDIA (nvidia-smi), AMD, and Intel GPUs.
+    /// Supports NVIDIA (NVML), AMD, and Intel GPUs without subprocesses.
     pub show_gpu: bool,
     
     /// Show network transfer rates (upload/download speeds).
@@ -122,7 +122,7 @@ pub struct Config {
     pub show_cpu_temp: bool,
     
     /// Show GPU temperature in the Temperatures section.
-    /// Uses nvidia-smi for NVIDIA, hwmon for AMD/Intel.
+    /// Uses NVML for NVIDIA and hwmon for AMD/Intel.
     pub show_gpu_temp: bool,
     
     /// Use circular gauge display for temperatures instead of text.
