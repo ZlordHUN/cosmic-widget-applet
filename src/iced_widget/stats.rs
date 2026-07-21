@@ -2,6 +2,7 @@
 
 use crate::battery::{BatteryDevice, BatteryMonitor};
 use crate::media::{MediaMonitor, MultiPlayerState, PlayerId};
+use crate::network::NetworkMonitor;
 use crate::notifications::{Notification, NotificationMonitor};
 use crate::storage::{DiskInfo, StorageMonitor};
 use crate::temperature::TemperatureMonitor;
@@ -16,6 +17,8 @@ pub struct SystemSnapshot {
     pub cpu_usage: f32,
     pub memory_usage: f32,
     pub gpu_usage: f32,
+    pub network_rx_rate: f64,
+    pub network_tx_rate: f64,
     pub cpu_temp: f32,
     pub gpu_temp: f32,
     pub disks: Vec<DiskInfo>,
@@ -61,6 +64,7 @@ impl StatsSampler {
         let media_monitor = sampler.media_monitor.clone();
         std::thread::spawn(move || {
             let mut utilization = UtilizationMonitor::new();
+            let mut network = NetworkMonitor::new();
             let mut temperature = TemperatureMonitor::new();
             let mut storage = StorageMonitor::new();
             let mut battery = BatteryMonitor::new();
@@ -72,6 +76,7 @@ impl StatsSampler {
 
             loop {
                 utilization.update();
+                network.update();
                 temperature.update();
                 storage.update();
                 battery.update();
@@ -97,6 +102,8 @@ impl StatsSampler {
                     cpu_usage: utilization.cpu_usage,
                     memory_usage: utilization.memory_usage,
                     gpu_usage: utilization.get_gpu_usage(),
+                    network_rx_rate: network.network_rx_rate,
+                    network_tx_rate: network.network_tx_rate,
                     cpu_temp: temperature.cpu_temp,
                     gpu_temp: temperature.gpu_temp,
                     disks: storage.disk_info.clone(),

@@ -28,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const APP_ID: &str = "com.github.zoliviragh.CosmicWidget.Iced";
 const SURFACE_WIDTH: u32 = 370;
 const BASE_SURFACE_HEIGHT: u32 = 556;
+const NETWORK_SECTION_HEIGHT: u32 = 120;
 const EMPTY_STORAGE_HEIGHT: u32 = 63;
 const STORAGE_SECTION_HEIGHT: u32 = 38;
 const STORAGE_ITEM_HEIGHT: u32 = 62;
@@ -300,10 +301,11 @@ impl App {
     fn new() -> (Self, Task<Message>) {
         let config_handler =
             cosmic_config::Config::new("com.github.zoliviragh.CosmicWidget", Config::VERSION).ok();
-        let config = config_handler
+        let mut config = config_handler
             .as_ref()
             .and_then(|handler| Config::get_entry(handler).ok())
             .unwrap_or_default();
+        config.ensure_network_section();
         let sampler = StatsSampler::spawn(
             config.update_interval_ms,
             config.show_weather,
@@ -435,7 +437,8 @@ impl App {
                 }
 
                 if let Some(handler) = &self.config_handler {
-                    if let Ok(config) = Config::get_entry(handler) {
+                    if let Ok(mut config) = Config::get_entry(handler) {
+                        config.ensure_network_section();
                         if config != self.config {
                             let position_changed = config.widget_x != self.config.widget_x
                                 || config.widget_y != self.config.widget_y;
@@ -929,6 +932,16 @@ fn desired_surface_height_with_animation(
     group_progress: f32,
 ) -> u32 {
     let mut height = BASE_SURFACE_HEIGHT as f32;
+    let network_visible = config.show_network
+        && config
+            .section_order
+            .iter()
+            .any(|section| matches!(section, WidgetSection::Network));
+
+    if network_visible {
+        height += NETWORK_SECTION_HEIGHT as f32;
+    }
+
     let storage_visible = config.show_storage
         && config
             .section_order
@@ -1165,10 +1178,11 @@ fn estimated_wrapped_lines(text: &str, line_width: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_SURFACE_HEIGHT, ExpansionAnimation, NOTIFICATION_EXPANSION_DURATION,
-        NotificationKey, PendingPlayback, ScrollAnimation, UI_TICK_SETTLE_DELAY,
-        delay_until_next_tick, desired_surface_height, desired_surface_height_with_expansion,
-        notification_viewport_height_with_animation, reconcile_media_state, ui_tick_interval,
+        BASE_SURFACE_HEIGHT, ExpansionAnimation, NETWORK_SECTION_HEIGHT,
+        NOTIFICATION_EXPANSION_DURATION, NotificationKey, PendingPlayback, ScrollAnimation,
+        UI_TICK_SETTLE_DELAY, delay_until_next_tick, desired_surface_height,
+        desired_surface_height_with_expansion, notification_viewport_height_with_animation,
+        reconcile_media_state, ui_tick_interval,
     };
     use crate::battery::BatteryDevice;
     use crate::config::{Config, WidgetSection};
@@ -1211,6 +1225,19 @@ mod tests {
 
         assert!(empty_height > BASE_SURFACE_HEIGHT);
         assert_eq!(desired_surface_height(&config, &snapshot), 780);
+    }
+
+    #[test]
+    fn surface_height_tracks_network_visibility() {
+        let mut config = Config::default();
+        config.show_storage = false;
+        config.show_network = true;
+        config.section_order = vec![WidgetSection::Network];
+
+        assert_eq!(
+            desired_surface_height(&config, &super::SystemSnapshot::default()),
+            BASE_SURFACE_HEIGHT + NETWORK_SECTION_HEIGHT
+        );
     }
 
     #[test]

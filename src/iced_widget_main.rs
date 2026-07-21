@@ -10,6 +10,8 @@ mod config;
 mod iced_widget;
 #[path = "widget/media.rs"]
 mod media;
+#[path = "widget/network.rs"]
+mod network;
 #[path = "widget/notifications.rs"]
 mod notifications;
 #[path = "widget/nvidia.rs"]

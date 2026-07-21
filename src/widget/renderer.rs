@@ -339,6 +339,9 @@ pub fn render_widget(
                         y_pos = render_utilization(&cr, &layout, y_pos, &params);
                     }
                 }
+                WidgetSection::Network => {
+                    // The legacy renderer keeps network below reorderable sections.
+                }
                 WidgetSection::Temperatures => {
                     if params.show_cpu_temp || params.show_gpu_temp {
                         y_pos += 10.0; // Spacing before temperature section
@@ -520,6 +523,9 @@ pub fn render_main_widget(
                     if params.show_cpu || params.show_memory || params.show_gpu {
                         y_pos = render_utilization(&cr, &layout, y_pos, &params);
                     }
+                }
+                WidgetSection::Network => {
+                    // The legacy renderer keeps network outside this split layout.
                 }
                 WidgetSection::Temperatures => {
                     if params.show_cpu_temp || params.show_gpu_temp {

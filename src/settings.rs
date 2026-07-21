@@ -326,6 +326,8 @@ impl Application for SettingsApp {
         // When new sections are added to the app, existing configs won't have them.
         // This ensures users don't lose access to new features.
 
+        config.ensure_network_section();
+
         // Add Battery section if missing (added in v1.x)
         if !config
             .section_order

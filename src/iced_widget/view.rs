@@ -66,6 +66,11 @@ pub fn widget_view<'a>(
                 spacing.space_xs,
                 spacing.space_xs,
             )),
+            WidgetSection::Network if config.show_network => Some(network_view(
+                stats,
+                spacing.space_xs,
+                spacing.space_xs,
+            )),
             WidgetSection::Temperatures if show_temperatures(config) => Some(temperature_view(
                 config,
                 stats,
@@ -213,6 +218,48 @@ fn utilization_view<'a>(
     section.into()
 }
 
+fn network_view<'a>(
+    stats: &SystemSnapshot,
+    section_spacing: u16,
+    row_spacing: u16,
+) -> Element<'a, super::Message> {
+    section(
+        "network-transmit-receive-symbolic",
+        "Network",
+        section_spacing,
+    )
+    .push(network_rate_row(
+        "network-receive-symbolic",
+        "Download",
+        stats.network_rx_rate,
+        row_spacing,
+    ))
+    .push(network_rate_row(
+        "network-transmit-symbolic",
+        "Upload",
+        stats.network_tx_rate,
+        row_spacing,
+    ))
+    .into()
+}
+
+fn network_rate_row<'a>(
+    icon_name: &'static str,
+    label: &'static str,
+    bytes_per_second: f64,
+    spacing: u16,
+) -> Element<'a, super::Message> {
+    widget::row::with_capacity(4)
+        .width(Length::Fill)
+        .align_y(Alignment::Center)
+        .spacing(spacing)
+        .push(widget::icon::from_name(icon_name).size(METRIC_ICON_SIZE))
+        .push(widget::text::body(label))
+        .push(widget::space::horizontal())
+        .push(widget::text::monotext(format_network_rate(bytes_per_second)))
+        .into()
+}
+
 fn temperature_view<'a>(
     config: &Config,
     stats: &SystemSnapshot,
@@ -230,7 +277,14 @@ fn temperature_view<'a>(
         gauges = gauges.push(temperature_item("GPU", stats.gpu_temp));
     }
 
-    section("temperature-symbolic", "Temperatures", section_spacing)
+    section_with_icon(
+        embedded_symbolic_icon(
+            include_bytes!("../../assets/icons/temperature-filled-symbolic.svg"),
+            18,
+        ),
+        "Temperatures",
+        section_spacing,
+    )
         .push(gauges)
         .into()
 }
@@ -680,11 +734,10 @@ fn notification_item<'a>(
 }
 
 fn filled_notification_icon() -> Element<'static, super::Message> {
-    let mut handle = widget::icon::from_svg_bytes(include_bytes!(
-        "../../assets/icons/notification-bell-filled-symbolic.svg"
-    ));
-    handle.symbolic = true;
-    widget::icon::icon(handle).size(18).into()
+    embedded_symbolic_icon(
+        include_bytes!("../../assets/icons/notification-bell-filled-symbolic.svg"),
+        18,
+    )
 }
 
 fn media_view<'a>(
@@ -1130,10 +1183,22 @@ fn section<'a>(
     title: &'a str,
     spacing: u16,
 ) -> cosmic::widget::Column<'a, super::Message, cosmic::Theme> {
+    section_with_icon(
+        widget::icon::from_name(icon_name).size(18).into(),
+        title,
+        spacing,
+    )
+}
+
+fn section_with_icon<'a>(
+    icon: Element<'static, super::Message>,
+    title: &'a str,
+    spacing: u16,
+) -> cosmic::widget::Column<'a, super::Message, cosmic::Theme> {
     let heading = widget::row::with_capacity(2)
         .align_y(Alignment::Center)
         .spacing(8)
-        .push(widget::icon::from_name(icon_name).size(18))
+        .push(icon)
         .push(widget::text::heading(title));
 
     widget::column::with_capacity(4)
@@ -1346,6 +1411,28 @@ fn format_storage_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_network_rate(bytes_per_second: f64) -> String {
+    const KB: f64 = 1_024.0;
+    const MB: f64 = KB * 1_024.0;
+    const GB: f64 = MB * 1_024.0;
+
+    let rate = if bytes_per_second.is_finite() {
+        bytes_per_second.max(0.0)
+    } else {
+        0.0
+    };
+
+    if rate >= GB {
+        format!("{:.1} GB/s", rate / GB)
+    } else if rate >= MB {
+        format!("{:.1} MB/s", rate / MB)
+    } else if rate >= KB {
+        format!("{:.1} KB/s", rate / KB)
+    } else {
+        format!("{rate:.0} B/s")
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MetricIcon {
     Cpu,
@@ -1359,9 +1446,16 @@ fn metric_icon(icon: MetricIcon) -> Element<'static, super::Message> {
         MetricIcon::Memory => include_bytes!("../../assets/icons/memory-symbolic.svg"),
         MetricIcon::Gpu => include_bytes!("../../assets/icons/gpu-symbolic.svg"),
     };
+    embedded_symbolic_icon(bytes, METRIC_ICON_SIZE)
+}
+
+fn embedded_symbolic_icon(
+    bytes: &'static [u8],
+    size: u16,
+) -> Element<'static, super::Message> {
     let mut handle = widget::icon::from_svg_bytes(bytes);
     handle.symbolic = true;
-    widget::icon::icon(handle).size(METRIC_ICON_SIZE).into()
+    widget::icon::icon(handle).size(size).into()
 }
 
 fn temperature_item<'a>(label: &'a str, value: f32) -> Element<'a, super::Message> {
@@ -1399,8 +1493,9 @@ fn format_time_parts(now: DateTime<Local>, use_24hour_time: bool) -> (String, St
 mod tests {
     use super::{
         BatteryBand, NotificationBand, battery_band, battery_icon_name, compact_single_line,
-        format_media_time, format_storage_bytes, format_weather_temperature, is_charging,
-        media_subtitle, notification_band, relative_notification_time, weather_icon_name,
+        format_media_time, format_network_rate, format_storage_bytes, format_weather_temperature,
+        is_charging, media_subtitle, notification_band, relative_notification_time,
+        weather_icon_name,
     };
     use crate::media::MediaInfo;
 
@@ -1410,6 +1505,14 @@ mod tests {
         assert_eq!(format_storage_bytes(608_000_000_000), "608 GB");
         assert_eq!(format_storage_bytes(950_000_000), "950 MB");
         assert_eq!(format_storage_bytes(999), "999 B");
+    }
+
+    #[test]
+    fn formats_network_rates_for_compact_display() {
+        assert_eq!(format_network_rate(0.0), "0 B/s");
+        assert_eq!(format_network_rate(1_536.0), "1.5 KB/s");
+        assert_eq!(format_network_rate(12.25 * 1_024.0 * 1_024.0), "12.2 MB/s");
+        assert_eq!(format_network_rate(f64::NAN), "0 B/s");
     }
 
     #[test]

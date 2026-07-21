@@ -37,6 +37,8 @@ use serde::{Deserialize, Serialize};
 pub enum WidgetSection {
     /// CPU, Memory, GPU usage bars and percentages
     Utilization,
+    /// Aggregate download and upload throughput
+    Network,
     /// CPU and GPU temperature displays (circular or text)
     Temperatures,
     /// Disk space usage for mounted filesystems
@@ -58,6 +60,7 @@ impl WidgetSection {
     pub fn label(&self) -> &'static str {
         match self {
             WidgetSection::Utilization => "Utilization",
+            WidgetSection::Network => "Network",
             WidgetSection::Temperatures => "Temperatures",
             WidgetSection::Storage => "Storage",
             WidgetSection::Battery => "Battery",
@@ -106,7 +109,7 @@ pub struct Config {
     pub show_gpu: bool,
     
     /// Show network transfer rates (upload/download speeds).
-    /// Currently not fully implemented in the reorderable sections.
+    /// Displayed as a reorderable Network section.
     pub show_network: bool,
     
     /// Show disk I/O activity.
@@ -249,6 +252,27 @@ pub struct Config {
     pub enable_logging: bool,
 }
 
+impl Config {
+    /// Add sections introduced after the current config schema was first saved.
+    pub fn ensure_network_section(&mut self) -> bool {
+        if self
+            .section_order
+            .iter()
+            .any(|section| matches!(section, WidgetSection::Network))
+        {
+            return false;
+        }
+
+        let position = self
+            .section_order
+            .iter()
+            .position(|section| matches!(section, WidgetSection::Utilization))
+            .map_or(0, |index| index + 1);
+        self.section_order.insert(position, WidgetSection::Network);
+        true
+    }
+}
+
 // ============================================================================
 // Default Configuration
 // ============================================================================
@@ -267,7 +291,7 @@ impl Default for Config {
             show_cpu: true,
             show_memory: true,
             show_gpu: false,        // Requires GPU, not always present
-            show_network: false,    // Not yet in reorderable sections
+            show_network: false,
             show_disk: false,       // Not yet in reorderable sections
             
             // Temperatures: Disabled by default (not all systems have sensors)
@@ -313,6 +337,7 @@ impl Default for Config {
             // Section order: Logical grouping from most to least common
             section_order: vec![
                 WidgetSection::Utilization,
+                WidgetSection::Network,
                 WidgetSection::Temperatures,
                 WidgetSection::Storage,
                 WidgetSection::Battery,
@@ -324,5 +349,23 @@ impl Default for Config {
             // Advanced: Logging off by default
             enable_logging: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, WidgetSection};
+
+    #[test]
+    fn inserts_network_after_utilization_for_existing_configs() {
+        let mut config = Config::default();
+        config
+            .section_order
+            .retain(|section| !matches!(section, WidgetSection::Network));
+
+        assert!(config.ensure_network_section());
+        assert_eq!(config.section_order[0], WidgetSection::Utilization);
+        assert_eq!(config.section_order[1], WidgetSection::Network);
+        assert!(!config.ensure_network_section());
     }
 }
