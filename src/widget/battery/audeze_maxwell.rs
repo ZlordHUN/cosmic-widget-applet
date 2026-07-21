@@ -140,7 +140,10 @@ fn parse_hid_id(uevent: &str) -> Option<(u16, u16)> {
     parts.next()?;
     let vendor_id = u32::from_str_radix(parts.next()?, 16).ok()?;
     let product_id = u32::from_str_radix(parts.next()?, 16).ok()?;
-    Some((u16::try_from(vendor_id).ok()?, u16::try_from(product_id).ok()?))
+    Some((
+        u16::try_from(vendor_id).ok()?,
+        u16::try_from(product_id).ok()?,
+    ))
 }
 
 fn send_request(
@@ -173,8 +176,7 @@ fn send_request(
 
 fn parse_battery_response(response: &[u8]) -> Option<u8> {
     response.windows(5).find_map(|window| {
-        (window[0..4] == [0xd6, 0x0c, 0x00, 0x00] && window[4] <= 100)
-            .then_some(window[4])
+        (window[0..4] == [0xd6, 0x0c, 0x00, 0x00] && window[4] <= 100).then_some(window[4])
     })
 }
 
@@ -193,8 +195,8 @@ const fn hid_ioc_get_input(length: usize) -> libc::c_ulong {
 #[cfg(test)]
 mod tests {
     use super::{
-        MESSAGE_SIZE, hid_ioc_get_input, parse_battery_response, parse_battery_state,
-        parse_hid_id, query,
+        MESSAGE_SIZE, hid_ioc_get_input, parse_battery_response, parse_battery_state, parse_hid_id,
+        query,
     };
 
     #[test]

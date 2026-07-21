@@ -54,7 +54,11 @@ pub fn calculate_widget_height(config: &Config, disk_count: usize) -> u32 {
 /// Calculate widget height with battery count (legacy API).
 ///
 /// Use [`calculate_widget_height_with_all`] for full control.
-pub fn calculate_widget_height_with_batteries(config: &Config, disk_count: usize, battery_count: usize) -> u32 {
+pub fn calculate_widget_height_with_batteries(
+    config: &Config,
+    disk_count: usize,
+    battery_count: usize,
+) -> u32 {
     calculate_widget_height_with_all(config, disk_count, battery_count, 0, 0)
 }
 
@@ -73,9 +77,15 @@ pub fn calculate_widget_height_with_batteries(config: &Config, disk_count: usize
 /// # Returns
 ///
 /// Height in pixels, minimum 100px
-pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, battery_count: usize, notification_count: usize, player_count: usize) -> u32 {
+pub fn calculate_widget_height_with_all(
+    config: &Config,
+    disk_count: usize,
+    battery_count: usize,
+    notification_count: usize,
+    player_count: usize,
+) -> u32 {
     let mut required_height = BASE_PADDING;
-    
+
     // === Clock & Date Section ===
     // Always at the top of the widget
     if config.show_clock {
@@ -87,7 +97,7 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
     if config.show_clock || config.show_date {
         required_height += 20; // Spacing after clock/date
     }
-    
+
     // === Utilization Section ===
     // CPU, Memory, and GPU usage bars
     if config.show_cpu || config.show_memory || config.show_gpu {
@@ -102,13 +112,13 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
             required_height += 30; // GPU bar + label
         }
     }
-    
+
     // === Temperature Section ===
     // CPU and/or GPU temperatures
     if config.show_cpu_temp || config.show_gpu_temp {
         required_height += SECTION_SPACING;
         required_height += HEADER_HEIGHT; // "Temperatures" header
-        
+
         if config.use_circular_temp_display {
             // Circular gauges are larger
             required_height += 60;
@@ -122,13 +132,13 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
             }
         }
     }
-    
+
     // === Network Section ===
     // Upload/Download rates (if enabled)
     if config.show_network {
         required_height += 50; // Two lines: RX and TX
     }
-    
+
     // === Storage Section ===
     // Dynamic based on mounted disk count
     if config.show_storage && disk_count > 0 {
@@ -137,13 +147,13 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
         // Each disk: name (20px) + bar (12px) + spacing (13px) = 45px
         required_height += disk_count as u32 * 45;
     }
-    
+
     // === Disk I/O Section ===
     // Read/Write rates (if enabled, separate from storage)
     if config.show_disk {
         required_height += 50;
     }
-    
+
     // === Weather Section ===
     // Icon + temperature + description
     if config.show_weather {
@@ -165,7 +175,7 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
             required_height += 25;
         }
     }
-    
+
     // === Notifications Section ===
     // Dynamic based on notification count (capped at 5)
     if config.show_notifications {
@@ -181,7 +191,7 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
             required_height += 25;
         }
     }
-    
+
     // === Media Player Section ===
     // Now playing from Cider
     if config.show_media {
@@ -193,10 +203,10 @@ pub fn calculate_widget_height_with_all(config: &Config, disk_count: usize, batt
         }
         required_height += 15; // Bottom padding after panel
     }
-    
+
     // Final padding
     required_height += BOTTOM_PADDING;
-    
+
     // Enforce minimum height
     required_height.max(MINIMUM_HEIGHT)
 }

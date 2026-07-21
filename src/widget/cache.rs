@@ -25,8 +25,8 @@
 //! occur, the worst case is displaying slightly stale data.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 // ============================================================================
 // Cache Data Structures

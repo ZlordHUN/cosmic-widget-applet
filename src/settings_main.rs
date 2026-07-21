@@ -43,8 +43,6 @@ fn main() -> cosmic::iced::Result {
     let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
     i18n::init(&requested_languages);
 
-    // Start the iced-based settings application.
-    // - Settings::default() provides standard window configuration
-    // - () is the flags parameter (no initialization data needed)
-    cosmic::app::run::<settings::SettingsApp>(cosmic::app::Settings::default(), ())
+    let settings = cosmic::app::Settings::default().size(cosmic::iced::Size::new(960.0, 720.0));
+    cosmic::app::run::<settings::SettingsApp>(settings, ())
 }

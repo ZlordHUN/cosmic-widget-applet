@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::battery::{BatteryDevice, BatteryMonitor};
+use crate::config::UPDATE_INTERVAL_MS;
+use crate::disk_io::DiskIoMonitor;
 use crate::media::{MediaMonitor, MultiPlayerState, PlayerId};
 use crate::network::NetworkMonitor;
 use crate::notifications::{Notification, NotificationMonitor};
@@ -8,7 +10,7 @@ use crate::storage::{DiskInfo, StorageMonitor};
 use crate::temperature::TemperatureMonitor;
 use crate::utilization::UtilizationMonitor;
 use crate::weather::{WeatherData, WeatherMonitor};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +21,8 @@ pub struct SystemSnapshot {
     pub gpu_usage: f32,
     pub network_rx_rate: f64,
     pub network_tx_rate: f64,
+    pub disk_read_rate: f64,
+    pub disk_write_rate: f64,
     pub cpu_temp: f32,
     pub gpu_temp: f32,
     pub disks: Vec<DiskInfo>,
@@ -31,8 +35,8 @@ pub struct SystemSnapshot {
 #[derive(Clone)]
 pub struct StatsSampler {
     latest: Arc<Mutex<SystemSnapshot>>,
-    interval_ms: Arc<AtomicU64>,
     weather_enabled: Arc<AtomicBool>,
+    solaar_enabled: Arc<AtomicBool>,
     weather_location: Arc<Mutex<String>>,
     notification_monitor: NotificationMonitor,
     media_monitor: MediaMonitor,
@@ -40,8 +44,8 @@ pub struct StatsSampler {
 
 impl StatsSampler {
     pub fn spawn(
-        interval_ms: u64,
         weather_enabled: bool,
+        solaar_enabled: bool,
         weather_location: String,
         max_notifications: usize,
         cider_api_token: String,
@@ -50,24 +54,26 @@ impl StatsSampler {
         let media_monitor = MediaMonitor::new(Some(cider_api_token));
         let sampler = Self {
             latest: Arc::new(Mutex::new(SystemSnapshot::default())),
-            interval_ms: Arc::new(AtomicU64::new(interval_ms.max(250))),
             weather_enabled: Arc::new(AtomicBool::new(weather_enabled)),
+            solaar_enabled: Arc::new(AtomicBool::new(solaar_enabled)),
             weather_location: Arc::new(Mutex::new(weather_location)),
             notification_monitor: notification_monitor.clone(),
             media_monitor: media_monitor.clone(),
         };
 
         let latest = Arc::clone(&sampler.latest);
-        let interval = Arc::clone(&sampler.interval_ms);
         let weather_enabled = Arc::clone(&sampler.weather_enabled);
+        let solaar_enabled = Arc::clone(&sampler.solaar_enabled);
         let weather_location = Arc::clone(&sampler.weather_location);
         let media_monitor = sampler.media_monitor.clone();
         std::thread::spawn(move || {
             let mut utilization = UtilizationMonitor::new();
             let mut network = NetworkMonitor::new();
+            let mut disk_io = DiskIoMonitor::new();
             let mut temperature = TemperatureMonitor::new();
             let mut storage = StorageMonitor::new();
-            let mut battery = BatteryMonitor::new();
+            let mut battery =
+                BatteryMonitor::new_with_solaar(solaar_enabled.load(Ordering::Relaxed));
             let mut active_weather_location = match weather_location.lock() {
                 Ok(location) => location.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
@@ -77,8 +83,10 @@ impl StatsSampler {
             loop {
                 utilization.update();
                 network.update();
+                disk_io.update();
                 temperature.update();
                 storage.update();
+                battery.set_solaar_enabled(solaar_enabled.load(Ordering::Relaxed));
                 battery.update();
 
                 let configured_location = match weather_location.lock() {
@@ -104,6 +112,8 @@ impl StatsSampler {
                     gpu_usage: utilization.get_gpu_usage(),
                     network_rx_rate: network.network_rx_rate,
                     network_tx_rate: network.network_tx_rate,
+                    disk_read_rate: disk_io.read_rate,
+                    disk_write_rate: disk_io.write_rate,
                     cpu_temp: temperature.cpu_temp,
                     gpu_temp: temperature.gpu_temp,
                     disks: storage.disk_info.clone(),
@@ -118,9 +128,7 @@ impl StatsSampler {
                     Err(poisoned) => *poisoned.into_inner() = snapshot,
                 }
 
-                std::thread::sleep(Duration::from_millis(
-                    interval.load(Ordering::Relaxed).max(250),
-                ));
+                std::thread::sleep(Duration::from_millis(UPDATE_INTERVAL_MS));
             }
         });
 
@@ -137,17 +145,16 @@ impl StatsSampler {
         snapshot
     }
 
-    pub fn set_interval(&self, interval_ms: u64) {
-        self.interval_ms
-            .store(interval_ms.max(250), Ordering::Relaxed);
-    }
-
     pub fn set_weather_config(&self, enabled: bool, location: String) {
         self.weather_enabled.store(enabled, Ordering::Relaxed);
         match self.weather_location.lock() {
             Ok(mut current) => *current = location,
             Err(poisoned) => *poisoned.into_inner() = location,
         }
+    }
+
+    pub fn set_solaar_enabled(&self, enabled: bool) {
+        self.solaar_enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn clear_notifications(&self) {

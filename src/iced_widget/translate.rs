@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use cosmic::iced::advanced::widget::tree::{self, Tree};
 use cosmic::iced::advanced::widget::Operation;
-use cosmic::iced::advanced::{
-    self, Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
-};
+use cosmic::iced::advanced::widget::tree::{self, Tree};
+use cosmic::iced::advanced::{self, Clipboard, Layout, Shell, Widget, layout, overlay, renderer};
 use cosmic::iced::{Event, Length, Rectangle, Size, Vector, mouse};
 use cosmic::{Element, Renderer, Theme};
 

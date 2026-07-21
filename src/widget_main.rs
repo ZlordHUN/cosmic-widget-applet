@@ -65,7 +65,7 @@ mod config;
 mod widget;
 mod widget_instance;
 
-use config::Config;
+use config::{Config, UPDATE_INTERVAL_MS};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use std::sync::Arc;
 use std::thread;
@@ -828,7 +828,7 @@ impl MonitorWidget {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
 
-        if elapsed < (self.config.update_interval_ms as f64 / 1000.0) {
+        if elapsed < (UPDATE_INTERVAL_MS as f64 / 1000.0) {
             return;
         }
 
@@ -1229,7 +1229,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_handler =
         cosmic_config::Config::new("com.github.zoliviragh.CosmicWidget", Config::VERSION)?;
 
-    let mut base_config = Config::get_entry(&config_handler).unwrap_or_default();
+    let mut base_config =
+        Config::get_entry(&config_handler).unwrap_or_else(|(_errors, config)| config);
 
     // Initialize logger only if enabled in config
     if base_config.enable_logging {
@@ -1351,35 +1352,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Check for external config changes every 500ms (from settings app)
             if now.duration_since(widget.last_config_check).as_millis() > 500 {
                 widget.last_config_check = now;
-                if let Ok(new_config) = Config::get_entry(&widget.config_handler) {
-                    // Only update if config actually changed
-                    if *widget.config != new_config {
-                        log::info!("Configuration changed, updating widget");
+                let new_config = Config::get_entry(&widget.config_handler)
+                    .unwrap_or_else(|(_errors, config)| config);
+                // Only update if config actually changed
+                if *widget.config != new_config {
+                    log::info!("Configuration changed, updating widget");
 
-                        // Keep latest config for future sessions
-                        base_config = new_config.clone();
+                    // Keep latest config for future sessions
+                    base_config = new_config.clone();
 
-                        // Update weather monitor if API key or location changed
-                        if widget.config.weather_api_key != new_config.weather_api_key {
-                            log::info!("Weather API key changed");
-                            widget
-                                .weather
-                                .set_api_key(new_config.weather_api_key.clone());
-                        }
-                        if widget.config.weather_location != new_config.weather_location {
-                            log::info!(
-                                "Weather location changed to: {}",
-                                new_config.weather_location
-                            );
-                            widget
-                                .weather
-                                .set_location(new_config.weather_location.clone());
-                        }
-
-                        widget.config = Arc::new(new_config);
-                        // Force a redraw with full stats update
-                        widget.draw(&qh, chrono::Local::now(), true);
+                    // Update weather monitor if API key or location changed
+                    if widget.config.weather_api_key != new_config.weather_api_key {
+                        log::info!("Weather API key changed");
+                        widget
+                            .weather
+                            .set_api_key(new_config.weather_api_key.clone());
                     }
+                    if widget.config.weather_location != new_config.weather_location {
+                        log::info!(
+                            "Weather location changed to: {}",
+                            new_config.weather_location
+                        );
+                        widget
+                            .weather
+                            .set_location(new_config.weather_location.clone());
+                    }
+
+                    widget.config = Arc::new(new_config);
+                    // Force a redraw with full stats update
+                    widget.draw(&qh, chrono::Local::now(), true);
                 }
             }
 

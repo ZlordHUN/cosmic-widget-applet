@@ -342,6 +342,9 @@ pub fn render_widget(
                 WidgetSection::Network => {
                     // The legacy renderer keeps network below reorderable sections.
                 }
+                WidgetSection::DiskIo => {
+                    // The legacy renderer keeps disk I/O below reorderable sections.
+                }
                 WidgetSection::Temperatures => {
                     if params.show_cpu_temp || params.show_gpu_temp {
                         y_pos += 10.0; // Spacing before temperature section
@@ -526,6 +529,9 @@ pub fn render_main_widget(
                 }
                 WidgetSection::Network => {
                     // The legacy renderer keeps network outside this split layout.
+                }
+                WidgetSection::DiskIo => {
+                    // The legacy renderer keeps disk I/O outside this split layout.
                 }
                 WidgetSection::Temperatures => {
                     if params.show_cpu_temp || params.show_gpu_temp {

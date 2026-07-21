@@ -78,7 +78,7 @@ impl CosmicTheme {
     /// Falls back to defaults if files cannot be read or parsed.
     pub fn load() -> Self {
         let mut theme = Self::default();
-        
+
         // Get config directory
         let config_dir = match dirs::config_dir() {
             Some(dir) => dir.join("cosmic"),
@@ -87,17 +87,17 @@ impl CosmicTheme {
                 return theme;
             }
         };
-        
+
         // Read dark/light mode
         theme.is_dark = Self::read_is_dark(&config_dir);
-        
+
         // Read accent color based on current mode
         theme.accent = Self::read_accent_color(&config_dir, theme.is_dark);
         theme.accent_bg = ThemeColor {
             alpha: 0.6,
             ..theme.accent
         };
-        
+
         log::info!(
             "Loaded COSMIC theme: is_dark={}, accent=({:.2}, {:.2}, {:.2})",
             theme.is_dark,
@@ -105,17 +105,17 @@ impl CosmicTheme {
             theme.accent.green,
             theme.accent.blue
         );
-        
+
         theme
     }
-    
+
     /// Read the is_dark setting from theme mode config
     fn read_is_dark(config_dir: &PathBuf) -> bool {
         let mode_path = config_dir
             .join("com.system76.CosmicTheme.Mode")
             .join("v1")
             .join("is_dark");
-        
+
         match fs::read_to_string(&mode_path) {
             Ok(content) => {
                 let trimmed = content.trim();
@@ -127,7 +127,7 @@ impl CosmicTheme {
             }
         }
     }
-    
+
     /// Read accent color from the appropriate theme config (dark or light)
     fn read_accent_color(config_dir: &PathBuf, is_dark: bool) -> ThemeColor {
         let theme_name = if is_dark {
@@ -135,12 +135,9 @@ impl CosmicTheme {
         } else {
             "com.system76.CosmicTheme.Light"
         };
-        
-        let accent_path = config_dir
-            .join(theme_name)
-            .join("v1")
-            .join("accent");
-        
+
+        let accent_path = config_dir.join(theme_name).join("v1").join("accent");
+
         match fs::read_to_string(&accent_path) {
             Ok(content) => Self::parse_accent_color(&content),
             Err(e) => {
@@ -149,7 +146,7 @@ impl CosmicTheme {
             }
         }
     }
-    
+
     /// Parse the RON-format accent color configuration.
     ///
     /// The format looks like:
@@ -170,7 +167,7 @@ impl CosmicTheme {
     /// to avoid adding a RON dependency.
     fn parse_accent_color(content: &str) -> ThemeColor {
         let mut color = ThemeColor::default();
-        
+
         // Find the "base:" section
         if let Some(base_start) = content.find("base:") {
             // Find the opening paren after "base:"
@@ -178,8 +175,9 @@ impl CosmicTheme {
                 let base_section_start = base_start + paren_start;
                 // Find the closing paren for the base section
                 if let Some(paren_end) = content[base_section_start..].find(')') {
-                    let base_section = &content[base_section_start..base_section_start + paren_end + 1];
-                    
+                    let base_section =
+                        &content[base_section_start..base_section_start + paren_end + 1];
+
                     // Parse individual color components
                     if let Some(red) = Self::extract_float(base_section, "red:") {
                         color.red = red;
@@ -196,29 +194,29 @@ impl CosmicTheme {
                 }
             }
         }
-        
+
         color
     }
-    
+
     /// Extract a float value following a key like "red:"
     fn extract_float(content: &str, key: &str) -> Option<f64> {
         content.find(key).and_then(|pos| {
             let start = pos + key.len();
             let remaining = &content[start..];
-            
+
             // Skip whitespace
             let trimmed = remaining.trim_start();
-            
+
             // Find the end of the number (comma or paren)
             let end = trimmed
                 .find(|c: char| c == ',' || c == ')' || c == '\n')
                 .unwrap_or(trimmed.len());
-            
+
             let num_str = trimmed[..end].trim();
             num_str.parse::<f64>().ok()
         })
     }
-    
+
     /// Get text color appropriate for the current theme mode.
     ///
     /// Returns white for dark mode, dark gray for light mode.
@@ -229,7 +227,7 @@ impl CosmicTheme {
             (0.1, 0.1, 0.1)
         }
     }
-    
+
     /// Get secondary/muted text color appropriate for the current theme mode.
     pub fn secondary_text_color(&self) -> (f64, f64, f64) {
         if self.is_dark {
@@ -238,7 +236,7 @@ impl CosmicTheme {
             (0.4, 0.4, 0.4)
         }
     }
-    
+
     /// Get background color for panels/cards appropriate for the current theme mode.
     pub fn panel_background(&self) -> (f64, f64, f64, f64) {
         if self.is_dark {
@@ -247,7 +245,7 @@ impl CosmicTheme {
             (0.95, 0.95, 0.97, 0.85)
         }
     }
-    
+
     /// Get border color appropriate for the current theme mode.
     pub fn border_color(&self) -> (f64, f64, f64, f64) {
         if self.is_dark {
@@ -256,7 +254,7 @@ impl CosmicTheme {
             (0.7, 0.7, 0.75, 0.9)
         }
     }
-    
+
     /// Get progress bar background color appropriate for the current theme mode.
     pub fn progress_background(&self) -> (f64, f64, f64, f64) {
         if self.is_dark {
@@ -265,12 +263,12 @@ impl CosmicTheme {
             (0.8, 0.8, 0.82, 0.9)
         }
     }
-    
+
     /// Get the accent color as RGB tuple
     pub fn accent_rgb(&self) -> (f64, f64, f64) {
         (self.accent.red, self.accent.green, self.accent.blue)
     }
-    
+
     /// Get the accent color as RGBA tuple
     pub fn accent_rgba(&self, alpha: f64) -> (f64, f64, f64, f64) {
         (self.accent.red, self.accent.green, self.accent.blue, alpha)
@@ -280,7 +278,7 @@ impl CosmicTheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_accent_color() {
         let content = r#"(
@@ -297,14 +295,14 @@ mod tests {
         alpha: 1.0,
     ),
 )"#;
-        
+
         let color = CosmicTheme::parse_accent_color(content);
         assert!((color.red - 0.41572583).abs() < 0.001);
         assert!((color.green - 0.35830325).abs() < 0.001);
         assert!((color.blue - 0.7028036).abs() < 0.001);
         assert!((color.alpha - 1.0).abs() < 0.001);
     }
-    
+
     #[test]
     fn test_default_theme() {
         let theme = CosmicTheme::default();

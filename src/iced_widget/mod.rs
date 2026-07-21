@@ -7,13 +7,12 @@ mod stats;
 mod translate;
 mod view;
 
-use crate::config::{Config, WidgetSection};
+use crate::config::{Config, UPDATE_INTERVAL_MS, WidgetSection};
 use crate::media::{MultiPlayerState, PlaybackStatus, PlayerId};
 use chrono::{DateTime, Local};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::platform_specific::runtime::wayland::{
-    self,
-    CornerRadius,
+    self, CornerRadius,
     layer_surface::{IcedMargin, SctkLayerSurfaceSettings},
 };
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
@@ -29,6 +28,7 @@ const APP_ID: &str = "com.github.zoliviragh.CosmicWidget.Iced";
 const SURFACE_WIDTH: u32 = 370;
 const BASE_SURFACE_HEIGHT: u32 = 556;
 const NETWORK_SECTION_HEIGHT: u32 = 120;
+const DISK_IO_SECTION_HEIGHT: u32 = 120;
 const EMPTY_STORAGE_HEIGHT: u32 = 63;
 const STORAGE_SECTION_HEIGHT: u32 = 38;
 const STORAGE_ITEM_HEIGHT: u32 = 62;
@@ -45,11 +45,9 @@ const NOTIFICATION_LINE_HEIGHT: u32 = 17;
 const NOTIFICATION_CHARS_PER_LINE: usize = 32;
 const NOTIFICATION_EXPANSION_DURATION: Duration = Duration::from_millis(220);
 const NOTIFICATION_GROUP_EXPANSION_DURATION: Duration = Duration::from_millis(320);
-const EMPTY_MEDIA_HEIGHT: u32 = 83;
+const EMPTY_MEDIA_HEIGHT: u32 = 95;
 const MEDIA_SECTION_HEIGHT: u32 = 248;
 const MEDIA_CONTROL_GRACE: Duration = Duration::from_secs(2);
-const MIN_UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
-const MAX_UI_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const UI_TICK_SETTLE_DELAY: Duration = Duration::from_millis(5);
 const CORNER_RADIUS_STARTUP_DELAY: Duration = Duration::from_secs(1);
 
@@ -140,9 +138,7 @@ impl ExpansionAnimation {
         let Some(started_at) = self.started_at else {
             return false;
         };
-        let linear = now
-            .saturating_duration_since(started_at)
-            .as_secs_f32()
+        let linear = now.saturating_duration_since(started_at).as_secs_f32()
             / self.active_duration.as_secs_f32();
         let t = linear.clamp(0.0, 1.0);
         let eased = if self.linear {
@@ -213,9 +209,7 @@ impl ScrollAnimation {
         let Some(started_at) = self.started_at else {
             return false;
         };
-        let linear = now
-            .saturating_duration_since(started_at)
-            .as_secs_f32()
+        let linear = now.saturating_duration_since(started_at).as_secs_f32()
             / NOTIFICATION_EXPANSION_DURATION.as_secs_f32();
         let t = linear.clamp(0.0, 1.0);
         let eased = t * t * (3.0 - 2.0 * t);
@@ -277,6 +271,8 @@ struct App {
     media_seek_preview: Option<f64>,
     media_timeline_hovered: bool,
     pending_playback: Option<PendingPlayback>,
+    overlay_cursor: Point,
+    overlay_drag_cursor: Option<Point>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +291,10 @@ pub enum Message {
     MediaSeekChanged(f64),
     CommitMediaSeek,
     NotificationScrolled(f32),
+    OverlayPointerMoved(Point),
+    BeginOverlayDrag,
+    EndOverlayDrag,
+    PinOverlay,
 }
 
 impl App {
@@ -303,12 +303,15 @@ impl App {
             cosmic_config::Config::new("com.github.zoliviragh.CosmicWidget", Config::VERSION).ok();
         let mut config = config_handler
             .as_ref()
-            .and_then(|handler| Config::get_entry(handler).ok())
+            .map(|handler| match Config::get_entry(handler) {
+                Ok(config) => config,
+                Err((_errors, config)) => config,
+            })
             .unwrap_or_default();
-        config.ensure_network_section();
+        config.ensure_all_sections();
         let sampler = StatsSampler::spawn(
-            config.update_interval_ms,
             config.show_weather,
+            config.enable_solaar_integration,
             config.weather_location.clone(),
             config.max_notifications,
             config.cider_api_token.clone(),
@@ -368,6 +371,8 @@ impl App {
                 media_seek_preview: None,
                 media_timeline_hovered: false,
                 pending_playback: None,
+                overlay_cursor: Point::ORIGIN,
+                overlay_drag_cursor: None,
             },
             create_surface,
         )
@@ -421,9 +426,7 @@ impl App {
                 if self
                     .expanded_notification_group
                     .as_ref()
-                    .is_some_and(|source| {
-                        notification_group_size(&self.snapshot, source) < 2
-                    })
+                    .is_some_and(|source| notification_group_size(&self.snapshot, source) < 2)
                 {
                     self.expanded_notification_group = None;
                     self.notification_group_expansion.reset();
@@ -437,30 +440,39 @@ impl App {
                 }
 
                 if let Some(handler) = &self.config_handler {
-                    if let Ok(mut config) = Config::get_entry(handler) {
-                        config.ensure_network_section();
-                        if config != self.config {
-                            let position_changed = config.widget_x != self.config.widget_x
-                                || config.widget_y != self.config.widget_y;
-                            self.sampler.set_interval(config.update_interval_ms);
-                            self.sampler.set_weather_config(
-                                config.show_weather,
-                                config.weather_location.clone(),
-                            );
-                            if config.cider_api_token != self.config.cider_api_token {
-                                self.sampler.set_cider_token(config.cider_api_token.clone());
-                            }
-                            self.config = config;
+                    let mut config =
+                        Config::get_entry(handler).unwrap_or_else(|(_errors, config)| config);
+                    config.ensure_all_sections();
+                    if self.config.widget_movable && config.widget_movable {
+                        config.widget_x = self.config.widget_x;
+                        config.widget_y = self.config.widget_y;
+                    }
+                    if config != self.config {
+                        crate::widget_logging::set_enabled(config.enable_logging);
+                        let position_changed = config.widget_x != self.config.widget_x
+                            || config.widget_y != self.config.widget_y;
+                        self.sampler.set_weather_config(
+                            config.show_weather,
+                            config.weather_location.clone(),
+                        );
+                        self.sampler
+                            .set_solaar_enabled(config.enable_solaar_integration);
+                        if config.cider_api_token != self.config.cider_api_token {
+                            self.sampler.set_cider_token(config.cider_api_token.clone());
+                        }
+                        self.config = config;
+                        if !self.config.widget_movable {
+                            self.overlay_drag_cursor = None;
+                        }
 
-                            if position_changed {
-                                tasks.push(layer_surface::set_margin(
-                                    self.surface_id,
-                                    self.config.widget_y,
-                                    0,
-                                    0,
-                                    self.config.widget_x,
-                                ));
-                            }
+                        if position_changed {
+                            tasks.push(layer_surface::set_margin(
+                                self.surface_id,
+                                self.config.widget_y,
+                                0,
+                                0,
+                                self.config.widget_x,
+                            ));
                         }
                     }
                 }
@@ -490,11 +502,7 @@ impl App {
                     }
                 }
                 if frosted_changed && !size_changed {
-                    tasks.push(set_surface_blur(
-                        self.surface_id,
-                        frosted,
-                        surface_height,
-                    ));
+                    tasks.push(set_surface_blur(self.surface_id, frosted, surface_height));
                 }
             }
             Message::AnimationTick => {
@@ -506,13 +514,11 @@ impl App {
                 let mut completed_dismissals = Vec::new();
                 self.dismissing_notifications.retain_mut(|dismissal| {
                     dismissal.animation.advance(now);
-                    let completed = !dismissal.animation.is_animating()
-                        && dismissal.animation.target == 1.0;
+                    let completed =
+                        !dismissal.animation.is_animating() && dismissal.animation.target == 1.0;
                     if completed {
-                        completed_dismissals.push((
-                            dismissal.key.clone(),
-                            dismissal.source.clone(),
-                        ));
+                        completed_dismissals
+                            .push((dismissal.key.clone(), dismissal.source.clone()));
                     }
                     !completed
                 });
@@ -520,9 +526,9 @@ impl App {
                 for (key, source) in completed_dismissals {
                     self.sampler
                         .dismiss_notification(&key.app_name, key.timestamp);
-                    self.snapshot.notifications.retain(|notification| {
-                        !key.matches(notification)
-                    });
+                    self.snapshot
+                        .notifications
+                        .retain(|notification| !key.matches(notification));
                     if self.expanded_notification.as_ref() == Some(&key) {
                         self.expanded_notification = None;
                         self.notification_expansion.reset();
@@ -721,6 +727,41 @@ impl App {
                     self.snapshot.media = self.sampler.media_state();
                 }
             }
+            Message::OverlayPointerMoved(position) => {
+                self.overlay_cursor = position;
+                if self.config.widget_movable
+                    && let Some(drag_origin) = self.overlay_drag_cursor
+                {
+                    let (x, y) = dragged_overlay_position(
+                        self.config.widget_x,
+                        self.config.widget_y,
+                        drag_origin,
+                        position,
+                    );
+                    if x != self.config.widget_x || y != self.config.widget_y {
+                        self.config.widget_x = x;
+                        self.config.widget_y = y;
+                        tasks.push(layer_surface::set_margin(self.surface_id, y, 0, 0, x));
+                    }
+                }
+            }
+            Message::BeginOverlayDrag => {
+                if self.config.widget_movable {
+                    self.overlay_drag_cursor = Some(self.overlay_cursor);
+                }
+            }
+            Message::EndOverlayDrag => {
+                self.overlay_drag_cursor = None;
+            }
+            Message::PinOverlay => {
+                self.overlay_drag_cursor = None;
+                self.config.widget_movable = false;
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.write_entry(handler)
+                {
+                    log::error!("Failed to save the pinned overlay position: {error}");
+                }
+            }
         }
 
         Task::batch(tasks)
@@ -769,7 +810,7 @@ impl App {
     }
 
     fn ui_tick_interval(&self) -> Duration {
-        ui_tick_interval(self.config.update_interval_ms)
+        Duration::from_millis(UPDATE_INTERVAL_MS)
     }
 
     fn target_surface_height(&self) -> u32 {
@@ -784,8 +825,10 @@ impl App {
     }
 }
 
-fn ui_tick_interval(configured_ms: u64) -> Duration {
-    Duration::from_millis(configured_ms).clamp(MIN_UI_TICK_INTERVAL, MAX_UI_TICK_INTERVAL)
+fn dragged_overlay_position(x: i32, y: i32, previous: Point, current: Point) -> (i32, i32) {
+    let delta_x = (current.x - previous.x).round() as i32;
+    let delta_y = (current.y - previous.y).round() as i32;
+    (x.saturating_add(delta_x), y.saturating_add(delta_y))
 }
 
 fn aligned_tick_stream(interval: &Duration) -> impl iced::futures::Stream<Item = ()> + use<> {
@@ -871,9 +914,66 @@ fn set_surface_corners(id: window::Id, corners: CornerRadius) -> Task<Message> {
 }
 
 fn set_surface_blur(id: window::Id, enabled: bool, height: u32) -> Task<Message> {
-    let region = enabled.then(|| vec![surface_region(height)]);
+    let region = enabled.then(|| rounded_surface_regions(height, overlay_corners()));
 
     blur::blur(id, region).discard()
+}
+
+fn rounded_surface_regions(height: u32, corners: CornerRadius) -> Vec<Rectangle> {
+    let max_radius = SURFACE_WIDTH.min(height) / 2;
+    let top_left = corners.top_left.min(max_radius);
+    let top_right = corners.top_right.min(max_radius);
+    let bottom_left = corners.bottom_left.min(max_radius);
+    let bottom_right = corners.bottom_right.min(max_radius);
+    let top_rows = top_left.max(top_right);
+    let bottom_rows = bottom_left.max(bottom_right);
+    let mut regions = Vec::with_capacity((top_rows + bottom_rows + 1) as usize);
+
+    for row in 0..top_rows {
+        regions.push(rounded_region_row(
+            row,
+            corner_inset(top_left, row),
+            corner_inset(top_right, row),
+        ));
+    }
+
+    let middle_height = height.saturating_sub(top_rows + bottom_rows);
+    if middle_height > 0 {
+        regions.push(Rectangle::new(
+            Point::new(0.0, top_rows as f32),
+            Size::new(SURFACE_WIDTH as f32, middle_height as f32),
+        ));
+    }
+
+    for row in 0..bottom_rows {
+        regions.push(rounded_region_row(
+            height - row - 1,
+            corner_inset(bottom_left, row),
+            corner_inset(bottom_right, row),
+        ));
+    }
+
+    regions
+}
+
+fn rounded_region_row(y: u32, left_inset: u32, right_inset: u32) -> Rectangle {
+    Rectangle::new(
+        Point::new(left_inset as f32, y as f32),
+        Size::new(
+            SURFACE_WIDTH.saturating_sub(left_inset + right_inset) as f32,
+            1.0,
+        ),
+    )
+}
+
+fn corner_inset(radius: u32, row_from_edge: u32) -> u32 {
+    if radius == 0 || row_from_edge >= radius {
+        return 0;
+    }
+
+    let radius = radius as f32;
+    let distance = radius - (row_from_edge as f32 + 0.5);
+    (radius - (radius * radius - distance * distance).sqrt()).ceil() as u32
 }
 
 fn set_surface_regions(id: window::Id, height: u32, frosted: bool) -> Task<Message> {
@@ -891,16 +991,14 @@ fn surface_region(height: u32) -> Rectangle {
 }
 
 fn set_surface_input_zone(id: window::Id, height: u32) -> Task<Message> {
-    cosmic::iced::runtime::task::effect(
-        cosmic::iced::runtime::Action::PlatformSpecific(
-            cosmic::iced::runtime::platform_specific::Action::Wayland(
-                wayland::Action::LayerSurface(wayland::layer_surface::Action::InputZone {
-                    id,
-                    zone: Some(vec![surface_region(height)]),
-                }),
-            ),
-        ),
-    )
+    cosmic::iced::runtime::task::effect(cosmic::iced::runtime::Action::PlatformSpecific(
+        cosmic::iced::runtime::platform_specific::Action::Wayland(wayland::Action::LayerSurface(
+            wayland::layer_surface::Action::InputZone {
+                id,
+                zone: Some(vec![surface_region(height)]),
+            },
+        )),
+    ))
 }
 
 fn desired_surface_height(config: &Config, snapshot: &SystemSnapshot) -> u32 {
@@ -918,8 +1016,16 @@ fn desired_surface_height_with_expansion(
         snapshot,
         expanded_notification,
         expanded_notification_group,
-        if expanded_notification.is_some() { 1.0 } else { 0.0 },
-        if expanded_notification_group.is_some() { 1.0 } else { 0.0 },
+        if expanded_notification.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+        if expanded_notification_group.is_some() {
+            1.0
+        } else {
+            0.0
+        },
     )
 }
 
@@ -940,6 +1046,16 @@ fn desired_surface_height_with_animation(
 
     if network_visible {
         height += NETWORK_SECTION_HEIGHT as f32;
+    }
+
+    let disk_io_visible = config.show_disk
+        && config
+            .section_order
+            .iter()
+            .any(|section| matches!(section, WidgetSection::DiskIo));
+
+    if disk_io_visible {
+        height += DISK_IO_SECTION_HEIGHT as f32;
     }
 
     let storage_visible = config.show_storage
@@ -1087,7 +1203,11 @@ fn notification_viewport_height(
         snapshot,
         expanded_notification,
         expanded_group,
-        if expanded_notification.is_some() { 1.0 } else { 0.0 },
+        if expanded_notification.is_some() {
+            1.0
+        } else {
+            0.0
+        },
         if expanded_group.is_some() { 1.0 } else { 0.0 },
     )
     .round() as u32
@@ -1125,8 +1245,8 @@ fn notification_viewport_height_with_animation(
         as f32
         * notification_progress.clamp(0.0, 1.0)
         * selected_group_progress;
-    let content_height = NOTIFICATION_ITEM_HEIGHT as f32 * (compact_rows + group_rows)
-        + expanded_height;
+    let content_height =
+        NOTIFICATION_ITEM_HEIGHT as f32 * (compact_rows + group_rows) + expanded_height;
 
     content_height.min((NOTIFICATION_ITEM_HEIGHT * MAX_VISIBLE_NOTIFICATION_ROWS) as f32)
 }
@@ -1178,11 +1298,12 @@ fn estimated_wrapped_lines(text: &str, line_width: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_SURFACE_HEIGHT, ExpansionAnimation, NETWORK_SECTION_HEIGHT,
-        NOTIFICATION_EXPANSION_DURATION, NotificationKey, PendingPlayback, ScrollAnimation,
-        UI_TICK_SETTLE_DELAY, delay_until_next_tick, desired_surface_height,
-        desired_surface_height_with_expansion, notification_viewport_height_with_animation,
-        reconcile_media_state, ui_tick_interval,
+        BASE_SURFACE_HEIGHT, DISK_IO_SECTION_HEIGHT, ExpansionAnimation, NETWORK_SECTION_HEIGHT,
+        NOTIFICATION_EXPANSION_DURATION, NotificationKey, PendingPlayback, SURFACE_WIDTH,
+        ScrollAnimation, UI_TICK_SETTLE_DELAY, delay_until_next_tick, desired_surface_height,
+        desired_surface_height_with_expansion, dragged_overlay_position,
+        notification_viewport_height_with_animation, reconcile_media_state,
+        rounded_surface_regions,
     };
     use crate::battery::BatteryDevice;
     use crate::config::{Config, WidgetSection};
@@ -1190,13 +1311,30 @@ mod tests {
     use crate::notifications::Notification;
     use crate::storage::DiskInfo;
     use crate::weather::WeatherData;
+    use cosmic::iced::platform_specific::runtime::wayland::CornerRadius;
     use std::time::{Duration, Instant};
 
     #[test]
-    fn ui_ticks_follow_the_configured_rate_without_exceeding_one_second() {
-        assert_eq!(ui_tick_interval(100), Duration::from_millis(250));
-        assert_eq!(ui_tick_interval(500), Duration::from_millis(500));
-        assert_eq!(ui_tick_interval(5_000), Duration::from_secs(1));
+    fn frosted_blur_region_excludes_rounded_corners() {
+        let corners = CornerRadius {
+            top_left: 16,
+            top_right: 16,
+            bottom_left: 16,
+            bottom_right: 16,
+        };
+
+        let regions = rounded_surface_regions(100, corners);
+        let top = regions.first().unwrap();
+        let middle = &regions[16];
+        let bottom = &regions[17];
+
+        assert!(top.x > 0.0);
+        assert!(top.width < SURFACE_WIDTH as f32);
+        assert_eq!((middle.x, middle.y), (0.0, 16.0));
+        assert_eq!(middle.width, SURFACE_WIDTH as f32);
+        assert_eq!(middle.height, 68.0);
+        assert_eq!((bottom.x, bottom.y), (top.x, 99.0));
+        assert_eq!(bottom.width, top.width);
     }
 
     #[test]
@@ -1210,6 +1348,32 @@ mod tests {
         assert_eq!(
             delay_until_next_tick(Duration::from_secs(2), interval),
             interval + UI_TICK_SETTLE_DELAY,
+        );
+    }
+
+    #[test]
+    fn overlay_dragging_uses_the_fixed_grab_point() {
+        assert_eq!(
+            dragged_overlay_position(
+                7250,
+                50,
+                cosmic::iced::Point::new(40.0, 30.0),
+                cosmic::iced::Point::new(55.4, 22.2),
+            ),
+            (7265, 42)
+        );
+    }
+
+    #[test]
+    fn compositor_catch_up_does_not_reverse_the_drag() {
+        let origin = cosmic::iced::Point::new(80.0, 40.0);
+        let moved =
+            dragged_overlay_position(7250, 50, origin, cosmic::iced::Point::new(90.0, 45.0));
+        assert_eq!(moved, (7260, 55));
+
+        assert_eq!(
+            dragged_overlay_position(moved.0, moved.1, origin, origin),
+            moved
         );
     }
 
@@ -1237,6 +1401,19 @@ mod tests {
         assert_eq!(
             desired_surface_height(&config, &super::SystemSnapshot::default()),
             BASE_SURFACE_HEIGHT + NETWORK_SECTION_HEIGHT
+        );
+    }
+
+    #[test]
+    fn surface_height_tracks_disk_io_visibility() {
+        let mut config = Config::default();
+        config.show_storage = false;
+        config.show_disk = true;
+        config.section_order = vec![WidgetSection::DiskIo];
+
+        assert_eq!(
+            desired_surface_height(&config, &super::SystemSnapshot::default()),
+            BASE_SURFACE_HEIGHT + DISK_IO_SECTION_HEIGHT
         );
     }
 
@@ -1343,9 +1520,8 @@ mod tests {
     #[test]
     fn notification_group_expansion_uses_a_slower_stable_transition() {
         let started = Instant::now();
-        let mut animation = ExpansionAnimation::with_duration(
-            super::NOTIFICATION_GROUP_EXPANSION_DURATION,
-        );
+        let mut animation =
+            ExpansionAnimation::with_duration(super::NOTIFICATION_GROUP_EXPANSION_DURATION);
 
         animation.transition_to(1.0, started);
         animation.advance(started + NOTIFICATION_EXPANSION_DURATION);
@@ -1451,7 +1627,7 @@ mod tests {
             media(),
         ));
 
-        assert_eq!(empty_height, 639);
+        assert_eq!(empty_height, 651);
         assert_eq!(desired_surface_height(&config, &snapshot), 804);
 
         snapshot.media.players.push((

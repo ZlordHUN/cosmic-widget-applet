@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::config::TemperatureGaugeStyle;
 use cosmic::iced::advanced::widget::tree::{self, Tree};
 use cosmic::iced::advanced::{self, Clipboard, Layout, Shell, Widget, layout, renderer};
 use cosmic::iced::widget::{Stack, canvas};
@@ -15,14 +16,25 @@ const TRACK_WIDTH: f32 = 8.0;
 const BAR_HEIGHT: f32 = 8.0;
 const START_ANGLE: f32 = 3.0 * PI / 4.0;
 const SWEEP_ANGLE: f32 = 3.0 * PI / 2.0;
-const ANIMATION_LAG: Duration = Duration::from_millis(120);
-const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const ANIMATION_LAG: Duration = Duration::from_millis(280);
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_ANIMATION_FRAME_DELTA: Duration = Duration::from_millis(100);
 const SNAP_THRESHOLD: f32 = 0.0005;
 
-pub fn temperature_gauge(value: f32) -> Element<'static, super::Message> {
+fn gauge_angles(style: TemperatureGaugeStyle) -> (f32, f32) {
+    match style {
+        TemperatureGaugeStyle::Arc => (START_ANGLE, SWEEP_ANGLE),
+        TemperatureGaugeStyle::Circular => (-PI / 2.0, 2.0 * PI),
+        TemperatureGaugeStyle::Text => (START_ANGLE, SWEEP_ANGLE),
+    }
+}
+
+pub fn temperature_gauge(
+    value: f32,
+    style: TemperatureGaugeStyle,
+) -> Element<'static, super::Message> {
     let value = value.clamp(0.0, 100.0);
-    let ring: Element<'static, super::Message> = TemperatureArc::new(value / 100.0).into();
+    let ring: Element<'static, super::Message> = TemperatureGauge::new(value / 100.0, style).into();
     let value: Element<'static, super::Message> =
         widget::container(widget::text::title4(format_temperature(value)))
             .center_x(Length::Fixed(GAUGE_SIZE))
@@ -40,14 +52,16 @@ fn format_temperature(value: f32) -> String {
     format!("{value:.0}\u{b0}C")
 }
 
-struct TemperatureArc {
+struct TemperatureGauge {
     target: f32,
+    style: TemperatureGaugeStyle,
 }
 
-impl TemperatureArc {
-    fn new(target: f32) -> Self {
+impl TemperatureGauge {
+    fn new(target: f32, style: TemperatureGaugeStyle) -> Self {
         Self {
             target: target.clamp(0.0, 1.0),
+            style,
         }
     }
 }
@@ -62,6 +76,7 @@ struct State {
 struct TemperatureState {
     progress: State,
     cache: canvas::Cache<Renderer>,
+    style: TemperatureGaugeStyle,
 }
 
 impl State {
@@ -192,7 +207,7 @@ where
     }
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for TemperatureArc
+impl<Message> Widget<Message, Theme, Renderer> for TemperatureGauge
 where
     Message: Clone,
 {
@@ -230,6 +245,11 @@ where
     ) {
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
             let state = tree.state.downcast_mut::<TemperatureState>();
+            let style_changed = state.style != self.style;
+            if style_changed {
+                state.style = self.style;
+                state.cache.clear();
+            }
             if state.progress.update(self.target, *now) {
                 state.cache.clear();
                 shell.request_redraw_at(*now + ANIMATION_FRAME_INTERVAL);
@@ -258,25 +278,60 @@ where
         let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
             let radius = (GAUGE_SIZE - TRACK_WIDTH) / 2.0;
 
-            stroke_arc(
-                frame,
-                radius,
-                START_ANGLE,
-                START_ANGLE + SWEEP_ANGLE,
-                track,
-                canvas::LineCap::Butt,
-            );
-            fill_arc_cap(frame, radius, START_ANGLE + SWEEP_ANGLE, track);
+            match self.style {
+                TemperatureGaugeStyle::Arc => {
+                    stroke_arc(
+                        frame,
+                        radius,
+                        START_ANGLE,
+                        START_ANGLE + SWEEP_ANGLE,
+                        track,
+                        canvas::LineCap::Butt,
+                    );
+                    fill_arc_cap(frame, radius, START_ANGLE + SWEEP_ANGLE, track);
+                }
+                TemperatureGaugeStyle::Circular => {
+                    frame.stroke(
+                        &canvas::Path::circle(frame.center(), radius),
+                        canvas::Stroke::default()
+                            .with_color(track)
+                            .with_width(TRACK_WIDTH),
+                    );
+                }
+                TemperatureGaugeStyle::Text => {
+                    stroke_arc(
+                        frame,
+                        radius,
+                        START_ANGLE,
+                        START_ANGLE + SWEEP_ANGLE,
+                        track,
+                        canvas::LineCap::Butt,
+                    );
+                    fill_arc_cap(frame, radius, START_ANGLE + SWEEP_ANGLE, track);
+                }
+            }
+
             if current > SNAP_THRESHOLD {
-                stroke_arc(
-                    frame,
-                    radius,
-                    START_ANGLE,
-                    START_ANGLE + SWEEP_ANGLE * current,
-                    active,
-                    canvas::LineCap::Round,
-                );
-            } else {
+                let (start, sweep) = gauge_angles(self.style);
+                if self.style == TemperatureGaugeStyle::Circular && current >= 1.0 - SNAP_THRESHOLD
+                {
+                    frame.stroke(
+                        &canvas::Path::circle(frame.center(), radius),
+                        canvas::Stroke::default()
+                            .with_color(active)
+                            .with_width(TRACK_WIDTH),
+                    );
+                } else {
+                    stroke_arc(
+                        frame,
+                        radius,
+                        start,
+                        start + sweep * current,
+                        active,
+                        canvas::LineCap::Round,
+                    );
+                }
+            } else if self.style == TemperatureGaugeStyle::Arc {
                 fill_arc_cap(frame, radius, START_ANGLE, track);
             }
         });
@@ -289,12 +344,12 @@ where
     }
 }
 
-impl<'a, Message> From<TemperatureArc> for cosmic::iced::Element<'a, Message, Theme, Renderer>
+impl<'a, Message> From<TemperatureGauge> for cosmic::iced::Element<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
 {
-    fn from(arc: TemperatureArc) -> Self {
-        Self::new(arc)
+    fn from(gauge: TemperatureGauge) -> Self {
+        Self::new(gauge)
     }
 }
 
@@ -362,7 +417,11 @@ fn indicator_band(value: f32) -> IndicatorBand {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndicatorBand, State, format_temperature, indicator_band};
+    use super::{
+        ANIMATION_FRAME_INTERVAL, IndicatorBand, State, format_temperature, gauge_angles,
+        indicator_band,
+    };
+    use crate::config::TemperatureGaugeStyle;
     use cosmic::iced::time::Instant;
     use std::time::Duration;
 
@@ -380,6 +439,18 @@ mod tests {
     }
 
     #[test]
+    fn progress_does_not_front_load_target_changes() {
+        let start = Instant::now();
+        let mut state = State::default();
+        state.update(0.0, start);
+
+        state.update(1.0, start + ANIMATION_FRAME_INTERVAL);
+
+        assert!(state.current > 0.0);
+        assert!(state.current < 0.1);
+    }
+
+    #[test]
     fn temperature_label_identifies_celsius() {
         assert_eq!(format_temperature(63.4), "63\u{b0}C");
     }
@@ -390,5 +461,14 @@ mod tests {
         assert_eq!(indicator_band(50.0), IndicatorBand::Warning);
         assert_eq!(indicator_band(79.9), IndicatorBand::Warning);
         assert_eq!(indicator_band(80.0), IndicatorBand::Danger);
+    }
+
+    #[test]
+    fn circular_style_uses_a_complete_ring() {
+        let (_, arc_sweep) = gauge_angles(TemperatureGaugeStyle::Arc);
+        let (_, circular_sweep) = gauge_angles(TemperatureGaugeStyle::Circular);
+
+        assert!((arc_sweep - 3.0 * std::f32::consts::PI / 2.0).abs() < f32::EPSILON);
+        assert!((circular_sweep - 2.0 * std::f32::consts::PI).abs() < f32::EPSILON);
     }
 }

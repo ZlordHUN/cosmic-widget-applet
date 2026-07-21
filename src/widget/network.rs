@@ -34,8 +34,8 @@
 //! - **First update**: No previous data, so rate starts at 0
 //! - **Interface changes**: The interface list is rediscovered every 30 seconds
 
-use sysinfo::Networks;
 use std::time::{Duration, Instant};
+use sysinfo::Networks;
 
 const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 

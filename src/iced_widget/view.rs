@@ -9,8 +9,8 @@ use crate::notifications::Notification;
 use crate::storage::DiskInfo;
 use crate::weather::WeatherData;
 use chrono::{DateTime, Local};
-use cosmic::iced::{Alignment, Background, Border, Color, ContentFit, Length};
 use cosmic::iced::core::image::FilterMethod;
+use cosmic::iced::{Alignment, Background, Border, Color, ContentFit, Length, mouse};
 use cosmic::{Element, theme, widget};
 use std::rc::Rc;
 
@@ -66,11 +66,12 @@ pub fn widget_view<'a>(
                 spacing.space_xs,
                 spacing.space_xs,
             )),
-            WidgetSection::Network if config.show_network => Some(network_view(
-                stats,
-                spacing.space_xs,
-                spacing.space_xs,
-            )),
+            WidgetSection::Network if config.show_network => {
+                Some(network_view(stats, spacing.space_xs, spacing.space_xs))
+            }
+            WidgetSection::DiskIo if config.show_disk => {
+                Some(disk_io_view(stats, spacing.space_xs, spacing.space_xs))
+            }
             WidgetSection::Temperatures if show_temperatures(config) => Some(temperature_view(
                 config,
                 stats,
@@ -125,7 +126,7 @@ pub fn widget_view<'a>(
         }
     }
 
-    let overlay = widget::container(content)
+    let overlay: Element<'a, super::Message> = widget::container(content)
         .padding(spacing.space_m)
         .width(Length::Fill)
         .height(Length::Fixed(surface_height as f32))
@@ -134,7 +135,37 @@ pub fn widget_view<'a>(
             let mut style = theme::Container::background(cosmic, theme.transparent);
             style.border.radius = cosmic.corner_radii.radius_l.into();
             style
-        }));
+        }))
+        .into();
+
+    if config.widget_movable {
+        let drag_layer: Element<'a, super::Message> = widget::mouse_area(
+            widget::container(widget::space())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_move(super::Message::OverlayPointerMoved)
+        .on_press(super::Message::BeginOverlayDrag)
+        .on_release(super::Message::EndOverlayDrag)
+        .interaction(mouse::Interaction::Grab)
+        .into();
+        let pin = widget::button::icon(widget::icon::from_name("pin-symbolic"))
+            .class(theme::Button::Suggested)
+            .tooltip("Pin overlay")
+            .on_press(super::Message::PinOverlay);
+        let pin_layer: Element<'a, super::Message> = widget::container(pin)
+            .padding(8)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(cosmic::iced::alignment::Horizontal::Right)
+            .align_y(cosmic::iced::alignment::Vertical::Top)
+            .into();
+
+        return cosmic::iced::widget::Stack::with_children([overlay, drag_layer, pin_layer])
+            .width(Length::Fill)
+            .height(Length::Fixed(surface_height as f32))
+            .into();
+    }
 
     widget::column::with_children([overlay.into()])
         .width(Length::Fill)
@@ -256,8 +287,35 @@ fn network_rate_row<'a>(
         .push(widget::icon::from_name(icon_name).size(METRIC_ICON_SIZE))
         .push(widget::text::body(label))
         .push(widget::space::horizontal())
-        .push(widget::text::monotext(format_network_rate(bytes_per_second)))
+        .push(widget::text::monotext(format_network_rate(
+            bytes_per_second,
+        )))
         .into()
+}
+
+fn disk_io_view<'a>(
+    stats: &SystemSnapshot,
+    section_spacing: u16,
+    row_spacing: u16,
+) -> Element<'a, super::Message> {
+    section(
+        "drive-harddisk-solidstate-symbolic",
+        "Disk I/O",
+        section_spacing,
+    )
+    .push(network_rate_row(
+        "document-open-symbolic",
+        "Read",
+        stats.disk_read_rate,
+        row_spacing,
+    ))
+    .push(network_rate_row(
+        "document-save-symbolic",
+        "Write",
+        stats.disk_write_rate,
+        row_spacing,
+    ))
+    .into()
 }
 
 fn temperature_view<'a>(
@@ -266,15 +324,51 @@ fn temperature_view<'a>(
     section_spacing: u16,
     gauge_spacing: u16,
 ) -> Element<'a, super::Message> {
+    if config.temperature_gauge_style == crate::config::TemperatureGaugeStyle::Text {
+        let mut temperatures = section_with_icon(
+            embedded_symbolic_icon(
+                include_bytes!("../../assets/icons/temperature-filled-symbolic.svg"),
+                18,
+            ),
+            "Temperatures",
+            section_spacing,
+        );
+        if config.show_cpu_temp {
+            temperatures = temperatures.push(temperature_text_item(
+                MetricIcon::Cpu,
+                "CPU",
+                stats.cpu_temp,
+                gauge_spacing,
+            ));
+        }
+        if config.show_gpu_temp {
+            temperatures = temperatures.push(temperature_text_item(
+                MetricIcon::Gpu,
+                "GPU",
+                stats.gpu_temp,
+                gauge_spacing,
+            ));
+        }
+        return temperatures.into();
+    }
+
     let mut gauges = widget::row::with_capacity(2)
         .spacing(gauge_spacing)
         .align_y(Alignment::Center);
 
     if config.show_cpu_temp {
-        gauges = gauges.push(temperature_item("CPU", stats.cpu_temp));
+        gauges = gauges.push(temperature_item(
+            "CPU",
+            stats.cpu_temp,
+            config.temperature_gauge_style,
+        ));
     }
     if config.show_gpu_temp {
-        gauges = gauges.push(temperature_item("GPU", stats.gpu_temp));
+        gauges = gauges.push(temperature_item(
+            "GPU",
+            stats.gpu_temp,
+            config.temperature_gauge_style,
+        ));
     }
 
     section_with_icon(
@@ -285,8 +379,8 @@ fn temperature_view<'a>(
         "Temperatures",
         section_spacing,
     )
-        .push(gauges)
-        .into()
+    .push(widget::container(gauges).center_x(Length::Fill))
+    .into()
 }
 
 fn storage_view<'a>(
@@ -394,10 +488,8 @@ fn notifications_view<'a>(
                 let notification = group.notifications[0];
                 let expanded =
                     expanded_notification.is_some_and(|selected| selected.matches(notification));
-                let dismissal_progress = notification_dismissal_progress(
-                    dismissing_notifications,
-                    notification,
-                );
+                let dismissal_progress =
+                    notification_dismissal_progress(dismissing_notifications, notification);
                 let extra_height = if expanded {
                     super::notification_extra_height(notification) as f32
                         * notification_progress.clamp(0.0, 1.0)
@@ -438,10 +530,8 @@ fn notifications_view<'a>(
                 for notification in group.notifications {
                     let expanded = expanded_notification
                         .is_some_and(|selected| selected.matches(notification));
-                    let dismissal_progress = notification_dismissal_progress(
-                        dismissing_notifications,
-                        notification,
-                    );
+                    let dismissal_progress =
+                        notification_dismissal_progress(dismissing_notifications, notification);
                     let extra_height = if expanded {
                         super::notification_extra_height(notification) as f32
                             * notification_progress.clamp(0.0, 1.0)
@@ -483,23 +573,23 @@ fn notifications_view<'a>(
                 list,
                 notification_scroll_translation,
             ))
-                .width(Length::Fill)
-                .height(Length::Fixed(
-                    super::notification_viewport_height_with_animation(
-                        stats,
-                        expanded_notification,
-                        expanded_notification_group,
-                        notification_progress,
-                        notification_group_progress,
-                    ),
-                ))
-                .auto_scroll(true)
-                .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
-                    cosmic::iced::widget::scrollable::Scrollbar::hidden(),
-                ))
-                .on_scroll(|viewport| {
-                    super::Message::NotificationScrolled(viewport.absolute_offset().y)
-                }),
+            .width(Length::Fill)
+            .height(Length::Fixed(
+                super::notification_viewport_height_with_animation(
+                    stats,
+                    expanded_notification,
+                    expanded_notification_group,
+                    notification_progress,
+                    notification_group_progress,
+                ),
+            ))
+            .auto_scroll(true)
+            .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                cosmic::iced::widget::scrollable::Scrollbar::hidden(),
+            ))
+            .on_scroll(|viewport| {
+                super::Message::NotificationScrolled(viewport.absolute_offset().y)
+            }),
         );
     }
 
@@ -547,9 +637,8 @@ fn notification_list_entry<'a>(
     let mut entry = widget::column::with_capacity(2);
 
     if divided {
-        entry = entry.push(
-            widget::container(widget::divider::horizontal::default()).padding([0, 8]),
-        );
+        entry =
+            entry.push(widget::container(widget::divider::horizontal::default()).padding([0, 8]));
     }
 
     let entry: Element<'a, super::Message> = widget::container(entry.push(row))
@@ -673,17 +762,17 @@ fn notification_item<'a>(
             cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
         )
     };
-    let dismiss = widget::button::icon(
-        widget::icon::from_name("window-close-symbolic").size(14),
-    )
+    let dismiss = widget::button::icon(widget::icon::from_name("window-close-symbolic").size(14))
         .tooltip("Dismiss notification")
         .width(Length::Fixed(28.0))
         .height(Length::Fixed(28.0))
         .padding(5)
-        .on_press_maybe((!dismissing).then_some(super::Message::DismissNotification {
-            app_name: notification.app_name.clone(),
-            timestamp: notification.timestamp,
-        }));
+        .on_press_maybe(
+            (!dismissing).then_some(super::Message::DismissNotification {
+                app_name: notification.app_name.clone(),
+                timestamp: notification.timestamp,
+            }),
+        );
     let text = widget::column::with_capacity(2)
         .width(Length::Fill)
         .spacing(0)
@@ -790,12 +879,12 @@ fn media_content<'a>(
     let previous = widget::button::icon(
         widget::icon::from_name("media-skip-backward-symbolic").size(MEDIA_CONTROL_ICON_SIZE),
     )
-        .tooltip("Previous track")
-        .padding(MEDIA_CONTROL_PADDING)
-        .on_press_maybe(
-            info.can_go_previous
-                .then_some(super::Message::PreviousMedia),
-        );
+    .tooltip("Previous track")
+    .padding(MEDIA_CONTROL_PADDING)
+    .on_press_maybe(
+        info.can_go_previous
+            .then_some(super::Message::PreviousMedia),
+    );
     let play_pause_icon = match info.status {
         PlaybackStatus::Playing => "media-playback-pause-symbolic",
         PlaybackStatus::Paused | PlaybackStatus::Stopped => "media-playback-start-symbolic",
@@ -803,20 +892,18 @@ fn media_content<'a>(
     let play_pause = widget::button::icon(
         widget::icon::from_name(play_pause_icon).size(MEDIA_CONTROL_ICON_SIZE),
     )
-        .tooltip(match info.status {
-            PlaybackStatus::Playing => "Pause",
-            PlaybackStatus::Paused | PlaybackStatus::Stopped => "Play",
-        })
-        .padding(MEDIA_CONTROL_PADDING)
-        .on_press_maybe(
-            (info.can_play || info.can_pause).then_some(super::Message::PlayPauseMedia),
-        );
+    .tooltip(match info.status {
+        PlaybackStatus::Playing => "Pause",
+        PlaybackStatus::Paused | PlaybackStatus::Stopped => "Play",
+    })
+    .padding(MEDIA_CONTROL_PADDING)
+    .on_press_maybe((info.can_play || info.can_pause).then_some(super::Message::PlayPauseMedia));
     let next = widget::button::icon(
         widget::icon::from_name("media-skip-forward-symbolic").size(MEDIA_CONTROL_ICON_SIZE),
     )
-        .tooltip("Next track")
-        .padding(MEDIA_CONTROL_PADDING)
-        .on_press_maybe(info.can_go_next.then_some(super::Message::NextMedia));
+    .tooltip("Next track")
+    .padding(MEDIA_CONTROL_PADDING)
+    .on_press_maybe(info.can_go_next.then_some(super::Message::NextMedia));
     let controls = widget::row::with_capacity(3)
         .align_y(Alignment::Center)
         .spacing(MEDIA_CONTROL_SPACING)
@@ -854,18 +941,10 @@ fn media_content<'a>(
                     )
                 }),
                 hovered: Rc::new(|theme| {
-                    media_seek_style(
-                        theme,
-                        cosmic::iced::widget::slider::Status::Hovered,
-                        true,
-                    )
+                    media_seek_style(theme, cosmic::iced::widget::slider::Status::Hovered, true)
                 }),
                 dragging: Rc::new(|theme| {
-                    media_seek_style(
-                        theme,
-                        cosmic::iced::widget::slider::Status::Dragged,
-                        true,
-                    )
+                    media_seek_style(theme, cosmic::iced::widget::slider::Status::Dragged, true)
                 }),
             })
             .on_release(super::Message::CommitMediaSeek);
@@ -881,8 +960,8 @@ fn media_content<'a>(
             .width(Length::Fill)
             .into()
     };
-    let current_time = widget::container(widget::text::body(format_media_time(position)))
-        .width(Length::Fill);
+    let current_time =
+        widget::container(widget::text::body(format_media_time(position))).width(Length::Fill);
     let duration = widget::container(widget::text::body(format_media_time(info.duration)))
         .width(Length::Fill)
         .align_x(cosmic::iced::alignment::Horizontal::Right);
@@ -951,30 +1030,29 @@ fn media_source_selector<'a>(
 
 fn media_source_dot(active: bool) -> Element<'static, super::Message> {
     widget::container(widget::space())
-    .width(Length::Fixed(MEDIA_SOURCE_DOT_SIZE))
-    .height(Length::Fixed(MEDIA_SOURCE_DOT_SIZE))
-    .class(theme::Container::custom(move |theme| {
-        let cosmic = theme.cosmic();
-        let accent: Color = cosmic.accent_color().into();
-        let neutral: Color = cosmic.on_bg_color().into();
+        .width(Length::Fixed(MEDIA_SOURCE_DOT_SIZE))
+        .height(Length::Fixed(MEDIA_SOURCE_DOT_SIZE))
+        .class(theme::Container::custom(move |theme| {
+            let cosmic = theme.cosmic();
+            let accent: Color = cosmic.accent_color().into();
+            let neutral: Color = cosmic.on_bg_color().into();
 
-        cosmic::iced::widget::container::Style {
-            background: active.then_some(Background::Color(accent)),
-            border: Border {
-                color: Color { a: 0.55, ..neutral },
-                width: if active { 0.0 } else { 1.0 },
-                radius: [MEDIA_SOURCE_DOT_SIZE / 2.0; 4].into(),
-            },
-            ..Default::default()
-        }
-    }))
-    .into()
+            cosmic::iced::widget::container::Style {
+                background: active.then_some(Background::Color(accent)),
+                border: Border {
+                    color: Color { a: 0.55, ..neutral },
+                    width: if active { 0.0 } else { 1.0 },
+                    radius: [MEDIA_SOURCE_DOT_SIZE / 2.0; 4].into(),
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
 }
 
 fn media_artwork(art: Option<&AlbumArt>) -> Element<'static, super::Message> {
     if let Some(art) = art {
-        let is_video_art = u64::from(art.source_width) * 4
-            >= u64::from(art.source_height) * 5;
+        let is_video_art = u64::from(art.source_width) * 4 >= u64::from(art.source_height) * 5;
         let (width, height) = if is_video_art {
             (MEDIA_VIDEO_ARTWORK_WIDTH, MEDIA_VIDEO_ARTWORK_HEIGHT)
         } else {
@@ -1451,21 +1529,39 @@ fn metric_icon(icon: MetricIcon) -> Element<'static, super::Message> {
     embedded_symbolic_icon(bytes, METRIC_ICON_SIZE)
 }
 
-fn embedded_symbolic_icon(
-    bytes: &'static [u8],
-    size: u16,
-) -> Element<'static, super::Message> {
+fn embedded_symbolic_icon(bytes: &'static [u8], size: u16) -> Element<'static, super::Message> {
     let mut handle = widget::icon::from_svg_bytes(bytes);
     handle.symbolic = true;
     widget::icon::icon(handle).size(size).into()
 }
 
-fn temperature_item<'a>(label: &'a str, value: f32) -> Element<'a, super::Message> {
+fn temperature_item<'a>(
+    label: &'a str,
+    value: f32,
+    style: crate::config::TemperatureGaugeStyle,
+) -> Element<'a, super::Message> {
     widget::column::with_capacity(2)
         .align_x(Alignment::Center)
         .spacing(4)
-        .push(gauge::temperature_gauge(value))
+        .push(gauge::temperature_gauge(value, style))
         .push(widget::text::heading(label))
+        .into()
+}
+
+fn temperature_text_item<'a>(
+    icon: MetricIcon,
+    label: &'a str,
+    value: f32,
+    spacing: u16,
+) -> Element<'a, super::Message> {
+    widget::row::with_capacity(4)
+        .width(Length::Fill)
+        .align_y(Alignment::Center)
+        .spacing(spacing)
+        .push(metric_icon(icon))
+        .push(widget::text::body(label))
+        .push(widget::space::horizontal())
+        .push(widget::text::monotext(format!("{value:.0}°C")))
         .into()
 }
 
@@ -1536,10 +1632,7 @@ mod tests {
 
     #[test]
     fn weather_visuals_use_cosmic_condition_icons_and_compact_units() {
-        assert_eq!(
-            weather_icon_name("01n"),
-            "weather-clear-night-symbolic"
-        );
+        assert_eq!(weather_icon_name("01n"), "weather-clear-night-symbolic");
         assert_eq!(weather_icon_name("02d"), "weather-few-clouds-symbolic");
         assert_eq!(weather_icon_name("04d"), "weather-overcast-symbolic");
         assert_eq!(weather_icon_name("13d"), "weather-snow-symbolic");

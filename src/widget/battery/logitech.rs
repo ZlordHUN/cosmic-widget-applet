@@ -2,8 +2,8 @@
 
 //! Native Logitech battery readers for Linux power supplies and Bolt receivers.
 
-use std::fs::{self, File, OpenOptions};
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -108,10 +108,7 @@ impl Monitor {
                             handle = fresh_handle;
                             thread::sleep(Duration::from_millis(75));
                         }
-                        discovered = discover_paired_devices(
-                            &mut handle,
-                            paired_devices.clone(),
-                        );
+                        discovered = discover_paired_devices(&mut handle, paired_devices.clone());
                         if !discovered.is_empty() {
                             break;
                         }
@@ -128,11 +125,7 @@ impl Monitor {
 
         for device in &self.bolt_devices {
             let reading = query_unified_battery(&mut handle, device);
-            let state = state_from_bolt_reading(
-                device,
-                reading,
-                &mut self.last_bolt_readings,
-            );
+            let state = state_from_bolt_reading(device, reading, &mut self.last_bolt_readings);
             upsert_state(&mut states, state);
         }
 
@@ -225,13 +218,12 @@ fn normalize_power_status(status: String) -> Option<String> {
 
 fn infer_kind(name: &str) -> Option<String> {
     let name = name.to_ascii_lowercase();
-    let kind = if name.contains("keyboard")
-        || name.contains("mechanical")
-        || name.contains("keys")
+    let kind = if name.contains("keyboard") || name.contains("mechanical") || name.contains("keys")
     {
         "keyboard"
     } else if name.contains("mouse")
-        || name.starts_with('g') && name[1..].starts_with(|character: char| character.is_ascii_digit())
+        || name.starts_with('g')
+            && name[1..].starts_with(|character: char| character.is_ascii_digit())
         || name.contains("master")
         || name.contains("anywhere")
     {
@@ -267,7 +259,10 @@ fn parse_hid_id(uevent: &str) -> Option<(u16, u16)> {
     parts.next()?;
     let vendor_id = u32::from_str_radix(parts.next()?, 16).ok()?;
     let product_id = u32::from_str_radix(parts.next()?, 16).ok()?;
-    Some((u16::try_from(vendor_id).ok()?, u16::try_from(product_id).ok()?))
+    Some((
+        u16::try_from(vendor_id).ok()?,
+        u16::try_from(product_id).ok()?,
+    ))
 }
 
 fn open_hidraw(path: &Path) -> io::Result<File> {
@@ -309,7 +304,8 @@ fn paired_bolt_devices(handle: &mut File) -> Result<Vec<PairedDevice>, String> {
     let expected = connection
         .get(1)
         .copied()
-        .ok_or_else(|| "Bolt receiver connection count was missing".to_string())? as usize;
+        .ok_or_else(|| "Bolt receiver connection count was missing".to_string())?
+        as usize;
     let mut devices = Vec::with_capacity(expected);
 
     for slot in 1..=6 {
@@ -390,12 +386,7 @@ fn discover_device(handle: &mut File, paired: PairedDevice) -> Result<HidppDevic
 }
 
 fn feature_index(handle: &mut File, slot: u8, feature: u16) -> Result<u8, String> {
-    let response = hidpp_request(
-        handle,
-        slot,
-        HIDPP_SOFTWARE_ID,
-        &feature.to_be_bytes(),
-    )?;
+    let response = hidpp_request(handle, slot, HIDPP_SOFTWARE_ID, &feature.to_be_bytes())?;
     response
         .first()
         .copied()
@@ -416,8 +407,8 @@ fn query_device_name(handle: &mut File, slot: u8, feature: u8) -> Result<String,
     let mut name = Vec::with_capacity(length);
 
     while name.len() < length {
-        let offset = u8::try_from(name.len())
-            .map_err(|_| "HID++ device name is too long".to_string())?;
+        let offset =
+            u8::try_from(name.len()).map_err(|_| "HID++ device name is too long".to_string())?;
         let fragment = hidpp_request(
             handle,
             slot,
@@ -499,11 +490,7 @@ fn hidpp_request(
     send_hidpp_request(handle, HIDPP_LONG_REPORT_ID, slot, request_id, params)
 }
 
-fn receiver_request(
-    handle: &mut File,
-    request_id: u16,
-    params: &[u8],
-) -> Result<Vec<u8>, String> {
+fn receiver_request(handle: &mut File, request_id: u16, params: &[u8]) -> Result<Vec<u8>, String> {
     send_hidpp_request(handle, HIDPP_SHORT_REPORT_ID, 0xff, request_id, params)
 }
 
@@ -548,7 +535,10 @@ fn send_hidpp_request(
         };
         let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
         if ready < 0 {
-            return Err(format!("failed to poll HID++ receiver: {}", io::Error::last_os_error()));
+            return Err(format!(
+                "failed to poll HID++ receiver: {}",
+                io::Error::last_os_error()
+            ));
         }
         if ready == 0 {
             return Err(format!("HID++ request {request_id:#06x} timed out"));
@@ -563,29 +553,20 @@ fn send_hidpp_request(
         if read < 5 || response[1] != slot {
             continue;
         }
-        if response[2] == 0xff
-            && response[3] == packet[2]
-            && response[4] == packet[3]
-        {
+        if response[2] == 0xff && response[3] == packet[2] && response[4] == packet[3] {
             return Err(format!(
                 "HID++ request {request_id:#06x} failed with error {:#04x}",
                 response.get(5).copied().unwrap_or_default()
             ));
         }
-        if response[2] == 0x8f
-            && response[3] == packet[2]
-            && response[4] == packet[3]
-        {
+        if response[2] == 0x8f && response[3] == packet[2] && response[4] == packet[3] {
             return Err(format!(
                 "HID++ receiver request {request_id:#06x} failed with error {:#04x}",
                 response.get(5).copied().unwrap_or_default()
             ));
         }
         if response[2..4] == packet[2..4] {
-            if slot == 0xff
-                && request_id == 0x83b5
-                && response.get(4) != params.first()
-            {
+            if slot == 0xff && request_id == 0x83b5 && response.get(4) != params.first() {
                 continue;
             }
             return Ok(response[4..read].to_vec());
@@ -607,8 +588,8 @@ fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        HidppDevice, infer_kind, parse_bolt_product_id, parse_hid_id,
-        parse_unified_battery, state_from_bolt_reading,
+        HidppDevice, infer_kind, parse_bolt_product_id, parse_hid_id, parse_unified_battery,
+        state_from_bolt_reading,
     };
     use std::collections::HashMap;
 
@@ -646,9 +627,7 @@ mod tests {
     #[test]
     fn parses_bolt_receiver_product_id() {
         assert_eq!(
-            parse_bolt_product_id(&[
-                0x54, 0x01, 0x67, 0xb3, 0x79, 0x66, 0x51, 0xb5,
-            ]),
+            parse_bolt_product_id(&[0x54, 0x01, 0x67, 0xb3, 0x79, 0x66, 0x51, 0xb5,]),
             Some(0xb367)
         );
     }
@@ -668,11 +647,8 @@ mod tests {
             Ok((Some(20), Some("discharging".to_string()))),
             &mut readings,
         );
-        let sleeping = state_from_bolt_reading(
-            &device,
-            Err("device timed out".to_string()),
-            &mut readings,
-        );
+        let sleeping =
+            state_from_bolt_reading(&device, Err("device timed out".to_string()), &mut readings);
 
         assert_eq!(sleeping.level, awake.level);
         assert_eq!(sleeping.status, awake.status);
@@ -687,7 +663,11 @@ mod tests {
         let states = monitor.query();
         assert!(!states.is_empty());
         assert!(states.iter().any(|state| state.name == "G309 LIGHTSPEED"));
-        assert!(states.iter().any(|state| state.name == "MX Mechanical Mini"));
+        assert!(
+            states
+                .iter()
+                .any(|state| state.name == "MX Mechanical Mini")
+        );
         for state in &states {
             assert!(state.level.is_none_or(|level| level <= 100));
         }

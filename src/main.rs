@@ -38,19 +38,19 @@ fn main() -> cosmic::iced::Result {
     // This log file is shared with the widget process for unified debugging.
     // Note: Logging is always enabled for the applet (it's lightweight).
     use std::fs::OpenOptions;
-    
+
     let log_file = OpenOptions::new()
-        .create(true)      // Create file if it doesn't exist
-        .append(true)      // Append to existing content (don't truncate)
+        .create(true) // Create file if it doesn't exist
+        .append(true) // Append to existing content (don't truncate)
         .open("/tmp/cosmic-widget.log")
         .expect("Failed to open log file");
-    
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
-    
+
     log::info!("Starting COSMIC Monitor Applet");
-    
+
     // Initialize internationalization (i18n) support.
     // Uses the system's preferred language list to select the appropriate
     // translation files from the i18n/ directory.

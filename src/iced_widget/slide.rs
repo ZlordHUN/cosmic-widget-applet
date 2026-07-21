@@ -5,10 +5,7 @@ use cosmic::iced::advanced::{self, Layout, Widget, layout, renderer};
 use cosmic::iced::{Length, Rectangle, Size, Vector, mouse};
 use cosmic::{Element, Renderer, Theme};
 
-pub fn left<'a, Message: 'a>(
-    content: Element<'a, Message>,
-    progress: f32,
-) -> Element<'a, Message> {
+pub fn left<'a, Message: 'a>(content: Element<'a, Message>, progress: f32) -> Element<'a, Message> {
     Element::new(SlideLeft {
         content,
         progress: progress.clamp(0.0, 1.0),

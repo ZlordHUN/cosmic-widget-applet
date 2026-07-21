@@ -218,9 +218,7 @@ impl StorageMonitor {
     fn fetch_remote_disks() -> Vec<DiskInfo> {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
-                libc::geteuid()
-            })));
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })));
         let gvfs_dir = runtime_dir.join("gvfs");
         let Ok(entries) = fs::read_dir(gvfs_dir) else {
             return Vec::new();

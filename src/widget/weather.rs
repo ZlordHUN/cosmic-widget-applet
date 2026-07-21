@@ -322,9 +322,7 @@ impl WeatherMonitor {
         let weather_data = Arc::new(Mutex::new(
             cached_weather.as_ref().map(|cache| cache.data.clone()),
         ));
-        let cached_location = Arc::new(Mutex::new(
-            cached_weather.map(|cache| cache.location),
-        ));
+        let cached_location = Arc::new(Mutex::new(cached_weather.map(|cache| cache.location)));
         let (update_sender, update_receiver) = sync_channel(1);
 
         // Spawn background thread for weather updates
@@ -388,16 +386,11 @@ impl WeatherMonitor {
                                         longitude: lon,
                                         display_name: name,
                                     };
-                                    *cached_location_clone.lock().unwrap() =
-                                        Some(resolved.clone());
+                                    *cached_location_clone.lock().unwrap() = Some(resolved.clone());
                                     Some(resolved)
                                 }
                                 Err(e) => {
-                                    log::error!(
-                                        "Failed to geocode location {}: {}",
-                                        location,
-                                        e
-                                    );
+                                    log::error!("Failed to geocode location {}: {}", location, e);
                                     None
                                 }
                             }
@@ -579,11 +572,9 @@ impl WeatherMonitor {
         if old_location != location {
             let cached_weather = WeatherCache::load(&location);
             *self.location.lock().unwrap() = location;
-            *self.cached_location.lock().unwrap() = cached_weather
-                .as_ref()
-                .map(|cache| cache.location.clone());
-            *self.weather_data.lock().unwrap() =
-                cached_weather.map(|cache| cache.data);
+            *self.cached_location.lock().unwrap() =
+                cached_weather.as_ref().map(|cache| cache.location.clone());
+            *self.weather_data.lock().unwrap() = cached_weather.map(|cache| cache.data);
             self.last_update = Instant::now() - std::time::Duration::from_secs(121);
         }
     }

@@ -56,10 +56,6 @@ pub struct AppModel {
     /// None if config system failed to initialize.
     config_handler: Option<cosmic_config::Config>,
 
-    /// Text input state for the update interval field.
-    /// Kept separate to allow editing without immediately saving.
-    interval_input: String,
-
     /// Whether the widget process is currently running.
     /// Updated when opening the popup and after toggle operations.
     widget_running: bool,
@@ -183,9 +179,6 @@ impl cosmic::Application for AppModel {
             })
             .unwrap_or_default();
 
-        // Initialize text input with current interval value
-        let interval_input = format!("{}", config.update_interval_ms);
-
         // Auto-start widget if configured to do so
         // Note: We add a small delay to give the compositor time to fully initialize
         // its layer-shell input routing. Without this, the widget may not receive
@@ -223,7 +216,6 @@ impl cosmic::Application for AppModel {
             core,
             config,
             config_handler,
-            interval_input,
             widget_running,
             ..Default::default()
         };
