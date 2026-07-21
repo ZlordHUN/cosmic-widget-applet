@@ -3,13 +3,13 @@
 //! # Storage/Disk Monitoring Module
 //!
 //! This module monitors disk usage across mounted filesystems, providing
-//! space utilization and friendly device names via `lsblk`.
+//! space utilization and friendly device names from sysfs.
 //!
 //! ## Features
 //!
 //! - **Disk usage tracking**: Total, available, and used space percentages
 //! - **Smart filtering**: Only shows meaningful mounts (/, /home, external drives)
-//! - **Friendly names**: Uses `lsblk` to get vendor/model names instead of device paths
+//! - **Friendly names**: Reads vendor/model names from sysfs instead of device paths
 //! - **Caching**: Shows cached disk list immediately while loading real data
 //! - **Background updates**: Disk model fetching runs in a separate thread
 //!
@@ -26,8 +26,8 @@
 //! ## Device Name Resolution
 //!
 //! ```text
-//! /dev/nvme0n1p1 → "Samsung 970 EVO"  (via lsblk)
-//! /dev/sda1      → "WDC WD10EZEX"     (via lsblk)
+//! /dev/nvme0n1p1 → "Samsung 970 EVO"  (via sysfs)
+//! /dev/sda1      → "WDC WD10EZEX"     (via sysfs)
 //! /home          → "Home"              (hardcoded)
 //! /              → "System" or model   (fallback)
 //! ```
@@ -35,7 +35,7 @@
 //! ## Architecture
 //!
 //! - Main thread: Calls `update()` to refresh disk space from sysinfo
-//! - Background thread: Runs `lsblk` every 10 seconds to update model names
+//! - Background thread: Reads sysfs every 10 seconds to update model names
 //! - Shared state: `disk_models` HashMap protected by Arc<Mutex>
 
 use std::collections::HashMap;
@@ -44,7 +44,6 @@ use std::fs;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use sysinfo::Disks;
 
@@ -78,12 +77,12 @@ pub struct DiskInfo {
 
 /// Monitors disk usage across mounted filesystems.
 ///
-/// Uses sysinfo for disk space queries and `lsblk` for device model names.
+/// Uses sysinfo for disk space queries and sysfs for device model names.
 /// The monitor maintains a list of relevant disks with friendly display names.
 ///
 /// # Architecture
 ///
-/// - **Disk models**: Fetched by background thread every 10 seconds via `lsblk`
+/// - **Disk models**: Fetched by background thread every 10 seconds via sysfs
 /// - **Disk space**: Refreshed in main thread via sysinfo on each `update()`
 /// - **Caching**: Shows cached disk list on startup for instant display
 ///
@@ -97,7 +96,7 @@ pub struct StorageMonitor {
     /// List of filtered disk information for display
     pub disk_info: Vec<DiskInfo>,
     /// Map of device name → model name (e.g., "nvme0n1" → "Samsung 970 EVO")
-    /// Updated by background thread via lsblk
+    /// Updated by the background thread from sysfs
     disk_models: Arc<Mutex<HashMap<String, String>>>,
     /// Remote storage discovered through desktop mounts such as GVFS SFTP/SMB.
     /// Updated in the background because an unavailable network mount can be slow.
@@ -115,7 +114,7 @@ impl StorageMonitor {
     ///
     /// 1. Load cached disk names for instant display
     /// 2. Initialize sysinfo disk list
-    /// 3. Spawn background thread to fetch disk models via `lsblk`
+    /// 3. Spawn background thread to fetch disk models from sysfs
     ///
     /// The background thread updates model names every 10 seconds since
     /// hardware rarely changes during runtime.
@@ -170,9 +169,7 @@ impl StorageMonitor {
         }
     }
 
-    /// Fetch disk model names from lsblk (called from background thread).
-    ///
-    /// Runs `lsblk -ndo NAME,VENDOR,MODEL` to get human-readable device names.
+    /// Fetch disk model names from sysfs (called from background thread).
     ///
     /// # Returns
     ///
@@ -180,31 +177,34 @@ impl StorageMonitor {
     /// - Key: "nvme0n1", "sda", etc.
     /// - Value: "Samsung SSD 970", "WDC WD10EZEX", etc.
     ///
-    /// # Example Output Parsing
+    /// # Example
     ///
     /// ```text
-    /// lsblk output: "nvme0n1 Samsung SSD 970 EVO Plus"
-    /// Parsed: {"nvme0n1" => "Samsung SSD 970 EVO Plus"}
+    /// /sys/class/block/nvme0n1/device/model: "Samsung SSD 970 EVO Plus"
+    /// Result: {"nvme0n1" => "Samsung SSD 970 EVO Plus"}
     /// ```
     fn fetch_disk_models() -> Option<HashMap<String, String>> {
+        Self::fetch_disk_models_from(Path::new("/sys/class/block"))
+    }
+
+    fn fetch_disk_models_from(block_dir: &Path) -> Option<HashMap<String, String>> {
         let mut models = HashMap::new();
 
-        // Run lsblk to get device vendor and model
-        // -n: no header, -d: no partition info, -o: output columns
-        if let Ok(output) = Command::new("lsblk")
-            .args(&["-ndo", "NAME,VENDOR,MODEL"])
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        let device = parts[0].to_string();
-                        let vendor_and_model = parts[1..].join(" ");
-                        models.insert(device, vendor_and_model.trim().to_string());
-                    }
-                }
+        for entry in fs::read_dir(block_dir).ok()?.filter_map(Result::ok) {
+            let Some(device) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let device_dir = entry.path().join("device");
+            let vendor = read_sysfs_text(&device_dir.join("vendor"));
+            let model = read_sysfs_text(&device_dir.join("model"));
+            let display_name = [vendor, model]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if !display_name.is_empty() {
+                models.insert(device, display_name);
             }
         }
 
@@ -426,6 +426,15 @@ impl StorageMonitor {
     }
 }
 
+fn read_sysfs_text(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let normalized = String::from_utf8_lossy(&bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 fn is_gvfs_remote_mount(name: &str) -> bool {
     ["sftp:", "smb-share:", "dav:", "davs:", "ftp:", "nfs:"]
         .iter()
@@ -507,7 +516,8 @@ fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_gvfs_remote_mount, remote_display_name};
+    use super::{StorageMonitor, is_gvfs_remote_mount, remote_display_name};
+    use std::fs;
 
     #[test]
     fn recognizes_supported_gvfs_network_mounts() {
@@ -528,5 +538,38 @@ mod tests {
             remote_display_name("smb-share:server=qnap.local,share=Media", false),
             "Media (qnap.local)"
         );
+    }
+
+    #[test]
+    fn reads_and_normalizes_disk_models_from_sysfs() {
+        let sysfs = std::env::temp_dir().join(format!(
+            "cosmic-widget-storage-sysfs-{}",
+            std::process::id()
+        ));
+        let nvme_device = sysfs.join("nvme0n1/device");
+        let usb_device = sysfs.join("sda/device");
+        fs::create_dir_all(&nvme_device).unwrap();
+        fs::create_dir_all(&usb_device).unwrap();
+        fs::create_dir_all(sysfs.join("loop0")).unwrap();
+        fs::write(
+            nvme_device.join("model"),
+            b"Samsung SSD 990 EVO Plus 4TB            \n",
+        )
+        .unwrap();
+        fs::write(usb_device.join("vendor"), b"Samsung \n").unwrap();
+        fs::write(usb_device.join("model"), b"PSSD   T7         \n").unwrap();
+
+        let models = StorageMonitor::fetch_disk_models_from(&sysfs).unwrap();
+
+        assert_eq!(
+            models.get("nvme0n1").map(String::as_str),
+            Some("Samsung SSD 990 EVO Plus 4TB")
+        );
+        assert_eq!(
+            models.get("sda").map(String::as_str),
+            Some("Samsung PSSD T7")
+        );
+        assert!(!models.contains_key("loop0"));
+        fs::remove_dir_all(sysfs).unwrap();
     }
 }

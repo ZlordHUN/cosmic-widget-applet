@@ -26,20 +26,21 @@
 //! - Cider: From Apple Music CDN URLs
 //! - MPRIS: From `mpris:artUrl` metadata (file:// or http://)
 //!
-//! ## Polling Architecture
+//! ## Monitoring Architecture
 //!
-//! A background thread polls every second:
-//! 1. Query Cider API for track info
-//! 2. Enumerate MPRIS players via D-Bus
-//! 3. Query each player's metadata and status
-//! 4. Update shared state with all players
+//! A background thread samples Cider and Emby once per second. MPRIS players
+//! are maintained by a persistent native D-Bus connection and refreshed from
+//! player, property, and seek signals, with a slow reconciliation fallback.
 
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[path = "media/cider.rs"]
+mod cider;
+#[path = "media/mpris.rs"]
+mod mpris;
 
 const MAX_ARTWORK_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ARTWORK_DIMENSION: u32 = 4096;
@@ -635,6 +636,10 @@ pub struct MediaMonitor {
     selected_player: Arc<Mutex<Option<PlayerId>>>,
     /// Connection details for the active local Emby Theater session.
     emby_control: Arc<Mutex<Option<EmbyControl>>>,
+    /// Native MPRIS session-bus monitor and controller.
+    mpris: mpris::Monitor,
+    /// Persistent native client for Cider's local HTTP API.
+    cider: cider::Client,
 }
 
 impl MediaMonitor {
@@ -646,6 +651,8 @@ impl MediaMonitor {
         let artwork_cache = Arc::new(Mutex::new(ArtworkCache::new(20)));
         let selected_player = Arc::new(Mutex::new(None));
         let emby_control = Arc::new(Mutex::new(None));
+        let mpris = mpris::Monitor::new();
+        let cider = cider::Client::new();
 
         // Spawn background thread to monitor all players
         let state_clone = Arc::clone(&player_state);
@@ -653,6 +660,8 @@ impl MediaMonitor {
         let cache_clone = Arc::clone(&artwork_cache);
         let selected_clone = Arc::clone(&selected_player);
         let emby_control_clone = Arc::clone(&emby_control);
+        let mpris_clone = mpris.clone();
+        let cider_clone = cider.clone();
 
         std::thread::spawn(move || {
             Self::monitor_loop(
@@ -661,6 +670,8 @@ impl MediaMonitor {
                 cache_clone,
                 selected_clone,
                 emby_control_clone,
+                mpris_clone,
+                cider_clone,
             );
         });
 
@@ -670,6 +681,8 @@ impl MediaMonitor {
             artwork_cache,
             selected_player,
             emby_control,
+            mpris,
+            cider,
         }
     }
 
@@ -680,6 +693,8 @@ impl MediaMonitor {
         artwork_cache: Arc<Mutex<ArtworkCache>>,
         selected_player: Arc<Mutex<Option<PlayerId>>>,
         emby_control: Arc<Mutex<Option<EmbyControl>>>,
+        mpris: mpris::Monitor,
+        cider: cider::Client,
     ) {
         log::info!("Starting multi-player media monitor");
         let mut artwork_by_player: HashMap<PlayerId, TrackArtwork> = HashMap::new();
@@ -728,7 +743,7 @@ impl MediaMonitor {
             // 2. Try Cider API
             let token = cider_token.lock().unwrap().clone();
             let mut has_cider_api_player = false;
-            if let Some(mut info) = Self::try_cider_api(token.as_deref()) {
+            if let Some(mut info) = cider.now_playing(token.as_deref()) {
                 Self::apply_best_artwork(
                     &PlayerId::Cider,
                     &mut info,
@@ -739,115 +754,109 @@ impl MediaMonitor {
                 has_cider_api_player = true;
             }
 
-            // 3. Enumerate MPRIS players
-            if let Some(mut mpris_players) = Self::get_mpris_players() {
-                // Query the proxy last so it can supplement, rather than
-                // duplicate, the real player that it mirrors.
-                mpris_players.sort_by_key(|name| Self::is_playerctld_mpris_player(name));
-                for bus_name in mpris_players {
-                    if has_cider_api_player && Self::is_cider_mpris_player(&bus_name) {
-                        continue;
-                    }
+            // 3. Consume the signal-driven native MPRIS snapshot. Query the
+            // playerctld proxy last so it can supplement the real player it mirrors.
+            let mut mpris_players = mpris.players();
+            mpris_players.sort_by_key(|(name, _)| Self::is_playerctld_mpris_player(name));
+            for (bus_name, mut info) in mpris_players {
+                if has_cider_api_player && Self::is_cider_mpris_player(&bus_name) {
+                    continue;
+                }
 
-                    if let Some(mut info) = Self::try_mpris_player(&bus_name) {
-                        let player_id = PlayerId::Mpris(bus_name.clone());
-                        let track = TrackSignature::from(&info);
+                let player_id = PlayerId::Mpris(bus_name.clone());
+                let track = TrackSignature::from(&info);
 
-                        let incomplete_firefox_timeline = Self::is_firefox_mpris_player(&bus_name)
-                            && info.status == PlaybackStatus::Playing
-                            && info.position == 0
-                            && info.duration == 0;
-                        let should_refresh = incomplete_firefox_timeline
-                            && timeline_refreshes.get(&player_id).is_none_or(|refresh| {
-                                refresh.track != track
-                                    || (!refresh.complete
-                                        && refresh.attempts < MAX_TIMELINE_REFRESH_ATTEMPTS
-                                        && refresh.attempted_at.elapsed()
-                                            >= TIMELINE_REFRESH_RETRY)
-                            });
+                let incomplete_firefox_timeline = Self::is_firefox_mpris_player(&bus_name)
+                    && info.status == PlaybackStatus::Playing
+                    && info.position == 0
+                    && info.duration == 0;
+                let should_refresh = incomplete_firefox_timeline
+                    && timeline_refreshes.get(&player_id).is_none_or(|refresh| {
+                        refresh.track != track
+                            || (!refresh.complete
+                                && refresh.attempts < MAX_TIMELINE_REFRESH_ATTEMPTS
+                                && refresh.attempted_at.elapsed() >= TIMELINE_REFRESH_RETRY)
+                    });
 
-                        if should_refresh {
-                            let previous_attempts = timeline_refreshes
-                                .get(&player_id)
-                                .filter(|refresh| refresh.track == track)
-                                .map_or(0, |refresh| refresh.attempts);
-                            if let Some(refreshed) = Self::refresh_mpris_timeline(&bus_name) {
-                                let complete = refreshed.duration > 0;
-                                info = refreshed;
-                                timeline_refreshes.insert(
-                                    player_id.clone(),
-                                    TimelineRefresh {
-                                        track: TrackSignature::from(&info),
-                                        attempted_at: Instant::now(),
-                                        attempts: previous_attempts + 1,
-                                        complete,
-                                    },
-                                );
-                            } else {
-                                timeline_refreshes.insert(
-                                    player_id.clone(),
-                                    TimelineRefresh {
-                                        track,
-                                        attempted_at: Instant::now(),
-                                        attempts: previous_attempts + 1,
-                                        complete: false,
-                                    },
-                                );
-                            }
-                        }
-
-                        if update_tracked_position(
-                            &mut position_trackers,
-                            &player_id,
-                            &mut info,
-                            Instant::now(),
-                        ) {
-                            log::info!(
-                                "Initial MPRIS state for {}: status={:?}, position={}ms, duration={}ms",
-                                info.player_name,
-                                info.status,
-                                info.position,
-                                info.duration,
-                            );
-                        }
-
-                        Self::apply_best_artwork(
-                            &player_id,
-                            &mut info,
-                            &artwork_cache,
-                            &mut artwork_by_player,
+                if should_refresh {
+                    let previous_attempts = timeline_refreshes
+                        .get(&player_id)
+                        .filter(|refresh| refresh.track == track)
+                        .map_or(0, |refresh| refresh.attempts);
+                    if let Some(refreshed) = mpris.refresh_timeline(&bus_name) {
+                        let complete = refreshed.duration > 0;
+                        info = refreshed;
+                        timeline_refreshes.insert(
+                            player_id.clone(),
+                            TimelineRefresh {
+                                track: TrackSignature::from(&info),
+                                attempted_at: Instant::now(),
+                                attempts: previous_attempts + 1,
+                                complete,
+                            },
                         );
-
-                        // Fallback to app icon if no album art
-                        if info.album_art.is_none() {
-                            let icon_cache_key = format!("__icon__{}", bus_name);
-                            let cached = artwork_cache.lock().unwrap().get(&icon_cache_key);
-                            if let Some(art) = cached {
-                                info.album_art = Some(art);
-                            } else if let Some(art) = Self::load_app_icon(&bus_name) {
-                                artwork_cache
-                                    .lock()
-                                    .unwrap()
-                                    .insert(icon_cache_key, art.clone());
-                                info.album_art = Some(art);
-                            }
-                        }
-
-                        if Self::is_playerctld_mpris_player(&bus_name)
-                            && let Some((_, primary)) = players.iter_mut().find(|(id, primary)| {
-                                matches!(id, PlayerId::Mpris(primary_bus)
-                                    if !Self::is_playerctld_mpris_player(primary_bus))
-                                    && TrackSignature::from(&*primary)
-                                        == TrackSignature::from(&info)
-                            })
-                        {
-                            merge_mpris_proxy_timeline(primary, &info);
-                            continue;
-                        }
-
-                        players.push((player_id, info));
+                    } else {
+                        timeline_refreshes.insert(
+                            player_id.clone(),
+                            TimelineRefresh {
+                                track,
+                                attempted_at: Instant::now(),
+                                attempts: previous_attempts + 1,
+                                complete: false,
+                            },
+                        );
                     }
                 }
+
+                if update_tracked_position(
+                    &mut position_trackers,
+                    &player_id,
+                    &mut info,
+                    Instant::now(),
+                ) {
+                    log::info!(
+                        "Initial MPRIS state for {}: status={:?}, position={}ms, duration={}ms",
+                        info.player_name,
+                        info.status,
+                        info.position,
+                        info.duration,
+                    );
+                }
+
+                Self::apply_best_artwork(
+                    &player_id,
+                    &mut info,
+                    &artwork_cache,
+                    &mut artwork_by_player,
+                );
+
+                // Fallback to app icon if no album art
+                if info.album_art.is_none() {
+                    let icon_cache_key = format!("__icon__{}", bus_name);
+                    let cached = artwork_cache.lock().unwrap().get(&icon_cache_key);
+                    if let Some(art) = cached {
+                        info.album_art = Some(art);
+                    } else if let Some(art) = Self::load_app_icon(&bus_name) {
+                        artwork_cache
+                            .lock()
+                            .unwrap()
+                            .insert(icon_cache_key, art.clone());
+                        info.album_art = Some(art);
+                    }
+                }
+
+                if Self::is_playerctld_mpris_player(&bus_name)
+                    && let Some((_, primary)) = players.iter_mut().find(|(id, primary)| {
+                        matches!(id, PlayerId::Mpris(primary_bus)
+                            if !Self::is_playerctld_mpris_player(primary_bus))
+                            && TrackSignature::from(&*primary) == TrackSignature::from(&info)
+                    })
+                {
+                    merge_mpris_proxy_timeline(primary, &info);
+                    continue;
+                }
+
+                players.push((player_id, info));
             }
 
             position_trackers.retain(|id, _| players.iter().any(|(player_id, _)| player_id == id));
@@ -904,27 +913,35 @@ impl MediaMonitor {
                     Some("log" | "ldb")
                 )
             })
-            .collect::<Vec<PathBuf>>();
+            .collect::<Vec<_>>();
         files.sort();
 
         files
             .into_iter()
-            .filter_map(|path| Command::new("strings").arg(path).output().ok())
-            .filter(|output| output.status.success())
-            .filter_map(|output| {
-                Self::parse_emby_credentials(&String::from_utf8_lossy(&output.stdout))
-            })
+            .filter_map(|path| std::fs::read(path).ok())
+            .filter_map(|bytes| Self::parse_emby_credentials(&bytes))
             .max_by_key(|credentials| credentials.last_accessed)
     }
 
-    fn parse_emby_credentials(output: &str) -> Option<EmbyCredentials> {
-        output
-            .lines()
-            .filter_map(|line| {
-                let json = &line[line.find("{\"Servers\":[")?..];
-                let mut deserializer = serde_json::Deserializer::from_str(json);
-                SavedEmbyServers::deserialize(&mut deserializer).ok()
-            })
+    fn parse_emby_credentials(bytes: &[u8]) -> Option<EmbyCredentials> {
+        const SAVED_SERVERS_MARKER: &[u8] = b"{\"Servers\":[";
+
+        let mut saved_servers = Vec::new();
+        let mut search_start = 0;
+        while let Some(offset) = bytes[search_start..]
+            .windows(SAVED_SERVERS_MARKER.len())
+            .position(|window| window == SAVED_SERVERS_MARKER)
+        {
+            let json_start = search_start + offset;
+            let mut deserializer = serde_json::Deserializer::from_slice(&bytes[json_start..]);
+            if let Ok(saved) = SavedEmbyServers::deserialize(&mut deserializer) {
+                saved_servers.push(saved);
+            }
+            search_start = json_start + SAVED_SERVERS_MARKER.len();
+        }
+
+        saved_servers
+            .into_iter()
             .flat_map(|saved| saved.servers)
             .filter_map(|server| {
                 let configured_user_id = server.user_id.as_deref();
@@ -1112,38 +1129,6 @@ impl MediaMonitor {
     // MPRIS D-Bus Methods
     // ========================================================================
 
-    /// Get list of all MPRIS player bus names.
-    fn get_mpris_players() -> Option<Vec<String>> {
-        let output = Command::new("dbus-send")
-            .args(&[
-                "--session",
-                "--print-reply",
-                "--dest=org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus.ListNames",
-            ])
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut players = Vec::new();
-
-        for line in stdout.lines() {
-            if let Some(start) = line.find("\"org.mpris.MediaPlayer2.") {
-                if let Some(end) = line[start + 1..].find('"') {
-                    let name = &line[start + 1..start + 1 + end];
-                    players.push(name.to_string());
-                }
-            }
-        }
-
-        Some(players)
-    }
-
     fn is_cider_mpris_player(bus_name: &str) -> bool {
         bus_name
             .strip_prefix("org.mpris.MediaPlayer2.")
@@ -1162,144 +1147,6 @@ impl MediaMonitor {
         bus_name
             .strip_prefix("org.mpris.MediaPlayer2.")
             .is_some_and(|identity| identity.eq_ignore_ascii_case("playerctld"))
-    }
-
-    fn refresh_mpris_timeline(bus_name: &str) -> Option<MediaInfo> {
-        log::info!("Refreshing incomplete Firefox MPRIS timeline");
-        if !Self::send_mpris_method(bus_name, "Pause") {
-            return None;
-        }
-
-        let mut refreshed = None;
-        for _ in 0..4 {
-            std::thread::sleep(Duration::from_millis(150));
-            refreshed = Self::try_mpris_player(bus_name);
-            if refreshed.as_ref().is_some_and(|info| info.duration > 0) {
-                break;
-            }
-        }
-        let resumed = Self::send_mpris_method(bus_name, "Play");
-        if !resumed {
-            log::warn!("Failed to resume Firefox after refreshing its MPRIS timeline");
-        }
-        if resumed && let Some(info) = refreshed.as_mut() {
-            info.status = PlaybackStatus::Playing;
-        }
-        refreshed
-    }
-
-    fn send_mpris_method(bus_name: &str, method: &str) -> bool {
-        let method = format!("org.mpris.MediaPlayer2.Player.{method}");
-        Command::new("dbus-send")
-            .args([
-                "--session",
-                "--type=method_call",
-                &format!("--dest={bus_name}"),
-                "/org/mpris/MediaPlayer2",
-                &method,
-            ])
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-
-    /// Query an MPRIS player for its current state.
-    fn try_mpris_player(bus_name: &str) -> Option<MediaInfo> {
-        let metadata = Self::query_mpris_property(bus_name, "Metadata")?;
-        let metadata = metadata.get("data")?;
-        let playback_status = Self::query_mpris_property(bus_name, "PlaybackStatus")?;
-        let position = Self::query_mpris_property(bus_name, "Position")?;
-
-        // Parse player name from bus name
-        let player_name = PlayerId::Mpris(bus_name.to_string()).display_name();
-
-        // Parse playback status
-        let status = match playback_status.get("data").and_then(serde_json::Value::as_str) {
-            Some("Playing") => PlaybackStatus::Playing,
-            Some("Paused") => PlaybackStatus::Paused,
-            _ => PlaybackStatus::Stopped,
-        };
-
-        // Parse position (microseconds to milliseconds)
-        let position = position
-            .get("data")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0)
-            / 1000;
-
-        // Parse metadata
-        let title = Self::mpris_metadata_string(metadata, "xesam:title").unwrap_or_default();
-        let artist = Self::mpris_metadata_array_string(metadata, "xesam:artist").unwrap_or_default();
-        let album = Self::mpris_metadata_string(metadata, "xesam:album").unwrap_or_default();
-        let duration = Self::mpris_metadata_i64(metadata, "mpris:length").unwrap_or(0) / 1000;
-
-        let media_url = Self::mpris_metadata_string(metadata, "xesam:url");
-        let art_url = Self::mpris_metadata_string(metadata, "mpris:artUrl");
-
-        // Skip if no title (nothing playing)
-        if title.is_empty() {
-            return None;
-        }
-
-        Some(MediaInfo {
-            player_name,
-            title,
-            artist,
-            album,
-            art_url,
-            media_url,
-            album_art: None,
-            status,
-            position: position as u64,
-            duration: duration as u64,
-            can_play: true,
-            can_pause: true,
-            can_go_next: true,
-            can_go_previous: true,
-            can_seek: true,
-        })
-    }
-
-    fn query_mpris_property(bus_name: &str, property: &str) -> Option<serde_json::Value> {
-        let output = Command::new("busctl")
-            .args([
-                "--user",
-                "--json=short",
-                "get-property",
-                bus_name,
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player",
-                property,
-            ])
-            .output()
-            .ok()?;
-
-        output
-            .status
-            .success()
-            .then(|| serde_json::from_slice(&output.stdout).ok())
-            .flatten()
-    }
-
-    fn mpris_metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
-        metadata
-            .get(key)?
-            .get("data")?
-            .as_str()
-            .map(ToOwned::to_owned)
-    }
-
-    fn mpris_metadata_array_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
-        metadata
-            .get(key)?
-            .get("data")?
-            .as_array()?
-            .first()?
-            .as_str()
-            .map(ToOwned::to_owned)
-    }
-
-    fn mpris_metadata_i64(metadata: &serde_json::Value, key: &str) -> Option<i64> {
-        metadata.get(key)?.get("data")?.as_i64()
     }
 
     fn apply_best_artwork(
@@ -1601,171 +1448,6 @@ impl MediaMonitor {
         })
     }
 
-    /// Query Cider API for current track info.
-    ///
-    /// Uses `curl` for HTTP requests to avoid pulling in reqwest for
-    /// a simple local API call.
-    ///
-    /// # Returns
-    ///
-    /// `Some(MediaInfo)` if Cider is running and playing
-    /// `None` if Cider is not running or no track is loaded
-    fn try_cider_api(token: Option<&str>) -> Option<MediaInfo> {
-        use std::process::Command;
-
-        // Build curl command for now-playing endpoint
-        let mut cmd = Command::new("curl");
-        cmd.args(&["-s", "--max-time", "1"]); // Silent, 1 second timeout
-
-        // Add authentication header if token provided
-        if let Some(t) = token {
-            cmd.args(&["-H", &format!("apptoken: {}", t)]);
-        }
-
-        cmd.arg("http://localhost:10767/api/v1/playback/now-playing");
-
-        let output = cmd.output().ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let json_str = String::from_utf8_lossy(&output.stdout);
-
-        // Check for error response
-        if json_str.contains("\"error\"") {
-            return None;
-        }
-
-        // Also query the is-playing endpoint for accurate playback status
-        let is_playing = Self::check_is_playing(token);
-
-        // Parse JSON response
-        Self::parse_cider_response(&json_str, is_playing)
-    }
-
-    /// Check if media is currently playing via is-playing endpoint.
-    fn check_is_playing(token: Option<&str>) -> bool {
-        use std::process::Command;
-
-        let mut cmd = Command::new("curl");
-        cmd.args(&["-s", "--max-time", "1"]);
-
-        if let Some(t) = token {
-            cmd.args(&["-H", &format!("apptoken: {}", t)]);
-        }
-
-        cmd.arg("http://localhost:10767/api/v1/playback/is-playing");
-
-        if let Ok(output) = cmd.output() {
-            if output.status.success() {
-                let json_str = String::from_utf8_lossy(&output.stdout);
-                return json_str.contains("\"is_playing\":true");
-            }
-        }
-
-        // Default to true if we can't determine (optimistic)
-        true
-    }
-
-    /// Parse Cider API JSON response into MediaInfo.
-    ///
-    /// Uses simple string parsing to avoid JSON dependency overhead.
-    /// Extracts: name, artistName, albumName, artwork.url, durationInMillis,
-    /// currentPlaybackTime.
-    fn parse_cider_response(json: &str, is_playing: bool) -> Option<MediaInfo> {
-        // Check if status is ok
-        if !json.contains("\"status\":\"ok\"") {
-            return None;
-        }
-
-        // Determine playback status from is_playing parameter
-        let playback_status = if is_playing {
-            PlaybackStatus::Playing
-        } else {
-            PlaybackStatus::Paused
-        };
-
-        let mut info = MediaInfo {
-            player_name: "Cider".to_string(),
-            can_play: true,
-            can_pause: true,
-            can_go_next: true,
-            can_go_previous: true,
-            can_seek: true,
-            status: playback_status,
-            ..Default::default()
-        };
-
-        // Extract title (name field in Cider API)
-        if let Some(name) = Self::extract_json_string(json, "\"name\":\"") {
-            info.title = name;
-        }
-
-        // Extract artist
-        if let Some(artist) = Self::extract_json_string(json, "\"artistName\":\"") {
-            info.artist = artist;
-        }
-
-        // Extract album
-        if let Some(album) = Self::extract_json_string(json, "\"albumName\":\"") {
-            info.album = album;
-        }
-
-        // Extract artwork URL from within the artwork object
-        // The response has: "artwork":{"width":...,"height":...,"url":"https://..."}
-        if let Some(artwork_start) = json.find("\"artwork\":{") {
-            let artwork_section = &json[artwork_start..];
-            // Find url within the artwork object
-            if let Some(url) = Self::extract_json_string(artwork_section, "\"url\":\"") {
-                // Replace {w}x{h} placeholders with actual size
-                let artwork_url = url.replace("{w}", "300").replace("{h}", "300");
-                info.art_url = Some(artwork_url);
-            }
-        }
-
-        // Extract duration in milliseconds
-        if let Some(duration_str) = Self::extract_json_number(json, "\"durationInMillis\":") {
-            if let Ok(duration) = duration_str.parse::<u64>() {
-                info.duration = duration;
-            }
-        }
-
-        // Extract current playback time (seconds → milliseconds)
-        if let Some(pos_str) = Self::extract_json_number(json, "\"currentPlaybackTime\":") {
-            if let Ok(pos) = pos_str.parse::<f64>() {
-                info.position = (pos * 1000.0) as u64;
-            }
-        }
-
-        // Check if we got meaningful data
-        if info.title.is_empty() {
-            return None;
-        }
-
-        Some(info)
-    }
-
-    /// Extract a string value from JSON by key.
-    ///
-    /// Simple parsing: finds key, then extracts until next quote.
-    fn extract_json_string(json: &str, key: &str) -> Option<String> {
-        let start = json.find(key)? + key.len();
-        let rest = &json[start..];
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    }
-
-    /// Extract a numeric value from JSON by key.
-    ///
-    /// Simple parsing: finds key, then extracts until delimiter.
-    fn extract_json_number(json: &str, key: &str) -> Option<String> {
-        let start = json.find(key)? + key.len();
-        let rest = &json[start..];
-        let end = rest.find(|c: char| c == ',' || c == '}' || c == ']')?;
-        Some(rest[..end].trim().to_string())
-    }
-
     // ========================================================================
     // Public API
     // ========================================================================
@@ -1982,20 +1664,7 @@ impl MediaMonitor {
 
     fn send_cider_command(&self, endpoint: &str) -> bool {
         let token = self.cider_token.lock().unwrap().clone();
-
-        let mut cmd = Command::new("curl");
-        cmd.args(&["-s", "-X", "POST", "--max-time", "1"]);
-
-        if let Some(t) = token {
-            cmd.args(&["-H", &format!("apptoken: {}", t)]);
-        }
-
-        cmd.arg(&format!(
-            "http://localhost:10767/api/v1/playback/{}",
-            endpoint
-        ));
-
-        cmd.output().map(|o| o.status.success()).unwrap_or(false)
+        self.cider.command(endpoint, token.as_deref())
     }
 
     fn cider_play_pause(&self) {
@@ -2006,19 +1675,7 @@ impl MediaMonitor {
 
     fn send_cider_command_async(&self, endpoint: &str) {
         let token = self.cider_token.lock().unwrap().clone();
-        let url = format!("http://localhost:10767/api/v1/playback/{}", endpoint);
-
-        std::thread::spawn(move || {
-            let mut cmd = Command::new("curl");
-            cmd.args(&["-s", "-X", "POST", "--max-time", "1"]);
-
-            if let Some(t) = token {
-                cmd.args(&["-H", &format!("apptoken: {}", t)]);
-            }
-
-            cmd.arg(&url);
-            let _ = cmd.output();
-        });
+        self.cider.command_async(endpoint, token);
     }
 
     fn cider_next(&self) {
@@ -2031,22 +1688,8 @@ impl MediaMonitor {
 
     fn cider_seek(&self, position_seconds: f64) -> bool {
         let token = self.cider_token.lock().unwrap().clone();
-
-        let mut cmd = Command::new("curl");
-        cmd.args(&["-s", "-X", "POST", "--max-time", "1"]);
-        cmd.args(&["-H", "Content-Type: application/json"]);
-
-        if let Some(t) = token {
-            cmd.args(&["-H", &format!("apptoken: {}", t)]);
-        }
-
-        cmd.args(&[
-            "-d",
-            &format!("{{\"position\": {}}}", position_seconds as u64),
-        ]);
-        cmd.arg("http://localhost:10767/api/v1/playback/seek");
-
-        cmd.output().map(|o| o.status.success()).unwrap_or(false)
+        self.cider
+            .seek(position_seconds.max(0.0) as u64, token.as_deref())
     }
 
     // ========================================================================
@@ -2055,100 +1698,21 @@ impl MediaMonitor {
 
     fn mpris_play_pause(&self, bus_name: &str) {
         log::info!("Sending PlayPause to MPRIS player: {}", bus_name);
-        let result = Command::new("dbus-send")
-            .args(&[
-                "--session",
-                "--print-reply",
-                &format!("--dest={}", bus_name),
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player.PlayPause",
-            ])
-            .output();
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    log::info!("PlayPause command succeeded for {}", bus_name);
-                } else {
-                    log::error!(
-                        "PlayPause command failed for {}: {:?}",
-                        bus_name,
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to execute dbus-send for PlayPause: {}", e);
-            }
+        if !self.mpris.play_pause(bus_name) {
+            log::warn!("Native MPRIS PlayPause failed for {bus_name}");
         }
     }
 
     fn mpris_next(&self, bus_name: &str) {
-        let _ = Command::new("dbus-send")
-            .args(&[
-                "--session",
-                "--print-reply",
-                &format!("--dest={}", bus_name),
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player.Next",
-            ])
-            .output();
+        self.mpris.next(bus_name);
     }
 
     fn mpris_previous(&self, bus_name: &str) {
-        let _ = Command::new("dbus-send")
-            .args(&[
-                "--session",
-                "--print-reply",
-                &format!("--dest={}", bus_name),
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player.Previous",
-            ])
-            .output();
+        self.mpris.previous(bus_name);
     }
 
     fn mpris_seek(&self, bus_name: &str, position_us: u64) -> bool {
-        let track_id = Self::query_mpris_property(bus_name, "Metadata")
-            .and_then(|metadata| metadata.get("data").cloned())
-            .and_then(|metadata| Self::mpris_metadata_string(&metadata, "mpris:trackid"));
-
-        if let Some(track_id) = track_id {
-            let absolute_seek = Command::new("dbus-send")
-                .args([
-                    "--session",
-                    "--print-reply",
-                    &format!("--dest={bus_name}"),
-                    "/org/mpris/MediaPlayer2",
-                    "org.mpris.MediaPlayer2.Player.SetPosition",
-                    &format!("objpath:{track_id}"),
-                    &format!("int64:{position_us}"),
-                ])
-                .output()
-                .is_ok_and(|output| output.status.success());
-
-            if absolute_seek {
-                return true;
-            }
-        }
-
-        let current_pos = Self::query_mpris_property(bus_name, "Position")
-            .and_then(|position| position.get("data").and_then(serde_json::Value::as_i64))
-            .unwrap_or(0);
-
-        let offset = position_us as i64 - current_pos;
-
-        Command::new("dbus-send")
-            .args(&[
-                "--session",
-                "--print-reply",
-                &format!("--dest={}", bus_name),
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player.Seek",
-                &format!("int64:{}", offset),
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        self.mpris.seek(bus_name, position_us)
     }
 }
 
@@ -2359,37 +1923,6 @@ mod tests {
     }
 
     #[test]
-    fn preserves_quotes_in_structured_mpris_metadata() {
-        let metadata = serde_json::json!({
-            "xesam:title": {
-                "type": "s",
-                "data": "Intel: \"Ya, we're cooked\""
-            },
-            "xesam:artist": {
-                "type": "as",
-                "data": ["TechLinked"]
-            },
-            "mpris:length": {
-                "type": "x",
-                "data": 559_000_000_i64
-            }
-        });
-
-        assert_eq!(
-            MediaMonitor::mpris_metadata_string(&metadata, "xesam:title").as_deref(),
-            Some("Intel: \"Ya, we're cooked\"")
-        );
-        assert_eq!(
-            MediaMonitor::mpris_metadata_array_string(&metadata, "xesam:artist").as_deref(),
-            Some("TechLinked")
-        );
-        assert_eq!(
-            MediaMonitor::mpris_metadata_i64(&metadata, "mpris:length"),
-            Some(559_000_000)
-        );
-    }
-
-    #[test]
     fn parses_youtube_urls_and_orders_thumbnail_candidates() {
         let urls = [
             "https://www.youtube.com/watch?v=testVideo_1&list=WL",
@@ -2439,13 +1972,17 @@ mod tests {
 
     #[test]
     fn selects_the_newest_saved_emby_credentials() {
-        let leveldb_strings = r#"
-noise
-{"Servers":[{"LocalAddress":"http://old:8096/","RemoteAddress":null,"ManualAddress":null,"UserId":"user-1","Users":[{"UserId":"user-1","AccessToken":"old-token"}],"DateLastAccessed":10}]}
-prefix:{"Servers":[{"LocalAddress":"http://nas:8096","RemoteAddress":"https://remote.example","ManualAddress":"http://nas:8096","UserId":"user-2","Users":[{"UserId":"user-2","AccessToken":"new-token"}],"DateLastAccessed":20}]}:suffix
-"#;
+        let mut leveldb_bytes = vec![0, 0xff, b'n', b'o', b'i', b's', b'e', 0];
+        leveldb_bytes.extend_from_slice(
+            br#"{"Servers":[{"LocalAddress":"http://old:8096/","RemoteAddress":null,"ManualAddress":null,"UserId":"user-1","Users":[{"UserId":"user-1","AccessToken":"old-token"}],"DateLastAccessed":10}]}"#,
+        );
+        leveldb_bytes.extend_from_slice(&[0, 0x80]);
+        leveldb_bytes.extend_from_slice(
+            br#"prefix:{"Servers":[{"LocalAddress":"http://nas:8096","RemoteAddress":"https://remote.example","ManualAddress":"http://nas:8096","UserId":"user-2","Users":[{"UserId":"user-2","AccessToken":"new-token"}],"DateLastAccessed":20}]}:suffix"#,
+        );
+        leveldb_bytes.push(0xff);
 
-        let credentials = MediaMonitor::parse_emby_credentials(leveldb_strings)
+        let credentials = MediaMonitor::parse_emby_credentials(&leveldb_bytes)
             .expect("credentials should be parsed");
         assert_eq!(credentials.user_id, "user-2");
         assert_eq!(credentials.access_token, "new-token");
@@ -2453,6 +1990,30 @@ prefix:{"Servers":[{"LocalAddress":"http://nas:8096","RemoteAddress":"https://re
             credentials.server_urls,
             vec!["http://nas:8096", "https://remote.example"]
         );
+    }
+
+    #[test]
+    fn skips_incomplete_emby_records_while_scanning_leveldb_bytes() {
+        let mut leveldb_bytes = br#"{"Servers":[{"LocalAddress":"partial"}"#.to_vec();
+        leveldb_bytes.extend_from_slice(&[0, 0xff, 0]);
+        leveldb_bytes.extend_from_slice(
+            br#"{"Servers":[{"LocalAddress":"http://nas:8096","RemoteAddress":null,"ManualAddress":null,"UserId":"user-1","Users":[{"UserId":"user-1","AccessToken":"token"}],"DateLastAccessed":30}]}"#,
+        );
+
+        let credentials = MediaMonitor::parse_emby_credentials(&leveldb_bytes)
+            .expect("complete credentials after a partial record should be parsed");
+        assert_eq!(credentials.user_id, "user-1");
+        assert_eq!(credentials.server_urls, vec!["http://nas:8096"]);
+    }
+
+    #[test]
+    #[ignore = "requires an Emby Theater profile with a saved server"]
+    fn discovers_live_emby_credentials() {
+        let credentials = MediaMonitor::discover_emby_credentials()
+            .expect("saved Emby credentials should be discovered");
+        assert!(!credentials.server_urls.is_empty());
+        assert!(!credentials.user_id.is_empty());
+        assert!(!credentials.access_token.is_empty());
     }
 
     #[test]

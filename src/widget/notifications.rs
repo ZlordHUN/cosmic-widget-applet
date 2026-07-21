@@ -3,8 +3,8 @@
 //! # Notification Monitoring Module
 //!
 //! This module captures desktop notifications via D-Bus and displays them
-//! in the widget. Uses `busctl` to monitor the `org.freedesktop.Notifications`
-//! interface for incoming notification calls.
+//! in the widget. Uses a native zbus monitor connection to observe the
+//! `org.freedesktop.Notifications` interface.
 //!
 //! ## D-Bus Interface
 //!
@@ -18,11 +18,11 @@
 //!
 //! ```text
 //! ┌──────────────┐    ┌─────────────┐    ┌───────────────┐
-//! │ Desktop App  │───►│ D-Bus       │───►│ busctl        │
+//! │ Desktop App  │───►│ D-Bus       │───►│ zbus monitor  │
 //! │ (notify-send)│    │ Notify call │    │ monitor       │
 //! └──────────────┘    └─────────────┘    └───────┬───────┘
 //!                                                 │
-//!                     ┌───────────────┐          │ stdout
+//!                     ┌───────────────┐          │ messages
 //!                     │ Main Thread   │◄─────────┘
 //!                     │ (reads list)  │    ┌───────────────┐
 //!                     └───────────────┘    │ Background    │
@@ -31,18 +31,14 @@
 //!                                          └───────────────┘
 //! ```
 //!
-//! ## busctl Output Parsing
+//! ## Structured Message Decoding
 //!
-//! The `busctl monitor` command outputs D-Bus messages in a text format.
-//! We parse STRING fields from Notify method calls:
+//! Notify calls, their method returns, and close signals are decoded directly
+//! from their D-Bus signatures. The call serial and reply serial associate the
+//! content with the notification ID assigned by the active daemon.
 //!
-//! ```text
-//! Type=method_call  Member=Notify
-//!   STRING "app_name"      # Index 0: Application name
-//!   STRING ""              # Index 1: App icon (usually empty)
-//!   STRING "Summary text"  # Index 2: Notification title
-//!   STRING "Body text"     # Index 3: Notification body
-//! ```
+//! This avoids depending on a command's human-readable output format and
+//! preserves escaped, quoted, and multiline notification content exactly.
 //!
 //! ## Notification Management
 //!
@@ -64,6 +60,7 @@ const NOTIFICATIONS_SERVICE: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
 const COSMIC_HISTORY_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+const NOTIFICATION_MONITOR_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 // ============================================================================
 // Notification Struct
@@ -103,21 +100,20 @@ struct NotificationCache {
 
 /// Monitors D-Bus for desktop notifications.
 ///
-/// Spawns a background thread running `busctl monitor` to capture incoming
-/// notifications. The notification list is shared via Arc<Mutex> for
+/// Spawns a background thread with a native zbus monitor connection to capture
+/// incoming notifications. The notification list is shared via Arc<Mutex> for
 /// thread-safe access from the main render thread.
 ///
 /// # Threading Model
 ///
-/// - Background thread: Runs `busctl monitor`, parses output, updates list
+/// - Background thread: Decodes monitored D-Bus messages and updates the list
 /// - Main thread: Reads notification list for rendering
 /// - Shared state: `notifications` Vec protected by Mutex
 ///
 /// # Resource Usage
 ///
 /// - Spawns one persistent background thread
-/// - Spawns one `busctl` child process
-/// - Both run for the lifetime of the application
+/// - Maintains one native session-bus monitor connection
 #[derive(Clone)]
 pub struct NotificationMonitor {
     /// Shared notification list, newest first
@@ -137,8 +133,8 @@ impl NotificationMonitor {
     /// # Background Thread
     ///
     /// Immediately spawns a background thread that:
-    /// 1. Starts `busctl monitor` to watch D-Bus
-    /// 2. Parses Notify method calls from stdout
+    /// 1. Opens a native zbus monitoring connection
+    /// 2. Decodes Notify method calls and their replies
     /// 3. Extracts app_name, summary, and body
     /// 4. Updates the shared notification list
     pub fn new(max_notifications: usize) -> Self {
@@ -174,14 +170,12 @@ impl NotificationMonitor {
         let max_count = retention_limit;
 
         std::thread::spawn(move || {
-            if let Err(e) = Self::monitor_notifications(
+            Self::monitor_notifications(
                 notifications_clone,
                 max_count,
                 &cache_path_clone,
                 &session_key_clone,
-            ) {
-                log::error!("Notification monitoring error: {}", e);
-            }
+            );
         });
 
         let notifications_clone = Arc::clone(&notifications);
@@ -237,65 +231,47 @@ impl NotificationMonitor {
         }
     }
 
-    /// Main D-Bus monitoring loop (runs in background thread).
-    ///
-    /// Uses `busctl monitor` to watch for Notify method calls on the
-    /// user session bus. Parses the text output to extract notification
-    /// fields.
-    ///
-    /// # busctl Command
-    ///
-    /// ```bash
-    /// busctl monitor --user \
-    ///   --match "type=method_call,interface=org.freedesktop.Notifications,member=Notify"
-    /// ```
-    ///
-    /// # Parsing Strategy
-    ///
-    /// 1. Watch for lines containing "Member=Notify" to start new notification
-    /// 2. Count STRING fields in order (app_name=0, icon=1, summary=2, body=3)
-    /// 3. Extract values between double quotes
-    /// 4. After body (field 3), save the notification
-    ///
-    /// # Error Handling
-    ///
-    /// Returns error if busctl cannot be spawned. Parsing errors within
-    /// the loop are logged but don't stop monitoring.
+    /// Main D-Bus monitoring supervisor (runs in a background thread).
     fn monitor_notifications(
         notifications: Arc<Mutex<Vec<Notification>>>,
         max_count: usize,
         cache_path: &Path,
         session_key: &str,
+    ) {
+        loop {
+            if let Err(error) = Self::monitor_notification_connection(
+                &notifications,
+                max_count,
+                cache_path,
+                session_key,
+            ) {
+                log::warn!("Native notification monitor disconnected: {error}");
+            }
+            std::thread::sleep(NOTIFICATION_MONITOR_RECONNECT_DELAY);
+        }
+    }
+
+    fn monitor_notification_connection(
+        notifications: &Arc<Mutex<Vec<Notification>>>,
+        max_count: usize,
+        cache_path: &Path,
+        session_key: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
+        use zbus::blocking::MessageIterator;
 
-        log::info!("Starting notification monitor via busctl");
-
-        // Capture Notify calls, their returned daemon IDs, and close signals.
-        let mut child = Command::new("busctl")
-            .args(&[
-                "monitor",
-                "--user",
-                "--match",
-                "type=method_call,interface=org.freedesktop.Notifications,member=Notify",
-                "--match",
-                "type=method_return,sender=org.freedesktop.Notifications",
-                "--match",
-                "type=signal,interface=org.freedesktop.Notifications,member=NotificationClosed",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()) // Suppress busctl stderr noise
-            .spawn()?;
-
-        let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-        let reader = BufReader::new(stdout);
-
-        let mut parser = BusctlNotificationParser::default();
-
-        for line in reader.lines() {
-            let line = line?;
-            for event in parser.push_line(&line, current_unix_timestamp()) {
+        let connection = open_notification_monitor_connection()?;
+        let mut parser = NotificationMessageParser::default();
+        log::info!("Using native zbus notification monitoring");
+        for message in MessageIterator::from(&connection) {
+            let message = message?;
+            let event = match parser.push_message(&message, current_unix_timestamp()) {
+                Ok(event) => event,
+                Err(error) => {
+                    log::debug!("Failed to decode monitored notification message: {error}");
+                    continue;
+                }
+            };
+            if let Some(event) = event {
                 let mut notifs = notifications.lock().unwrap();
                 match event {
                     NotificationBusEvent::Upsert(notification) => {
@@ -327,7 +303,7 @@ impl NotificationMonitor {
             }
         }
 
-        Ok(())
+        Err("notification monitor message stream closed".into())
     }
 
     /// Get a snapshot of current notifications (newest first).
@@ -414,22 +390,44 @@ impl NotificationMonitor {
     }
 }
 
+fn open_notification_monitor_connection()
+    -> Result<zbus::blocking::Connection, Box<dyn std::error::Error>>
+{
+    use zbus::MatchRule;
+    use zbus::blocking::Connection;
+    use zbus::message::Type as MessageType;
+
+    let connection = Connection::session()?;
+    let rules = [
+        MatchRule::builder()
+            .msg_type(MessageType::MethodCall)
+            .path(NOTIFICATIONS_PATH)?
+            .interface(NOTIFICATIONS_INTERFACE)?
+            .member("Notify")?
+            .build(),
+        MatchRule::builder()
+            .msg_type(MessageType::MethodReturn)
+            .sender(NOTIFICATIONS_SERVICE)?
+            .build(),
+        MatchRule::builder()
+            .msg_type(MessageType::Error)
+            .sender(NOTIFICATIONS_SERVICE)?
+            .build(),
+        MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .path(NOTIFICATIONS_PATH)?
+            .interface(NOTIFICATIONS_INTERFACE)?
+            .member("NotificationClosed")?
+            .build(),
+    ];
+    zbus::blocking::fdo::MonitoringProxy::new(&connection)?.become_monitor(&rules, 0)?;
+    Ok(connection)
+}
+
 #[derive(Debug)]
 enum NotificationBusEvent {
     Upsert(Notification),
     Closed { id: u32, server_owner: String },
-}
-
-#[derive(Debug, Default)]
-struct MonitoredBusMessage {
-    message_type: String,
-    cookie: Option<u64>,
-    reply_cookie: Option<u64>,
-    sender: Option<String>,
-    destination: Option<String>,
-    member: Option<String>,
-    strings: Vec<String>,
-    uint32s: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -441,139 +439,99 @@ struct PendingNotification {
 }
 
 #[derive(Debug, Default)]
-struct BusctlNotificationParser {
-    current: Option<MonitoredBusMessage>,
-    pending: HashMap<(String, u64), PendingNotification>,
+struct NotificationMessageParser {
+    pending: HashMap<(String, u32), PendingNotification>,
 }
 
-impl BusctlNotificationParser {
-    fn push_line(&mut self, line: &str, timestamp: u64) -> Vec<NotificationBusEvent> {
-        let trimmed = line.trim();
-        let mut events = Vec::new();
+impl NotificationMessageParser {
+    fn push_message(
+        &mut self,
+        message: &zbus::Message,
+        timestamp: u64,
+    ) -> zbus::Result<Option<NotificationBusEvent>> {
+        use zbus::message::Type as MessageType;
+        use zbus::zvariant::OwnedValue;
 
-        if is_busctl_message_header(trimmed) {
-            if let Some(event) = self.finish_message(timestamp) {
-                events.push(event);
-            }
-            let mut message = MonitoredBusMessage::default();
-            populate_message_header(&mut message, trimmed);
-            self.current = Some(message);
-            return events;
-        }
+        type NotifyArguments = (
+            String,
+            u32,
+            String,
+            String,
+            String,
+            Vec<String>,
+            HashMap<String, OwnedValue>,
+            i32,
+        );
 
-        if trimmed.is_empty() {
-            if let Some(event) = self.finish_message(timestamp) {
-                events.push(event);
-            }
-            return events;
-        }
-
-        let Some(message) = self.current.as_mut() else {
-            return events;
-        };
-        populate_message_header(message, trimmed);
-        if let Some(value) = parse_busctl_string(trimmed) {
-            message.strings.push(value);
-        } else if let Some(value) = parse_busctl_u32(trimmed) {
-            message.uint32s.push(value);
-        }
-
-        events
-    }
-
-    fn finish_message(&mut self, timestamp: u64) -> Option<NotificationBusEvent> {
-        let message = self.current.take()?;
-        match (message.message_type.as_str(), message.member.as_deref()) {
-            ("method_call", Some("Notify")) => {
-                let sender = message.sender?;
-                let cookie = message.cookie?;
-                let summary = message.strings.get(2)?.clone();
+        let header = message.header();
+        match header.message_type() {
+            MessageType::MethodCall if header.member().is_some_and(|member| member == "Notify") => {
+                let Some(sender) = header.sender().map(ToString::to_string) else {
+                    return Ok(None);
+                };
+                let (app_name, _, _, summary, body, _, _, _): NotifyArguments =
+                    message.body().deserialize()?;
                 if summary.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 self.pending.insert(
-                    (sender, cookie),
+                    (sender, message.primary_header().serial_num().get()),
                     PendingNotification {
-                        app_name: message
-                            .strings
-                            .first()
-                            .filter(|name| !name.is_empty())
-                            .cloned()
+                        app_name: (!app_name.is_empty())
+                            .then_some(app_name)
                             .unwrap_or_else(|| "System".to_string()),
                         summary,
-                        body: message.strings.get(3).cloned().unwrap_or_default(),
+                        body,
                         timestamp,
                     },
                 );
-                None
+                Ok(None)
             }
-            ("method_return", _) => {
-                let key = (message.destination?, message.reply_cookie?);
-                let pending = self.pending.remove(&key)?;
-                let id = *message.uint32s.first()?;
-                Some(NotificationBusEvent::Upsert(Notification {
+            MessageType::MethodReturn => {
+                let Some(key) = header.destination().zip(header.reply_serial()).map(
+                    |(destination, reply_serial)| {
+                        (destination.to_string(), reply_serial.get())
+                    },
+                ) else {
+                    return Ok(None);
+                };
+                let Some(pending) = self.pending.remove(&key) else {
+                    return Ok(None);
+                };
+                let id: u32 = message.body().deserialize()?;
+                Ok(Some(NotificationBusEvent::Upsert(Notification {
                     id: Some(id),
-                    server_owner: message.sender,
+                    server_owner: header.sender().map(ToString::to_string),
                     app_name: pending.app_name,
                     summary: pending.summary,
                     body: pending.body,
                     timestamp: pending.timestamp,
-                }))
+                })))
             }
-            ("signal", Some("NotificationClosed")) => Some(NotificationBusEvent::Closed {
-                id: *message.uint32s.first()?,
-                server_owner: message.sender?,
-            }),
-            _ => None,
+            MessageType::Error => {
+                if let Some(key) = header.destination().zip(header.reply_serial()).map(
+                    |(destination, reply_serial)| {
+                        (destination.to_string(), reply_serial.get())
+                    },
+                ) {
+                    self.pending.remove(&key);
+                }
+                Ok(None)
+            }
+            MessageType::Signal
+                if header
+                    .member()
+                    .is_some_and(|member| member == "NotificationClosed") =>
+            {
+                let Some(server_owner) = header.sender().map(ToString::to_string) else {
+                    return Ok(None);
+                };
+                let (id, _reason): (u32, u32) = message.body().deserialize()?;
+                Ok(Some(NotificationBusEvent::Closed { id, server_owner }))
+            }
+            _ => Ok(None),
         }
     }
-}
-
-fn is_busctl_message_header(line: &str) -> bool {
-    line.starts_with("Type=") || line.starts_with("‣ Type=")
-}
-
-fn populate_message_header(message: &mut MonitoredBusMessage, line: &str) {
-    if let Some(value) = busctl_header_value(line, "Type") {
-        message.message_type = value.to_string();
-    }
-    if let Some(value) = busctl_header_value(line, "Cookie").and_then(parse_u64) {
-        message.cookie = Some(value);
-    }
-    if let Some(value) = busctl_header_value(line, "ReplyCookie").and_then(parse_u64) {
-        message.reply_cookie = Some(value);
-    }
-    if let Some(value) = busctl_header_value(line, "Sender") {
-        message.sender = Some(value.to_string());
-    }
-    if let Some(value) = busctl_header_value(line, "Destination") {
-        message.destination = Some(value.to_string());
-    }
-    if let Some(value) = busctl_header_value(line, "Member") {
-        message.member = Some(value.to_string());
-    }
-}
-
-fn busctl_header_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=");
-    line.split_whitespace()
-        .find_map(|field| field.strip_prefix(&prefix))
-}
-
-fn parse_u64(value: &str) -> Option<u64> {
-    value.parse().ok()
-}
-
-fn parse_busctl_string(line: &str) -> Option<String> {
-    let encoded = line.strip_prefix("STRING ")?.strip_suffix(';')?;
-    serde_json::from_str(encoded).ok()
-}
-
-fn parse_busctl_u32(line: &str) -> Option<u32> {
-    line.strip_prefix("UINT32 ")?
-        .strip_suffix(';')?
-        .parse()
-        .ok()
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -799,39 +757,17 @@ fn persist_cached_notifications(
 #[cfg(test)]
 mod tests {
     use super::{
-        BusctlNotificationParser, Notification, NotificationBusEvent,
+        NOTIFICATIONS_INTERFACE, NOTIFICATIONS_PATH, NOTIFICATIONS_SERVICE, Notification,
+        NotificationBusEvent, NotificationMessageParser,
         apply_local_dismissal_suppression, load_cached_notifications,
-        persist_cached_notifications, upsert_notification,
+        open_notification_monitor_connection, persist_cached_notifications, upsert_notification,
     };
-    use std::collections::HashSet;
-
-    const NOTIFY_EXCHANGE: &str = r#"‣ Type=method_call  Endian=l  Flags=4  Version=1 Cookie=2
-  Sender=:1.8323  Destination=org.freedesktop.Notifications  Path=/org/freedesktop/Notifications  Interface=org.freedesktop.Notifications  Member=Notify
-  UniqueName=:1.8323
-  MESSAGE "susssasa{sv}i" {
-          STRING "COSMIC synchronization probe";
-          UINT32 0;
-          STRING "";
-          STRING "ID tracking probe";
-          STRING "Capturing the assigned ID.";
-  };
-
-‣ Type=method_return  Endian=l  Flags=0  Version=1 Cookie=71  ReplyCookie=2
-  Sender=:1.82  Destination=:1.8323
-  UniqueName=:1.82
-  MESSAGE "u" {
-          UINT32 15;
-  };
-"#;
-
-    const CLOSED_SIGNAL: &str = r#"‣ Type=signal  Endian=l  Flags=0  Version=1 Cookie=73
-  Sender=:1.82  Path=/org/freedesktop/Notifications  Interface=org.freedesktop.Notifications  Member=NotificationClosed
-  UniqueName=:1.82
-  MESSAGE "uu" {
-          UINT32 15;
-          UINT32 2;
-  };
-"#;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use zbus::blocking::{Connection, MessageIterator, Proxy};
+    use zbus::Message;
+    use zbus::zvariant::OwnedValue;
 
     fn cache_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -849,6 +785,48 @@ mod tests {
             body: "Body".to_string(),
             timestamp,
         }
+    }
+
+    fn notify_exchange() -> (Message, Message) {
+        let notify = Message::method(NOTIFICATIONS_PATH, "Notify")
+            .unwrap()
+            .sender(":1.8323")
+            .unwrap()
+            .destination(NOTIFICATIONS_SERVICE)
+            .unwrap()
+            .interface(NOTIFICATIONS_INTERFACE)
+            .unwrap()
+            .build(&(
+                "COSMIC synchronization probe".to_string(),
+                0_u32,
+                String::new(),
+                "ID tracking probe".to_string(),
+                "Capturing the assigned ID.\nWithout text parsing.".to_string(),
+                Vec::<String>::new(),
+                HashMap::<String, OwnedValue>::new(),
+                -1_i32,
+            ))
+            .unwrap();
+        let reply = Message::method_reply(&notify)
+            .unwrap()
+            .sender(":1.82")
+            .unwrap()
+            .build(&15_u32)
+            .unwrap();
+        (notify, reply)
+    }
+
+    fn closed_signal() -> Message {
+        Message::signal(
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+            "NotificationClosed",
+        )
+        .unwrap()
+        .sender(":1.82")
+        .unwrap()
+        .build(&(15_u32, 2_u32))
+        .unwrap()
     }
 
     #[test]
@@ -892,36 +870,105 @@ mod tests {
 
     #[test]
     fn correlates_notify_call_with_cosmic_assigned_id() {
-        let mut parser = BusctlNotificationParser::default();
-        let mut events = Vec::new();
-        for line in NOTIFY_EXCHANGE.lines().chain([""]) {
-            events.extend(parser.push_line(line, 42));
-        }
-
-        let NotificationBusEvent::Upsert(notification) = &events[0] else {
+        let mut parser = NotificationMessageParser::default();
+        let (notify, reply) = notify_exchange();
+        assert!(parser.push_message(&notify, 42).unwrap().is_none());
+        let Some(NotificationBusEvent::Upsert(notification)) =
+            parser.push_message(&reply, 43).unwrap()
+        else {
             panic!("expected a notification event");
         };
-        assert_eq!(events.len(), 1);
         assert_eq!(notification.id, Some(15));
         assert_eq!(notification.server_owner.as_deref(), Some(":1.82"));
         assert_eq!(notification.app_name, "COSMIC synchronization probe");
         assert_eq!(notification.summary, "ID tracking probe");
-        assert_eq!(notification.body, "Capturing the assigned ID.");
+        assert_eq!(
+            notification.body,
+            "Capturing the assigned ID.\nWithout text parsing."
+        );
         assert_eq!(notification.timestamp, 42);
     }
 
     #[test]
     fn parses_cosmic_notification_closed_signal() {
-        let mut parser = BusctlNotificationParser::default();
-        let mut events = Vec::new();
-        for line in CLOSED_SIGNAL.lines().chain([""]) {
-            events.extend(parser.push_line(line, 42));
-        }
+        let mut parser = NotificationMessageParser::default();
+        let event = parser.push_message(&closed_signal(), 42).unwrap();
 
         assert!(matches!(
-            events.as_slice(),
-            [NotificationBusEvent::Closed { id: 15, server_owner }] if server_owner == ":1.82"
+            event,
+            Some(NotificationBusEvent::Closed { id: 15, server_owner }) if server_owner == ":1.82"
         ));
+    }
+
+    #[test]
+    fn discards_pending_notification_after_a_dbus_error() {
+        let mut parser = NotificationMessageParser::default();
+        let (notify, reply) = notify_exchange();
+        let error = Message::method_error(&notify, "org.freedesktop.DBus.Error.Failed")
+            .unwrap()
+            .sender(":1.82")
+            .unwrap()
+            .build(&"Notification rejected")
+            .unwrap();
+
+        assert!(parser.push_message(&notify, 42).unwrap().is_none());
+        assert_eq!(parser.pending.len(), 1);
+        assert!(parser.push_message(&error, 43).unwrap().is_none());
+        assert!(parser.pending.is_empty());
+        assert!(parser.push_message(&reply, 44).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "creates and closes a notification through the live COSMIC daemon"]
+    fn captures_a_live_notification_with_native_zbus_monitoring() {
+        let monitor = open_notification_monitor_connection().unwrap();
+        let messages = MessageIterator::from(monitor);
+        let (event_sender, event_receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut parser = NotificationMessageParser::default();
+            for message in messages {
+                let Ok(message) = message else {
+                    return;
+                };
+                if let Ok(Some(NotificationBusEvent::Upsert(notification))) =
+                    parser.push_message(&message, 42)
+                {
+                    let _ = event_sender.send(notification);
+                    return;
+                }
+            }
+        });
+
+        let connection = Connection::session().unwrap();
+        let proxy = Proxy::new(
+            &connection,
+            NOTIFICATIONS_SERVICE,
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+        )
+        .unwrap();
+        let id: u32 = proxy
+            .call(
+                "Notify",
+                &(
+                    "COSMIC Widget Test",
+                    0_u32,
+                    "",
+                    "Native zbus notification monitor test",
+                    "This notification should close automatically.",
+                    Vec::<String>::new(),
+                    HashMap::<String, OwnedValue>::new(),
+                    5_000_i32,
+                ),
+            )
+            .unwrap();
+
+        let captured = event_receiver.recv_timeout(Duration::from_secs(3));
+        let _: () = proxy.call("CloseNotification", &id).unwrap();
+        let captured = captured.expect("native monitor did not capture the notification");
+        assert_eq!(captured.id, Some(id));
+        assert_eq!(captured.app_name, "COSMIC Widget Test");
+        assert_eq!(captured.summary, "Native zbus notification monitor test");
     }
 
     #[test]

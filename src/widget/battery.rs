@@ -31,7 +31,8 @@
 //! 1. **Startup**: Load cached device names for instant display
 //! 2. **First update**: Immediately query tools in background thread
 //! 3. **Native updates**: Query Maxwell and Logitech devices every 5 seconds
-//! 4. **External updates**: Request Solaar/HeadsetControl updates every 30 seconds
+//! 4. **External fallbacks**: Refresh only backends serving non-native devices
+//! 5. **External discovery**: Recheck inactive backends every five minutes
 //!
 //! ## Parsing Strategies
 //!
@@ -46,6 +47,7 @@
 //! - Parse failure → keep previous snapshot
 //! - Device disconnected → device shows as not connected
 
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +62,8 @@ const MAXWELL_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(2);
 const INITIAL_NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const EXTERNAL_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const EXTERNAL_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 // ============================================================================
 // Battery Device Struct
@@ -97,15 +101,40 @@ pub struct BatteryDevice {
     pub is_connected: bool,
 }
 
+#[derive(Debug, Default)]
+struct ExternalDeviceState {
+    solaar_devices: Vec<BatteryDevice>,
+    headsetcontrol_devices: Vec<BatteryDevice>,
+    solaar_fallback_names: HashSet<String>,
+    headsetcontrol_fallback_names: HashSet<String>,
+    last_discovery: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalProbePlan {
+    solaar: bool,
+    headsetcontrol: bool,
+}
+
+impl ExternalProbePlan {
+    const DISCOVERY: Self = Self {
+        solaar: true,
+        headsetcontrol: true,
+    };
+
+    fn is_empty(self) -> bool {
+        !self.solaar && !self.headsetcontrol
+    }
+}
+
 // ============================================================================
 // Battery Monitor Struct
 // ============================================================================
 
-/// Monitors battery levels for external peripherals via CLI tools.
+/// Monitors battery levels for external peripherals.
 ///
-/// Uses Solaar (Logitech devices) and HeadsetControl (gaming headsets) to
-/// query battery status. All queries run in a background thread to avoid
-/// blocking the main render loop.
+/// Native readers handle supported Audeze and Logitech devices. Solaar and
+/// HeadsetControl are retained for discovery and unsupported-device fallbacks.
 ///
 /// # Threading Model
 ///
@@ -113,7 +142,7 @@ pub struct BatteryDevice {
 /// - `update_requested`: Flag to trigger background refresh
 /// - Background thread retries unresolved startup readings every second
 /// - Native polling returns to a five-second interval after startup resolves
-/// - Main thread calls `update()` every 30 seconds to set flag
+/// - Main thread calls `update()` every 30 seconds to refresh active fallbacks
 ///
 /// # Caching
 ///
@@ -125,7 +154,7 @@ pub struct BatteryMonitor {
     devices: Arc<Mutex<Vec<BatteryDevice>>>,
     /// Last time `update()` was called (for rate limiting)
     last_update: Instant,
-    /// Minimum interval between requesting Solaar updates (30 seconds)
+    /// Minimum interval between requesting external fallback updates
     refresh_interval: Duration,
     /// Flag to signal background thread that an update is needed
     update_requested: Arc<Mutex<bool>>,
@@ -139,14 +168,15 @@ impl BatteryMonitor {
     /// 1. Load cached device info from disk (shows instantly)
     /// 2. Set `last_update` to 31 seconds ago to trigger immediate first update
     /// 3. Spawn background thread for tool queries
-    /// 4. Background thread immediately queries Solaar/HeadsetControl
+    /// 4. Background thread performs one external-device discovery pass
     /// 5. Cache updated on first successful query
     ///
     /// # Background Thread Behavior
     ///
     /// - Sleeps for 1 second while cached startup readings are unresolved
     /// - Returns to a 5-second native polling interval after resolution
-    /// - Only queries tools when `update_requested` flag is set
+    /// - Only queries active fallback backends during 30-second updates
+    /// - Rechecks inactive external backends every five minutes
     /// - On error, keeps previous device snapshot
     pub fn new() -> Self {
         // Initialize with 31 seconds ago to force immediate first update
@@ -190,10 +220,7 @@ impl BatteryMonitor {
                     "Using native monitoring for {} Logitech device(s)",
                     native_logitech.len()
                 );
-                merge_native_logitech(
-                    &mut devices_clone.lock().unwrap(),
-                    &native_logitech,
-                );
+                merge_native_logitech(&mut devices_clone.lock().unwrap(), &native_logitech);
             }
 
             match query_native_maxwell(false) {
@@ -213,28 +240,39 @@ impl BatteryMonitor {
                 }
             }
 
-            // Perform immediate first update on startup
-            match query_external_devices() {
-                Ok(mut new_devices) => {
-                    if native_maxwell_authoritative {
-                        merge_native_maxwell(&mut new_devices, native_maxwell.clone());
-                    }
-                    merge_native_logitech(&mut new_devices, &native_logitech);
-                    let mut devices = devices_clone.lock().unwrap();
-                    preserve_loading_devices(&mut new_devices, &devices);
-                    *devices = new_devices.clone();
-                    drop(devices);
+            // Probe both external backends once for devices that are not covered
+            // by the native readers. Inactive backends are only rediscovered
+            // periodically after this initial pass.
+            let mut external_state = ExternalDeviceState::default();
+            seed_cached_fallbacks(
+                &mut external_state,
+                &devices_clone.lock().unwrap(),
+                native_maxwell_authoritative,
+                &native_logitech,
+            );
+            query_external_backends(&mut external_state, ExternalProbePlan::DISCOVERY);
+            external_state.last_discovery = Some(Instant::now());
+            reconcile_external_fallbacks(
+                &mut external_state,
+                native_maxwell_authoritative,
+                &native_logitech,
+            );
 
-                    // Update cache after first successful update
-                    if is_first_update && new_devices.iter().any(|device| !device.is_loading) {
-                        let mut cache = super::cache::WidgetCache::load();
-                        cache.update_battery_devices(&new_devices);
-                        is_first_update = false;
-                    }
-                }
-                Err(_) => {
-                    // On error, keep cached data - tool may not be installed
-                }
+            let mut new_devices = combined_battery_devices(
+                &external_state,
+                native_maxwell_authoritative,
+                native_maxwell.clone(),
+                &native_logitech,
+            );
+            let mut devices = devices_clone.lock().unwrap();
+            preserve_loading_devices(&mut new_devices, &devices);
+            *devices = new_devices.clone();
+            drop(devices);
+
+            if is_first_update && new_devices.iter().any(|device| !device.is_loading) {
+                let mut cache = super::cache::WidgetCache::load();
+                cache.update_battery_devices(&new_devices);
+                is_first_update = false;
             }
 
             // Clear the initial update request flag
@@ -265,8 +303,10 @@ impl BatteryMonitor {
                 }
 
                 native_logitech = query_native_logitech(&mut logitech_monitor);
-                merge_native_logitech(
-                    &mut devices_clone.lock().unwrap(),
+                merge_native_logitech(&mut devices_clone.lock().unwrap(), &native_logitech);
+                reconcile_external_fallbacks(
+                    &mut external_state,
+                    native_maxwell_authoritative,
                     &native_logitech,
                 );
 
@@ -282,29 +322,43 @@ impl BatteryMonitor {
                 };
 
                 if requested {
-                    match query_external_devices() {
-                        Ok(mut new_devices) => {
-                            if native_maxwell_authoritative {
-                                merge_native_maxwell(&mut new_devices, native_maxwell.clone());
-                            }
-                            merge_native_logitech(&mut new_devices, &native_logitech);
-                            let mut devices = devices_clone.lock().unwrap();
-                            preserve_loading_devices(&mut new_devices, &devices);
-                            *devices = new_devices.clone();
-                            drop(devices);
+                    let discovery_due = external_state
+                        .last_discovery
+                        .is_none_or(|last| last.elapsed() >= EXTERNAL_DISCOVERY_INTERVAL);
+                    let plan = external_probe_plan(
+                        &external_state,
+                        discovery_due,
+                        native_maxwell_authoritative,
+                    );
+                    if plan.is_empty() {
+                        continue;
+                    }
 
-                            // Update cache after first successful update
-                            if is_first_update
-                                && new_devices.iter().any(|device| !device.is_loading)
-                            {
-                                let mut cache = super::cache::WidgetCache::load();
-                                cache.update_battery_devices(&new_devices);
-                                is_first_update = false;
-                            }
-                        }
-                        Err(_) => {
-                            // On error, keep previous data
-                        }
+                    query_external_backends(&mut external_state, plan);
+                    if discovery_due {
+                        external_state.last_discovery = Some(Instant::now());
+                    }
+                    reconcile_external_fallbacks(
+                        &mut external_state,
+                        native_maxwell_authoritative,
+                        &native_logitech,
+                    );
+
+                    let mut new_devices = combined_battery_devices(
+                        &external_state,
+                        native_maxwell_authoritative,
+                        native_maxwell.clone(),
+                        &native_logitech,
+                    );
+                    let mut devices = devices_clone.lock().unwrap();
+                    preserve_loading_devices(&mut new_devices, &devices);
+                    *devices = new_devices.clone();
+                    drop(devices);
+
+                    if is_first_update && new_devices.iter().any(|device| !device.is_loading) {
+                        let mut cache = super::cache::WidgetCache::load();
+                        cache.update_battery_devices(&new_devices);
+                        is_first_update = false;
                     }
                 }
             }
@@ -313,7 +367,7 @@ impl BatteryMonitor {
         Self {
             devices,
             last_update,
-            refresh_interval: Duration::from_secs(30),
+            refresh_interval: EXTERNAL_FALLBACK_REFRESH_INTERVAL,
             update_requested,
         }
     }
@@ -333,9 +387,9 @@ impl BatteryMonitor {
     ///
     /// # Rate Limiting
     ///
-    /// Battery queries are expensive (spawn external processes), so we
-    /// limit updates to every 30 seconds. Battery levels don't change
-    /// fast enough to need more frequent polling.
+    /// Active fallback queries are expensive because they spawn external
+    /// processes, so they are limited to every 30 seconds. Native devices
+    /// continue to update on their faster background interval.
     pub fn update(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_update) < self.refresh_interval {
@@ -355,9 +409,7 @@ impl BatteryMonitor {
 
 fn query_native_maxwell(was_connected: bool) -> Result<Option<BatteryDevice>, String> {
     let mut state = audeze_maxwell::query()?;
-    let is_connected = state
-        .as_ref()
-        .is_some_and(|state| state.connected);
+    let is_connected = state.as_ref().is_some_and(|state| state.connected);
 
     if is_connected != was_connected {
         std::thread::sleep(MAXWELL_CONNECTION_SETTLE_DELAY);
@@ -381,10 +433,7 @@ fn query_native_maxwell(was_connected: bool) -> Result<Option<BatteryDevice>, St
     }))
 }
 
-fn merge_native_maxwell(
-    devices: &mut Vec<BatteryDevice>,
-    native_maxwell: Option<BatteryDevice>,
-) {
+fn merge_native_maxwell(devices: &mut Vec<BatteryDevice>, native_maxwell: Option<BatteryDevice>) {
     if let Some(device) = native_maxwell {
         replace_device_in_place(devices, device);
     } else {
@@ -457,77 +506,175 @@ fn native_poll_interval(devices: &[BatteryDevice], elapsed: Duration) -> Duratio
     }
 }
 
+fn seed_cached_fallbacks(
+    external: &mut ExternalDeviceState,
+    cached_devices: &[BatteryDevice],
+    native_maxwell_authoritative: bool,
+    native_logitech: &[BatteryDevice],
+) {
+    for device in cached_devices.iter().filter(|device| device.is_loading) {
+        if native_logitech
+            .iter()
+            .any(|native| native.name.eq_ignore_ascii_case(&device.name))
+        {
+            continue;
+        }
+
+        let name = device.name.to_ascii_lowercase();
+        let kind = device.kind.as_deref().unwrap_or_default();
+        if device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME)
+            || kind.eq_ignore_ascii_case("headset")
+        {
+            if !native_maxwell_authoritative
+                || !device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME)
+            {
+                external.headsetcontrol_fallback_names.insert(name);
+            }
+        } else if [
+            "mouse",
+            "keyboard",
+            "numpad",
+            "presenter",
+            "trackball",
+            "touchpad",
+        ]
+        .iter()
+        .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+        {
+            external.solaar_fallback_names.insert(name);
+        }
+    }
+}
+
+fn reconcile_external_fallbacks(
+    external: &mut ExternalDeviceState,
+    native_maxwell_authoritative: bool,
+    native_logitech: &[BatteryDevice],
+) {
+    external.solaar_fallback_names.retain(|name| {
+        !native_logitech
+            .iter()
+            .any(|native| native.name.eq_ignore_ascii_case(name))
+    });
+    for device in &external.solaar_devices {
+        if !native_logitech
+            .iter()
+            .any(|native| native.name.eq_ignore_ascii_case(&device.name))
+        {
+            external
+                .solaar_fallback_names
+                .insert(device.name.to_ascii_lowercase());
+        }
+    }
+
+    if native_maxwell_authoritative {
+        external
+            .headsetcontrol_fallback_names
+            .remove(&MAXWELL_DEVICE_NAME.to_ascii_lowercase());
+    }
+    for device in &external.headsetcontrol_devices {
+        if !native_maxwell_authoritative || !device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME) {
+            external
+                .headsetcontrol_fallback_names
+                .insert(device.name.to_ascii_lowercase());
+        }
+    }
+}
+
+fn external_probe_plan(
+    external: &ExternalDeviceState,
+    discovery_due: bool,
+    native_maxwell_authoritative: bool,
+) -> ExternalProbePlan {
+    ExternalProbePlan {
+        solaar: discovery_due || !external.solaar_fallback_names.is_empty(),
+        headsetcontrol: discovery_due
+            || !native_maxwell_authoritative
+            || !external.headsetcontrol_fallback_names.is_empty(),
+    }
+}
+
+fn query_external_backends(external: &mut ExternalDeviceState, plan: ExternalProbePlan) {
+    if plan.solaar {
+        match query_solaar_devices() {
+            Ok(devices) => external.solaar_devices = devices,
+            Err(error) => log::debug!("Solaar fallback query failed: {error}"),
+        }
+    }
+    if plan.headsetcontrol {
+        match query_headsetcontrol_devices() {
+            Ok(devices) => external.headsetcontrol_devices = devices,
+            Err(error) => log::debug!("HeadsetControl fallback query failed: {error}"),
+        }
+    }
+}
+
+fn combined_battery_devices(
+    external: &ExternalDeviceState,
+    native_maxwell_authoritative: bool,
+    native_maxwell: Option<BatteryDevice>,
+    native_logitech: &[BatteryDevice],
+) -> Vec<BatteryDevice> {
+    let mut devices = Vec::new();
+    for device in external
+        .solaar_devices
+        .iter()
+        .chain(&external.headsetcontrol_devices)
+    {
+        replace_device_in_place(&mut devices, device.clone());
+    }
+    if native_maxwell_authoritative {
+        merge_native_maxwell(&mut devices, native_maxwell);
+    }
+    merge_native_logitech(&mut devices, native_logitech);
+    devices
+}
+
 // ============================================================================
 // External Tool Query Functions
 // ============================================================================
 
-/// Query Solaar and HeadsetControl for battery information.
-///
-/// Aggregates devices from multiple sources:
-/// 1. Solaar JSON output (preferred for Logitech devices)
-/// 2. Solaar text output (fallback)
-/// 3. HeadsetControl JSON output (gaming headsets)
-///
-/// # Returns
-///
-/// Combined list of all discovered devices, or empty list on failure.
-fn query_external_devices() -> Result<Vec<BatteryDevice>, String> {
-    let mut all_devices = Vec::new();
-
-    // ========================================================================
-    // Solaar Query (Logitech devices)
-    // ========================================================================
-
-    // Try JSON output if available (newer Solaar versions)
-    // JSON is more reliable and structured than text output
+/// Query Solaar for Logitech devices not covered by the native readers.
+fn query_solaar_devices() -> Result<Vec<BatteryDevice>, String> {
+    // Prefer structured output when supported by the installed Solaar version.
     if let Ok(output) = Command::new("solaar").arg("show").arg("--json").output() {
         if output.status.success() {
             if let Ok(text) = String::from_utf8(output.stdout) {
                 if let Ok(devices) = parse_solaar_json(&text) {
-                    all_devices.extend(devices);
+                    if !devices.is_empty() {
+                        return Ok(devices);
+                    }
                 }
             }
         }
     }
 
-    // Fallback: plain-text `solaar show` if JSON didn't give us devices
-    // Older Solaar versions don't support JSON output
-    // Note: We don't check exit status here because Solaar may output valid
-    // device data to stdout before encountering an error (exit code 1).
-    // This happens when there's a Python exception while querying certain
-    // device settings - the battery data is still valid.
-    if all_devices.is_empty() {
-        if let Ok(output) = Command::new("solaar").arg("show").output() {
-            if let Ok(text) = String::from_utf8(output.stdout) {
-                if !text.is_empty() {
-                    all_devices.extend(parse_solaar_text(&text));
-                }
-            }
-        }
-    }
+    // Older Solaar versions require plain text. A nonzero status may still
+    // accompany useful device output when querying one setting fails.
+    let output = Command::new("solaar")
+        .arg("show")
+        .output()
+        .map_err(|error| format!("failed to start Solaar: {error}"))?;
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("Solaar returned invalid UTF-8: {error}"))?;
+    Ok(parse_solaar_text(&text))
+}
 
-    // ========================================================================
-    // HeadsetControl Query (gaming headsets)
-    // ========================================================================
-
-    // HeadsetControl supports many gaming headset brands
-    // -b: battery only, -o json: JSON output format
-    if let Ok(output) = Command::new("headsetcontrol")
+/// Query HeadsetControl for gaming headsets without a native reader.
+fn query_headsetcontrol_devices() -> Result<Vec<BatteryDevice>, String> {
+    let output = Command::new("headsetcontrol")
         .arg("-b")
         .arg("-o")
         .arg("json")
         .output()
-    {
-        if output.status.success() {
-            if let Ok(text) = String::from_utf8(output.stdout) {
-                if let Ok(headset_devices) = parse_headsetcontrol_json(&text) {
-                    all_devices.extend(headset_devices);
-                }
-            }
-        }
+        .map_err(|error| format!("failed to start HeadsetControl: {error}"))?;
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("HeadsetControl returned invalid UTF-8: {error}"))?;
+    match parse_headsetcontrol_json(&text) {
+        Ok(devices) => Ok(devices),
+        Err(_) if !output.status.success() => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
-
-    Ok(all_devices)
 }
 
 // ============================================================================
@@ -890,9 +1037,10 @@ fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatteryDevice, INITIAL_NATIVE_POLL_INTERVAL, INITIAL_PROBE_TIMEOUT, NATIVE_POLL_INTERVAL,
-        expire_initial_readings, merge_native_logitech, merge_native_maxwell, native_poll_interval,
-        parse_headsetcontrol_json, preserve_loading_devices,
+        BatteryDevice, ExternalDeviceState, ExternalProbePlan, INITIAL_NATIVE_POLL_INTERVAL,
+        INITIAL_PROBE_TIMEOUT, NATIVE_POLL_INTERVAL, expire_initial_readings, external_probe_plan,
+        merge_native_logitech, merge_native_maxwell, native_poll_interval,
+        parse_headsetcontrol_json, preserve_loading_devices, reconcile_external_fallbacks,
     };
     use std::time::Duration;
 
@@ -1071,6 +1219,83 @@ mod tests {
             devices
                 .iter()
                 .any(|device| device.name == "Unsupported Logitech device")
+        );
+    }
+
+    #[test]
+    fn native_devices_disable_thirty_second_external_polling() {
+        let native_logitech = vec![battery_device("G309 LIGHTSPEED", false)];
+        let mut external = ExternalDeviceState {
+            solaar_devices: vec![battery_device("G309 LIGHTSPEED", false)],
+            headsetcontrol_devices: vec![battery_device("Audeze Maxwell", false)],
+            ..Default::default()
+        };
+
+        reconcile_external_fallbacks(&mut external, true, &native_logitech);
+
+        assert_eq!(
+            external_probe_plan(&external, false, true),
+            ExternalProbePlan {
+                solaar: false,
+                headsetcontrol: false,
+            }
+        );
+        assert_eq!(
+            external_probe_plan(&external, true, true),
+            ExternalProbePlan::DISCOVERY
+        );
+    }
+
+    #[test]
+    fn unsupported_devices_keep_only_their_fallback_backend_active() {
+        let native_logitech = vec![battery_device("G309 LIGHTSPEED", false)];
+        let mut external = ExternalDeviceState {
+            solaar_devices: vec![
+                battery_device("G309 LIGHTSPEED", false),
+                battery_device("Unsupported Logitech device", false),
+            ],
+            headsetcontrol_devices: vec![battery_device("Audeze Maxwell", false)],
+            ..Default::default()
+        };
+
+        reconcile_external_fallbacks(&mut external, true, &native_logitech);
+
+        assert_eq!(
+            external_probe_plan(&external, false, true),
+            ExternalProbePlan {
+                solaar: true,
+                headsetcontrol: false,
+            }
+        );
+    }
+
+    #[test]
+    fn native_coverage_retires_a_temporary_solaar_fallback() {
+        let mut external = ExternalDeviceState::default();
+        external
+            .solaar_fallback_names
+            .insert("mx mechanical mini".to_string());
+        assert!(external_probe_plan(&external, false, true).solaar);
+
+        reconcile_external_fallbacks(
+            &mut external,
+            true,
+            &[battery_device("MX Mechanical Mini", false)],
+        );
+
+        assert!(!external_probe_plan(&external, false, true).solaar);
+    }
+
+    #[test]
+    fn headsetcontrol_remains_a_fallback_when_native_maxwell_fails() {
+        let external = ExternalDeviceState::default();
+
+        assert_eq!(
+            external_probe_plan(&external, false, false),
+            ExternalProbePlan {
+                solaar: false,
+                headsetcontrol: true,
+            }
         );
     }
 }
