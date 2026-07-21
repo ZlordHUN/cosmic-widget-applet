@@ -21,8 +21,9 @@ use cosmic::iced::platform_specific::shell::commands::layer_surface::{
 };
 use cosmic::iced::platform_specific::shell::commands::{blur, corner_radius};
 use cosmic::iced::{self, Color, Point, Rectangle, Size, Subscription, Task, window};
+use futures_util::SinkExt;
 use stats::{StatsSampler, SystemSnapshot};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "com.github.zoliviragh.CosmicWidget.Iced";
 const SURFACE_WIDTH: u32 = 370;
@@ -45,6 +46,9 @@ const NOTIFICATION_EXPANSION_DURATION: Duration = Duration::from_millis(220);
 const EMPTY_MEDIA_HEIGHT: u32 = 83;
 const MEDIA_SECTION_HEIGHT: u32 = 248;
 const MEDIA_CONTROL_GRACE: Duration = Duration::from_secs(2);
+const MIN_UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_UI_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const UI_TICK_SETTLE_DELAY: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone)]
 struct PendingPlayback {
@@ -196,6 +200,7 @@ pub fn run() -> iced::Result {
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
 
     iced::daemon(App::new, App::update, App::view)
+        .executor::<cosmic::executor::single::Executor>()
         .title(App::title)
         .subscription(App::subscription)
         .theme(App::theme)
@@ -683,7 +688,8 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let stats = iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick);
+        let stats = Subscription::run_with(self.ui_tick_interval(), aligned_tick_stream)
+            .map(|_| Message::Tick);
 
         if self.animations_active() {
             Subscription::batch([
@@ -705,6 +711,10 @@ impl App {
             || self.notification_scroll.is_animating()
     }
 
+    fn ui_tick_interval(&self) -> Duration {
+        ui_tick_interval(self.config.update_interval_ms)
+    }
+
     fn target_surface_height(&self) -> u32 {
         desired_surface_height_with_animation(
             &self.config,
@@ -715,6 +725,40 @@ impl App {
             self.notification_group_expansion.target,
         )
     }
+}
+
+fn ui_tick_interval(configured_ms: u64) -> Duration {
+    Duration::from_millis(configured_ms).clamp(MIN_UI_TICK_INTERVAL, MAX_UI_TICK_INTERVAL)
+}
+
+fn aligned_tick_stream(interval: &Duration) -> impl iced::futures::Stream<Item = ()> + use<> {
+    let interval = *interval;
+
+    iced::stream::channel(1, async move |mut output| {
+        loop {
+            let elapsed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            tokio::time::sleep(delay_until_next_tick(elapsed, interval)).await;
+
+            if output.send(()).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn delay_until_next_tick(elapsed: Duration, interval: Duration) -> Duration {
+    let interval_ns = interval.as_nanos().max(1);
+    let remainder_ns = elapsed.as_nanos() % interval_ns;
+    let until_boundary_ns = if remainder_ns == 0 {
+        interval_ns
+    } else {
+        interval_ns - remainder_ns
+    };
+    let until_boundary = Duration::from_nanos(u64::try_from(until_boundary_ns).unwrap_or(u64::MAX));
+
+    until_boundary.saturating_add(UI_TICK_SETTLE_DELAY)
 }
 
 fn reconcile_media_state(
@@ -1068,9 +1112,9 @@ fn estimated_wrapped_lines(text: &str, line_width: usize) -> u32 {
 mod tests {
     use super::{
         BASE_SURFACE_HEIGHT, ExpansionAnimation, NOTIFICATION_EXPANSION_DURATION,
-        NotificationKey, PendingPlayback, ScrollAnimation, desired_surface_height,
-        desired_surface_height_with_expansion, notification_viewport_height_with_animation,
-        reconcile_media_state,
+        NotificationKey, PendingPlayback, ScrollAnimation, UI_TICK_SETTLE_DELAY,
+        delay_until_next_tick, desired_surface_height, desired_surface_height_with_expansion,
+        notification_viewport_height_with_animation, reconcile_media_state, ui_tick_interval,
     };
     use crate::battery::BatteryDevice;
     use crate::config::{Config, WidgetSection};
@@ -1079,6 +1123,27 @@ mod tests {
     use crate::storage::DiskInfo;
     use crate::weather::WeatherData;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn ui_ticks_follow_the_configured_rate_without_exceeding_one_second() {
+        assert_eq!(ui_tick_interval(100), Duration::from_millis(250));
+        assert_eq!(ui_tick_interval(500), Duration::from_millis(500));
+        assert_eq!(ui_tick_interval(5_000), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ui_ticks_align_just_after_the_next_epoch_boundary() {
+        let interval = Duration::from_secs(1);
+
+        assert_eq!(
+            delay_until_next_tick(Duration::from_millis(1_250), interval),
+            Duration::from_millis(750) + UI_TICK_SETTLE_DELAY,
+        );
+        assert_eq!(
+            delay_until_next_tick(Duration::from_secs(2), interval),
+            interval + UI_TICK_SETTLE_DELAY,
+        );
+    }
 
     #[test]
     fn surface_height_tracks_visible_storage_rows() {

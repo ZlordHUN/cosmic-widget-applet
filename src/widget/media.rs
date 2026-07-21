@@ -44,30 +44,23 @@ mod mpris;
 
 const MAX_ARTWORK_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ARTWORK_DIMENSION: u32 = 4096;
-const LEGACY_ARTWORK_DIMENSION: u32 = 512;
 const MIN_YOUTUBE_THUMBNAIL_WIDTH: u32 = 320;
 const MIN_YOUTUBE_THUMBNAIL_HEIGHT: u32 = 180;
 const TIMELINE_REFRESH_RETRY: Duration = Duration::from_secs(2);
 const MAX_TIMELINE_REFRESH_ATTEMPTS: u8 = 3;
+const ARTWORK_QUEUE_CAPACITY: usize = 32;
+const MAX_CONCURRENT_ARTWORK_REQUESTS: usize = 4;
 
 // ============================================================================
 // Album Art Cache
 // ============================================================================
 
-/// Decoded album art ready for rendering.
-///
-/// Stores RGBA pixel data along with dimensions for Cairo rendering.
+/// Encoded album art and its source dimensions, ready for Iced rendering.
 #[derive(Clone)]
 pub struct AlbumArt {
-    /// Premultiplied BGRA pixels retained for the legacy Cairo renderer.
-    pub data: Arc<[u8]>,
-    /// Pixel width of the legacy render buffer.
-    pub width: u32,
-    /// Pixel height of the legacy render buffer.
-    pub height: u32,
-    /// Decoded width before any legacy-renderer downscaling.
+    /// Decoded source width.
     pub source_width: u32,
-    /// Decoded height before any legacy-renderer downscaling.
+    /// Decoded source height.
     pub source_height: u32,
     /// Stable Iced handle backed by the original encoded image bytes.
     pub iced_handle: cosmic::iced::widget::image::Handle,
@@ -82,11 +75,8 @@ impl AlbumArt {
 impl std::fmt::Debug for AlbumArt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlbumArt")
-            .field("width", &self.width)
-            .field("height", &self.height)
             .field("source_width", &self.source_width)
             .field("source_height", &self.source_height)
-            .field("data_len", &self.data.len())
             .finish()
     }
 }
@@ -390,6 +380,116 @@ impl TrackArtwork {
         if is_better {
             self.best = Some(candidate);
         }
+    }
+}
+
+#[derive(Clone)]
+struct ArtworkRequest {
+    player_id: PlayerId,
+    track: TrackSignature,
+    url: String,
+}
+
+struct ArtworkResult {
+    request: ArtworkRequest,
+    artwork: Option<AlbumArt>,
+}
+
+struct ArtworkLoader {
+    requests: tokio::sync::mpsc::Sender<ArtworkRequest>,
+    completed: std::sync::mpsc::Receiver<ArtworkResult>,
+    pending_urls: HashSet<String>,
+    available: bool,
+}
+
+impl ArtworkLoader {
+    fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .user_agent("cosmic-widget-applet/0.1")
+            .build()
+            .unwrap_or_else(|error| {
+                log::warn!("Failed to configure the artwork HTTP client: {error}");
+                reqwest::Client::new()
+            });
+        let (request_tx, mut request_rx) =
+            tokio::sync::mpsc::channel::<ArtworkRequest>(ARTWORK_QUEUE_CAPACITY);
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel::<ArtworkResult>();
+
+        if let Err(error) = std::thread::Builder::new()
+            .name("artwork-loader".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        log::warn!("Failed to start the artwork runtime: {error}");
+                        return;
+                    }
+                };
+
+                runtime.block_on(async move {
+                    let permits = Arc::new(tokio::sync::Semaphore::new(
+                        MAX_CONCURRENT_ARTWORK_REQUESTS,
+                    ));
+                    while let Some(request) = request_rx.recv().await {
+                        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                            break;
+                        };
+                        let client = client.clone();
+                        let completed_tx = completed_tx.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let artwork =
+                                MediaMonitor::download_artwork(&client, &request.url).await;
+                            let _ = completed_tx.send(ArtworkResult { request, artwork });
+                        });
+                    }
+                });
+            })
+        {
+            log::warn!("Failed to spawn the artwork loader: {error}");
+        }
+
+        Self {
+            requests: request_tx,
+            completed: completed_rx,
+            pending_urls: HashSet::new(),
+            available: true,
+        }
+    }
+
+    fn enqueue(&mut self, request: ArtworkRequest) -> bool {
+        if self.pending_urls.contains(&request.url) {
+            return true;
+        }
+        if !self.available {
+            return false;
+        }
+
+        let url = request.url.clone();
+        match self.requests.try_send(request) {
+            Ok(()) => {
+                self.pending_urls.insert(url);
+                true
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => false,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.available = false;
+                log::warn!("Artwork loader stopped accepting requests");
+                false
+            }
+        }
+    }
+
+    fn take_completed(&mut self) -> Vec<ArtworkResult> {
+        let completed = self.completed.try_iter().collect::<Vec<_>>();
+        for result in &completed {
+            self.pending_urls.remove(&result.request.url);
+        }
+        completed
     }
 }
 
@@ -698,6 +798,7 @@ impl MediaMonitor {
     ) {
         log::info!("Starting multi-player media monitor");
         let mut artwork_by_player: HashMap<PlayerId, TrackArtwork> = HashMap::new();
+        let mut artwork_loader = ArtworkLoader::new();
         let mut position_trackers: HashMap<PlayerId, PositionTracker> = HashMap::new();
         let mut timeline_refreshes: HashMap<PlayerId, TimelineRefresh> = HashMap::new();
         let emby_client = reqwest::blocking::Client::builder()
@@ -709,6 +810,11 @@ impl MediaMonitor {
         let mut last_emby_discovery = Instant::now();
 
         loop {
+            Self::collect_artwork_results(
+                &mut artwork_loader,
+                &artwork_cache,
+                &mut artwork_by_player,
+            );
             let mut players: Vec<(PlayerId, MediaInfo)> = Vec::new();
 
             // 1. Query the native Emby Theater session through Emby Server.
@@ -733,6 +839,7 @@ impl MediaMonitor {
                     &mut info,
                     &artwork_cache,
                     &mut artwork_by_player,
+                    &mut artwork_loader,
                 );
                 *emby_control.lock().unwrap() = Some(control);
                 players.push((player_id, info));
@@ -749,6 +856,7 @@ impl MediaMonitor {
                     &mut info,
                     &artwork_cache,
                     &mut artwork_by_player,
+                    &mut artwork_loader,
                 );
                 players.push((PlayerId::Cider, info));
                 has_cider_api_player = true;
@@ -828,6 +936,7 @@ impl MediaMonitor {
                     &mut info,
                     &artwork_cache,
                     &mut artwork_by_player,
+                    &mut artwork_loader,
                 );
 
                 // Fallback to app icon if no album art
@@ -1154,13 +1263,14 @@ impl MediaMonitor {
         info: &mut MediaInfo,
         artwork_cache: &Arc<Mutex<ArtworkCache>>,
         artwork_by_player: &mut HashMap<PlayerId, TrackArtwork>,
+        artwork_loader: &mut ArtworkLoader,
     ) {
         let track = TrackSignature::from(&*info);
         let selection = artwork_by_player
             .entry(player_id.clone())
             .or_insert_with(|| TrackArtwork::new(track.clone()));
         if selection.track != track {
-            *selection = TrackArtwork::new(track);
+            *selection = TrackArtwork::new(track.clone());
         }
 
         let is_youtube = info
@@ -1169,23 +1279,9 @@ impl MediaMonitor {
             .and_then(Self::extract_youtube_video_id)
             .is_some();
         for url in Self::artwork_candidate_urls(info) {
-            if !selection.attempted_urls.insert(url.clone()) {
-                continue;
-            }
-
             let cached = { artwork_cache.lock().unwrap().get(&url) };
-            let candidate = if cached.is_some() {
-                cached
-            } else {
-                Self::download_artwork(&url).inspect(|art| {
-                    artwork_cache
-                        .lock()
-                        .unwrap()
-                        .insert(url.clone(), art.clone());
-                })
-            };
-
-            if let Some(candidate) = candidate {
+            if let Some(candidate) = cached {
+                selection.attempted_urls.insert(url.clone());
                 let adequate_youtube_thumbnail = candidate.source_width
                     >= MIN_YOUTUBE_THUMBNAIL_WIDTH
                     && candidate.source_height >= MIN_YOUTUBE_THUMBNAIL_HEIGHT;
@@ -1193,10 +1289,64 @@ impl MediaMonitor {
                 if is_youtube && adequate_youtube_thumbnail {
                     break;
                 }
+                continue;
+            }
+
+            if selection.attempted_urls.contains(&url) {
+                continue;
+            }
+
+            let request = ArtworkRequest {
+                player_id: player_id.clone(),
+                track: track.clone(),
+                url: url.clone(),
+            };
+            if artwork_loader.enqueue(request) {
+                selection.attempted_urls.insert(url);
             }
         }
 
         info.album_art = selection.best.clone();
+    }
+
+    fn collect_artwork_results(
+        artwork_loader: &mut ArtworkLoader,
+        artwork_cache: &Arc<Mutex<ArtworkCache>>,
+        artwork_by_player: &mut HashMap<PlayerId, TrackArtwork>,
+    ) {
+        for result in artwork_loader.take_completed() {
+            let ArtworkResult { request, artwork } = result;
+            let Some(artwork) = artwork else {
+                log::debug!("Unable to load artwork from {}", request.url);
+                continue;
+            };
+
+            Self::accept_completed_artwork(
+                request,
+                artwork,
+                &mut artwork_cache.lock().unwrap(),
+                artwork_by_player,
+            );
+        }
+    }
+
+    fn accept_completed_artwork(
+        request: ArtworkRequest,
+        artwork: AlbumArt,
+        artwork_cache: &mut ArtworkCache,
+        artwork_by_player: &mut HashMap<PlayerId, TrackArtwork>,
+    ) {
+        let ArtworkRequest {
+            player_id,
+            track,
+            url,
+        } = request;
+        artwork_cache.insert(url, artwork.clone());
+        if let Some(selection) = artwork_by_player.get_mut(&player_id)
+            && selection.track == track
+        {
+            selection.accept(artwork);
+        }
     }
 
     fn artwork_candidate_urls(info: &MediaInfo) -> Vec<String> {
@@ -1366,22 +1516,22 @@ impl MediaMonitor {
     /// Reads the encoded image and creates a stable Iced handle plus a bounded
     /// compatibility buffer for the legacy Cairo renderer.
     /// Handles both http(s):// and file:// URLs.
-    fn download_artwork(url: &str) -> Option<AlbumArt> {
+    async fn download_artwork(client: &reqwest::Client, url: &str) -> Option<AlbumArt> {
         log::info!("Downloading album art from: {}", url);
 
         let uri = reqwest::Url::parse(url).ok()?;
         let image_data = match uri.scheme() {
             "file" => {
                 let path = uri.to_file_path().ok()?;
-                std::fs::read(path).ok()?
+                let metadata = tokio::fs::metadata(&path).await.ok()?;
+                if metadata.len() > MAX_ARTWORK_BYTES as u64 {
+                    log::warn!("Artwork file exceeds size limit: {url}");
+                    return None;
+                }
+                tokio::fs::read(path).await.ok()?
             }
             "http" | "https" => {
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .user_agent("cosmic-widget-applet/0.1")
-                    .build()
-                    .ok()?;
-                let response = client.get(uri).send().ok()?.error_for_status().ok()?;
+                let mut response = client.get(uri).send().await.ok()?.error_for_status().ok()?;
                 if response
                     .content_length()
                     .is_some_and(|length| length > MAX_ARTWORK_BYTES as u64)
@@ -1389,7 +1539,21 @@ impl MediaMonitor {
                     log::warn!("Artwork response exceeds size limit: {url}");
                     return None;
                 }
-                response.bytes().ok()?.to_vec()
+
+                let capacity = response
+                    .content_length()
+                    .and_then(|length| usize::try_from(length).ok())
+                    .unwrap_or_default()
+                    .min(MAX_ARTWORK_BYTES);
+                let mut bytes = Vec::with_capacity(capacity);
+                while let Some(chunk) = response.chunk().await.ok()? {
+                    if bytes.len().saturating_add(chunk.len()) > MAX_ARTWORK_BYTES {
+                        log::warn!("Artwork response exceeds size limit: {url}");
+                        return None;
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                bytes
             }
             scheme => {
                 log::warn!("Unsupported artwork URI scheme {scheme}: {url}");
@@ -1417,31 +1581,9 @@ impl MediaMonitor {
             return None;
         }
 
-        let resized = image.resize(
-            LEGACY_ARTWORK_DIMENSION,
-            LEGACY_ARTWORK_DIMENSION,
-            image::imageops::FilterType::Lanczos3,
-        );
-
-        let rgba = resized.to_rgba8();
-        let (width, height) = rgba.dimensions();
-
-        let mut bgra_data = Vec::with_capacity((width * height * 4) as usize);
-        for pixel in rgba.pixels() {
-            let [r, g, b, a] = pixel.0;
-            let alpha = a as f32 / 255.0;
-            bgra_data.push((b as f32 * alpha) as u8);
-            bgra_data.push((g as f32 * alpha) as u8);
-            bgra_data.push((r as f32 * alpha) as u8);
-            bgra_data.push(a);
-        }
-
         log::info!("Album art loaded: {source_width}x{source_height}");
 
         Some(AlbumArt {
-            data: bgra_data.into(),
-            width,
-            height,
             source_width,
             source_height,
             iced_handle: cosmic::iced::widget::image::Handle::from_bytes(image_data),
@@ -1719,11 +1861,10 @@ impl MediaMonitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlbumArt, HashMap, Instant, MediaInfo, MediaMonitor, MultiPlayerState, PlaybackStatus,
-        PlayerId, PositionTracker, TrackArtwork, TrackSignature, merge_mpris_proxy_timeline,
-        preferred_player_id, update_tracked_position,
+        AlbumArt, ArtworkCache, ArtworkRequest, HashMap, Instant, MediaInfo, MediaMonitor,
+        MultiPlayerState, PlaybackStatus, PlayerId, PositionTracker, TrackArtwork, TrackSignature,
+        merge_mpris_proxy_timeline, preferred_player_id, update_tracked_position,
     };
-    use std::sync::Arc;
     use std::time::Duration;
 
     fn media(status: PlaybackStatus, position: u64, title: &str) -> MediaInfo {
@@ -1769,9 +1910,6 @@ mod tests {
 
     fn artwork(source_width: u32, source_height: u32) -> AlbumArt {
         AlbumArt {
-            data: Arc::from(vec![0, 0, 0, 255]),
-            width: 1,
-            height: 1,
             source_width,
             source_height,
             iced_handle: cosmic::iced::widget::image::Handle::from_rgba(
@@ -1780,6 +1918,79 @@ mod tests {
                 vec![0, 0, 0, 255],
             ),
         }
+    }
+
+    #[test]
+    fn decoded_artwork_uses_an_encoded_iced_handle() {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+
+        let artwork = MediaMonitor::decode_artwork(encoded.into_inner()).unwrap();
+        let cosmic::iced::widget::image::Handle::Bytes(_, handle_bytes) = &artwork.iced_handle
+        else {
+            panic!("decoded artwork should use an encoded Iced handle");
+        };
+
+        assert!(!handle_bytes.is_empty());
+    }
+
+    #[test]
+    fn completed_artwork_is_cached_but_only_applied_to_its_original_track() {
+        let player_id = PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".to_string());
+        let old_track = TrackSignature::from(&media(
+            PlaybackStatus::Playing,
+            0,
+            "Previous video",
+        ));
+        let current_track = TrackSignature::from(&media(
+            PlaybackStatus::Playing,
+            0,
+            "Current video",
+        ));
+        let mut selections = HashMap::from([(
+            player_id.clone(),
+            TrackArtwork::new(current_track.clone()),
+        )]);
+        let mut cache = ArtworkCache::new(4);
+
+        MediaMonitor::accept_completed_artwork(
+            ArtworkRequest {
+                player_id: player_id.clone(),
+                track: old_track,
+                url: "https://example.test/old.jpg".to_string(),
+            },
+            artwork(1280, 720),
+            &mut cache,
+            &mut selections,
+        );
+
+        assert!(cache.get("https://example.test/old.jpg").is_some());
+        assert!(selections[&player_id].best.is_none());
+
+        MediaMonitor::accept_completed_artwork(
+            ArtworkRequest {
+                player_id: player_id.clone(),
+                track: current_track,
+                url: "https://example.test/current.jpg".to_string(),
+            },
+            artwork(640, 360),
+            &mut cache,
+            &mut selections,
+        );
+
+        assert_eq!(
+            selections[&player_id]
+                .best
+                .as_ref()
+                .map(AlbumArt::source_pixel_count),
+            Some(640 * 360),
+        );
     }
 
     #[test]

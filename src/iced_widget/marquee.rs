@@ -13,7 +13,10 @@ const SUBTITLE_HEIGHT: f32 = 20.0;
 const SUBTITLE_TEXT_SIZE: f32 = 14.0;
 const GAP: f32 = 32.0;
 const SPEED: f32 = 28.0;
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_FRAME_DELTA: Duration = Duration::from_millis(100);
+
+type RenderParagraph = <Renderer as text::Renderer>::Paragraph;
 
 pub fn media_title(title: &str) -> Element<'static, super::Message> {
     Marquee::new(title, MarqueeKind::Title).into()
@@ -74,7 +77,7 @@ impl Marquee {
             font: self.kind.font(),
             align_x: text::Alignment::Default,
             align_y: alignment::Vertical::Top,
-            shaping: text::Shaping::Advanced,
+            shaping: text::Shaping::Auto,
             wrapping: text::Wrapping::None,
             ellipsize: text::Ellipsize::None,
         })
@@ -83,6 +86,7 @@ impl Marquee {
 
 struct State {
     title: String,
+    paragraph: RenderParagraph,
     text_width: f32,
     viewport_width: f32,
     offset: f32,
@@ -93,6 +97,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             title: String::new(),
+            paragraph: RenderParagraph::default(),
             text_width: 0.0,
             viewport_width: 0.0,
             offset: 0.0,
@@ -102,9 +107,10 @@ impl Default for State {
 }
 
 impl State {
-    fn reset(&mut self, title: &str) {
+    fn reset(&mut self, title: &str, paragraph: RenderParagraph) {
         self.title.clear();
         self.title.push_str(title);
+        self.paragraph = paragraph;
         self.offset = 0.0;
         self.last_frame = None;
     }
@@ -117,7 +123,7 @@ impl State {
         let Some(last_frame) = self.last_frame.replace(now) else {
             return;
         };
-        let elapsed = (now - last_frame).min(Duration::from_millis(50));
+        let elapsed = (now - last_frame).min(MAX_FRAME_DELTA);
 
         self.offset += SPEED * elapsed.as_secs_f32();
         let cycle = self.text_width + GAP;
@@ -150,13 +156,12 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let node = layout::atomic(limits, Length::Fill, Length::Fixed(self.kind.height()));
-        let paragraph = self.paragraph();
         let state = tree.state.downcast_mut::<State>();
 
         if state.title != self.title {
-            state.reset(&self.title);
+            state.reset(&self.title, self.paragraph());
         }
-        state.text_width = paragraph.min_width();
+        state.text_width = state.paragraph.min_width();
         state.viewport_width = node.size().width;
         if !state.overflowing() {
             state.offset = 0.0;
@@ -198,23 +203,9 @@ where
     ) {
         let bounds = layout.bounds();
         let state = tree.state.downcast_ref::<State>();
-        let height = self.kind.height();
-        let text_size = self.kind.text_size();
-        let font = self.kind.font();
-        let draw_title = |renderer: &mut Renderer, content: &str, x: f32| {
-            renderer.fill_text(
-                text::Text {
-                    content: content.to_string(),
-                    bounds: Size::new(state.text_width.max(bounds.width), height),
-                    size: text_size.into(),
-                    line_height: text::LineHeight::Absolute(height.into()),
-                    font,
-                    align_x: text::Alignment::Default,
-                    align_y: alignment::Vertical::Top,
-                    shaping: text::Shaping::Advanced,
-                    wrapping: text::Wrapping::None,
-                    ellipsize: text::Ellipsize::None,
-                },
+        let draw_title = |renderer: &mut Renderer, x: f32| {
+            renderer.fill_paragraph(
+                &state.paragraph,
                 Point::new(x, bounds.y),
                 style.text_color,
                 bounds,
@@ -222,13 +213,9 @@ where
         };
 
         renderer.with_layer(bounds, |renderer| {
-            draw_title(renderer, &self.title, bounds.x - state.offset);
+            draw_title(renderer, bounds.x - state.offset);
             if state.overflowing() {
-                draw_title(
-                    renderer,
-                    &self.title,
-                    bounds.x - state.offset + state.text_width + GAP,
-                );
+                draw_title(renderer, bounds.x - state.offset + state.text_width + GAP);
             }
         });
     }

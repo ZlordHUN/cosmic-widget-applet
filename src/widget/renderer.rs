@@ -68,7 +68,7 @@ use pango;
 use pangocairo;
 
 use super::battery::BatteryDevice;
-use super::media::MediaInfo;
+use super::media::{AlbumArt, MediaInfo};
 use super::notifications::Notification;
 use super::storage::DiskInfo;
 use super::temperature::draw_temp_circle;
@@ -1971,32 +1971,10 @@ fn render_media(
         cr.rectangle(art_x - 2.0, art_y - 2.0, art_size + 4.0, art_size + 4.0);
         cr.fill().expect("Failed to fill art background");
 
-        // Create an ImageSurface from the album art data
-        if album_art.width > 0 && album_art.height > 0 {
-            // Create a new surface and copy the pixel data
-            if let Ok(mut art_surface) = cairo::ImageSurface::create(
-                cairo::Format::ARgb32,
-                album_art.width as i32,
-                album_art.height as i32,
-            ) {
-                // Copy pixel data to the surface
-                {
-                    let mut data = art_surface.data().expect("Failed to get surface data");
-                    let src_len = album_art.data.len().min(data.len());
-                    data[..src_len].copy_from_slice(&album_art.data[..src_len]);
-                }
-
-                // Scale and draw the art
-                cr.save().expect("Failed to save");
-                cr.translate(art_x, art_y);
-                let scale_x = art_size / album_art.width as f64;
-                let scale_y = art_size / album_art.height as f64;
-                cr.scale(scale_x, scale_y);
-                cr.set_source_surface(&art_surface, 0.0, 0.0)
-                    .expect("Failed to set source");
-                cr.paint().expect("Failed to paint album art");
-                cr.restore().expect("Failed to restore");
-            }
+        if let Some(art_surface) = decode_legacy_artwork(album_art, art_size as u32) {
+            cr.set_source_surface(&art_surface, art_x, art_y)
+                .expect("Failed to set source");
+            cr.paint().expect("Failed to paint album art");
         }
 
         // Draw border around the art
@@ -2359,6 +2337,38 @@ fn render_media(
 
     // Return position after the panel with some padding
     (panel_y + panel_height + 15.0, button_bounds)
+}
+
+fn decode_legacy_artwork(album_art: &AlbumArt, size: u32) -> Option<cairo::ImageSurface> {
+    let cosmic::iced::widget::image::Handle::Bytes(_, encoded) = &album_art.iced_handle else {
+        return None;
+    };
+    let image = image::load_from_memory(encoded.as_ref()).ok()?;
+    let rgba = image
+        .resize_to_fill(size, size, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let mut surface = cairo::ImageSurface::create(
+        cairo::Format::ARgb32,
+        i32::try_from(size).ok()?,
+        i32::try_from(size).ok()?,
+    )
+    .ok()?;
+    let stride = usize::try_from(surface.stride()).ok()?;
+    {
+        let mut destination = surface.data().ok()?;
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let source = rgba.get_pixel(x as u32, y as u32).0;
+                let alpha = source[3] as f32 / 255.0;
+                let offset = y * stride + x * 4;
+                destination[offset] = (source[2] as f32 * alpha) as u8;
+                destination[offset + 1] = (source[1] as f32 * alpha) as u8;
+                destination[offset + 2] = (source[0] as f32 * alpha) as u8;
+                destination[offset + 3] = source[3];
+            }
+        }
+    }
+    Some(surface)
 }
 
 #[cfg(test)]

@@ -145,16 +145,26 @@ impl NotificationMonitor {
                 log::warn!("Failed to restore cached notifications: {error}");
                 Vec::new()
             });
-        let (cached, retention_limit) = match load_cosmic_notification_history() {
-            Ok(Some(history)) => {
-                log::info!("Loaded {} notifications from COSMIC", history.len());
-                (history, COSMIC_NOTIFICATION_HISTORY_LIMIT)
-            }
-            Ok(None) => (cached, max_notifications),
+        let cosmic_history_connection = match zbus::blocking::Connection::session() {
+            Ok(connection) => Some(connection),
             Err(error) => {
-                log::warn!("Failed to retrieve COSMIC notification history: {error}");
-                (cached, max_notifications)
+                log::warn!("Failed to connect to the session bus for COSMIC history: {error}");
+                None
             }
+        };
+        let (cached, retention_limit) = match cosmic_history_connection.as_ref() {
+            Some(connection) => match load_cosmic_notification_history(connection) {
+                Ok(Some(history)) => {
+                    log::info!("Loaded {} notifications from COSMIC", history.len());
+                    (history, COSMIC_NOTIFICATION_HISTORY_LIMIT)
+                }
+                Ok(None) => (cached, max_notifications),
+                Err(error) => {
+                    log::warn!("Failed to retrieve COSMIC notification history: {error}");
+                    (cached, max_notifications)
+                }
+            },
+            None => (cached, max_notifications),
         };
         if let Err(error) = persist_cached_notifications(&cache_path, &session_key, &cached) {
             log::warn!("Failed to initialize notification cache: {error}");
@@ -188,6 +198,7 @@ impl NotificationMonitor {
                 locally_dismissed_clone,
                 &cache_path_clone,
                 &session_key_clone,
+                cosmic_history_connection,
             );
         });
 
@@ -204,14 +215,31 @@ impl NotificationMonitor {
         locally_dismissed: Arc<Mutex<HashSet<(u32, String)>>>,
         cache_path: &Path,
         session_key: &str,
+        mut connection: Option<zbus::blocking::Connection>,
     ) {
         loop {
             std::thread::sleep(COSMIC_HISTORY_SYNC_INTERVAL);
-            let mut history = match load_cosmic_notification_history() {
+            if connection.is_none() {
+                connection = match zbus::blocking::Connection::session() {
+                    Ok(connection) => Some(connection),
+                    Err(error) => {
+                        log::debug!("Failed to reconnect COSMIC notification history: {error}");
+                        continue;
+                    }
+                };
+            }
+
+            let Some(history_connection) = connection.as_ref() else {
+                continue;
+            };
+            let mut history = match load_cosmic_notification_history(history_connection) {
                 Ok(Some(history)) => history,
                 Ok(None) => return,
                 Err(error) => {
                     log::debug!("Failed to synchronize COSMIC notification history: {error}");
+                    if matches!(error, zbus::Error::InputOutput(_)) {
+                        connection = None;
+                    }
                     continue;
                 }
             };
@@ -634,22 +662,21 @@ fn close_remote_notifications_inner(
 
 type CosmicNotificationHistoryEntry = (u32, String, String, String, u64);
 
-fn load_cosmic_notification_history()
-    -> Result<Option<Vec<Notification>>, Box<dyn std::error::Error>>
-{
-    use zbus::blocking::{Connection, Proxy};
+fn load_cosmic_notification_history(
+    connection: &zbus::blocking::Connection,
+) -> zbus::Result<Option<Vec<Notification>>> {
+    use zbus::blocking::Proxy;
     use zbus::names::OwnedUniqueName;
 
-    let connection = Connection::session()?;
     let bus = Proxy::new(
-        &connection,
+        connection,
         "org.freedesktop.DBus",
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
     )?;
     let owner: OwnedUniqueName = bus.call("GetNameOwner", &NOTIFICATIONS_SERVICE)?;
     let proxy = Proxy::new(
-        &connection,
+        connection,
         NOTIFICATIONS_SERVICE,
         NOTIFICATIONS_PATH,
         NOTIFICATIONS_INTERFACE,

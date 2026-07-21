@@ -16,6 +16,8 @@ const BAR_HEIGHT: f32 = 8.0;
 const START_ANGLE: f32 = 3.0 * PI / 4.0;
 const SWEEP_ANGLE: f32 = 3.0 * PI / 2.0;
 const ANIMATION_LAG: Duration = Duration::from_millis(120);
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const MAX_ANIMATION_FRAME_DELTA: Duration = Duration::from_millis(100);
 const SNAP_THRESHOLD: f32 = 0.0005;
 
 pub fn temperature_gauge(value: f32) -> Element<'static, super::Message> {
@@ -75,9 +77,9 @@ impl State {
             return false;
         }
 
-        let elapsed = (now - last_frame).as_secs_f32().min(1.0 / 60.0);
+        let elapsed = (now - last_frame).min(MAX_ANIMATION_FRAME_DELTA);
         let lag = ANIMATION_LAG.as_secs_f32();
-        self.current += difference * (1.0 - (-elapsed / lag).exp());
+        self.current += difference * (1.0 - (-elapsed.as_secs_f32() / lag).exp());
         true
     }
 }
@@ -133,7 +135,7 @@ where
         if let Event::Window(window::Event::RedrawRequested(now)) = event
             && tree.state.downcast_mut::<State>().update(self.target, *now)
         {
-            shell.request_redraw();
+            shell.request_redraw_at(*now + ANIMATION_FRAME_INTERVAL);
         }
     }
 
@@ -230,7 +232,7 @@ where
             let state = tree.state.downcast_mut::<TemperatureState>();
             if state.progress.update(self.target, *now) {
                 state.cache.clear();
-                shell.request_redraw();
+                shell.request_redraw_at(*now + ANIMATION_FRAME_INTERVAL);
             }
         }
     }
