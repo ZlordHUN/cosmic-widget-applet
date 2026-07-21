@@ -421,9 +421,9 @@ fn notifications_view<'a>(
         }
 
         let list: Element<'a, super::Message> = widget::container(list.width(Length::Fill))
-                    .width(Length::Fill)
-                    .class(theme::Container::List)
-                    .into();
+            .width(Length::Fill)
+            .class(notification_panel_class())
+            .into();
         notifications = notifications.push(
             widget::scrollable(super::translate::vertical(
                 list,
@@ -450,6 +450,32 @@ fn notifications_view<'a>(
     }
 
     notifications.into()
+}
+
+fn notification_panel_class() -> theme::Container<'static> {
+    theme::Container::custom(|theme| {
+        let cosmic = theme.cosmic();
+        let container = theme.current_container();
+        let mut background: Color = container.on.into();
+        let mut border: Color = container.on.into();
+
+        // A low-opacity foreground tint remains visibly distinct from the
+        // surrounding surface without masking the shared compositor blur.
+        background.a = if theme.transparent { 0.045 } else { 0.07 };
+        border.a = if theme.transparent { 0.10 } else { 0.14 };
+
+        cosmic::iced::widget::container::Style {
+            icon_color: Some(container.on.into()),
+            text_color: Some(container.on.into()),
+            background: Some(Background::Color(background)),
+            border: Border {
+                color: border,
+                width: 1.0,
+                radius: cosmic.corner_radii.radius_s.into(),
+            },
+            ..Default::default()
+        }
+    })
 }
 
 fn notification_list_entry<'a>(

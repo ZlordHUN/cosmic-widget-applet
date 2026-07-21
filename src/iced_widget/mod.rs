@@ -50,6 +50,7 @@ const MEDIA_CONTROL_GRACE: Duration = Duration::from_secs(2);
 const MIN_UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_UI_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const UI_TICK_SETTLE_DELAY: Duration = Duration::from_millis(5);
+const CORNER_RADIUS_STARTUP_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 struct PendingPlayback {
@@ -265,6 +266,7 @@ struct App {
     surface_height: u32,
     frosted: bool,
     corners: Option<CornerRadius>,
+    corners_ready_at: Instant,
     expanded_notification_group: Option<String>,
     expanded_notification: Option<NotificationKey>,
     notification_group_expansion: ExpansionAnimation,
@@ -352,6 +354,7 @@ impl App {
                 // The compositor validates radii against the committed buffer,
                 // so wait until the 1x1 bootstrap surface has been replaced.
                 corners: None,
+                corners_ready_at: Instant::now() + CORNER_RADIUS_STARTUP_DELAY,
                 expanded_notification_group: None,
                 expanded_notification: None,
                 notification_group_expansion: ExpansionAnimation::with_duration(
@@ -423,10 +426,12 @@ impl App {
                     self.expanded_notification_group = None;
                     self.notification_group_expansion.reset();
                 }
-                let corners = overlay_corners();
-                if self.corners != Some(corners) {
-                    self.corners = Some(corners);
-                    tasks.push(set_surface_corners(self.surface_id, corners));
+                if Instant::now() >= self.corners_ready_at {
+                    let corners = overlay_corners();
+                    if self.corners != Some(corners) {
+                        self.corners = Some(corners);
+                        tasks.push(set_surface_corners(self.surface_id, corners));
+                    }
                 }
 
                 if let Some(handler) = &self.config_handler {
