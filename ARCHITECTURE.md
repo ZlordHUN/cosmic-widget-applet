@@ -1,5 +1,7 @@
 # Architecture
 
+[Overview](README.md) | [Architecture](ARCHITECTURE.md) | [Supported Devices](SUPPORTED_DEVICES.md)
+
 ## Runtime Components
 
 COSMIC Widget is split into three installed processes so the panel, overlay,

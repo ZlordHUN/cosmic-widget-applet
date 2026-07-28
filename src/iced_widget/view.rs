@@ -693,10 +693,16 @@ fn notification_group_item<'a>(
     expanded: bool,
     spacing: u16,
 ) -> Element<'a, super::Message> {
+    let title = widget::text::caption_heading(compact_single_line(group.source, usize::MAX))
+        .width(Length::Fill)
+        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+            cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+        ));
     let text = widget::column::with_capacity(2)
         .width(Length::Fill)
         .spacing(0)
-        .push(widget::text::caption_heading(group.source))
+        .push(title)
         .push(widget::text::caption(format!(
             "{} notifications",
             group.notifications.len()

@@ -1,5 +1,7 @@
 # Supported Devices
 
+[Overview](README.md) | [Architecture](ARCHITECTURE.md) | [Supported Devices](SUPPORTED_DEVICES.md)
+
 This document is the battery compatibility contract for COSMIC Widget. It lists
 every explicit native device identity in the source tree and the complete
 protocol rules used for dynamically discovered Logitech peripherals.
