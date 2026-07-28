@@ -1,454 +1,204 @@
-# Cosmic Monitor Architecture
+# Architecture
 
-## Overview
+## Runtime Components
 
-This project implements a Conky-style system monitor for COSMIC desktop with three separate binaries:
+COSMIC Widget is split into three installed processes so the panel, overlay,
+and settings window can restart independently.
 
-1. **cosmic-widget-applet** - Panel applet providing menu interface
-2. **cosmic-widget** - Borderless floating widget using Wayland layer-shell
-3. **cosmic-widget-settings** - Configuration window
+| Component | Cargo target | Installed command | Responsibility |
+| --- | --- | --- | --- |
+| Panel applet | `cosmic-widget-applet` | `cosmic-widget-applet` | Panel popup, overlay lifecycle, settings launcher |
+| Overlay | `cosmic-widget-iced` | `cosmic-widget` | Layer-shell UI and all live monitoring |
+| Settings | `cosmic-widget-settings` | `cosmic-widget-settings` | COSMIC configuration UI |
 
-## Why Three Binaries?
+Cargo also contains an older `cosmic-widget` target backed by the original
+smithay-client-toolkit, Cairo, and Pango renderer. It is not installed by
+`just install`; the Iced target is installed under that public command name.
 
-- **Applet**: Integrates with COSMIC panel for easy access
-- **Widget**: Runs independently as a borderless overlay (like Conky)
-- **Settings**: Separate configuration UI (launched on-demand)
+## Process Flow
 
-This separation allows the widget to run continuously while settings/applet can start/stop independently.
+```text
+COSMIC panel
+    |
+    +-- cosmic-widget-applet
+            |
+            +-- starts/stops --> cosmic-widget
+            +-- opens --------> cosmic-widget-settings
 
-## Component Architecture
-
-### 1. Panel Applet (`src/app.rs`, `src/main.rs`)
-
-**Purpose**: Provide quick access menu in COSMIC panel
-
-**Implementation**:
-- Uses `libcosmic::Application` with panel applet mode
-- Minimal UI - just a menu with 3 items
-- Manages widget process lifecycle (spawn/kill)
-- Launches settings window
-
-**Key Features**:
-- Toggle Widget: Spawns or kills `cosmic-widget` process
-- Settings: Launches `cosmic-widget-settings`
-- About: Shows app information
-
-**File**: `src/main.rs` (entry point), `src/app.rs` (logic)
-
-### 2. Widget (`src/widget_main.rs`)
-
-**Purpose**: Borderless floating overlay displaying system stats
-
-**Why Not libcosmic?**
-- COSMIC compositor (`cosmic-comp`) adds mandatory 10px `RESIZE_BORDER` to all windows
-- No way to disable borders with libcosmic/client-side decorations
-- Layer-shell protocol bypasses window management entirely
-
-**Implementation**:
-- Direct Wayland client (no libcosmic Application)
-- Uses `smithay-client-toolkit` 0.19.2 for layer-shell protocol
-- Custom rendering with Cairo/Pango (transparent background, text outlines)
-- Clock display with chrono (HH:MM:SS + full date)
-- System monitoring via `sysinfo` crate
-
-**Architecture**:
-```
-MonitorWidget struct
-├── Wayland state
-│   ├── registry_state
-│   ├── compositor_state
-│   ├── layer_shell (wlr-layer-shell)
-│   ├── seat_state
-│   └── output_state
-├── Rendering
-│   ├── shm_state (shared memory)
-│   ├── slot_pool (double buffering)
-│   └── layer_surface (the actual surface)
-└── Application state
-    ├── config (Arc<Config>)
-    ├── utilization (CPU, RAM, GPU)
-    ├── temperature (CPU, GPU)
-    ├── network (rx/tx rates)
-    ├── weather (API integration)
-    ├── storage (disk usage)
-    ├── battery (Solaar + HeadsetControl)
-    ├── notifications (D-Bus monitoring)
-    ├── media (MediaMonitor - Cider API)
-    ├── collapsed_groups (notification UI state)
-    ├── last_update (for timing)
-    └── last_config_check (for polling)
+cosmic-widget-settings
+    |
+    +-- writes cosmic-config
+            |
+            +-- watched by the applet and overlay
 ```
 
-**Layer Surface Configuration**:
-- **Layer**: `TOP` (above normal windows)
-- **Anchor**: `TOP | LEFT` (positioned from top-left corner)
-- **Size**: 350x300 pixels (configurable via constants)
-- **Margins**: `(widget_y, 0, 0, widget_x)` - positions the widget
-- **Exclusive Zone**: -1 (doesn't reserve space)
-- **Keyboard Interactivity**: None (click-through)
-- **Background**: Fully transparent using Cairo `Operator::Source`
+The processes share configuration, but not in-memory state. The overlay owns
+the monitors and runtime caches. A process lock prevents duplicate overlay
+instances after compositor or panel restarts.
 
-**Rendering Pipeline**:
-1. Request buffer from shared memory pool
-2. Create Cairo surface from buffer
-3. Set transparent background with `Operator::Source`
-4. Render clock with text outlines (stroke + fill)
-5. Render CPU/RAM icons using Cairo paths
-6. Render progress bars with gradient fills (green/yellow/red based on usage)
-7. Render system metrics with Cairo/Pango
-8. Flush Cairo surface
-9. Attach buffer to Wayland surface
-10. Damage and commit surface
+## Overlay
 
-**Config Watching**:
-- Polls config file every 500ms
-- Detects changes and redraws
-- Does NOT update margins (requires restart)
+The production overlay is an Iced daemon using libcosmic's single-worker
+executor. It creates a Wayland layer-shell surface through Iced's COSMIC
+platform integration.
 
-**Clock Display**:
-- Uses `chrono::Local` for current date/time
-- Large HH:MM display (Ubuntu Bold 48)
-- Smaller :SS display (Ubuntu Bold 28)
-- Full date below clock (Ubuntu 16)
-- White text with black outlines (Conky-style)
-- Can be individually toggled (show_clock, show_date)
+The surface:
 
-**Visual Indicators**:
-- CPU icon: Chip representation with pins
-- RAM icon: Memory stick with notch and chips
-- GPU icon: Graphics card with fan and PCIe connector
-- Progress bars: 200px wide with gradient fills
-  - Green gradient (< 50% usage)
-  - Yellow gradient (50-80% usage)
-  - Red gradient (> 80% usage)
-- Layout: Icon + Label + Bar + Percentage (if enabled)
+- is anchored from the top-left using saved X and Y margins;
+- requests compositor blur and rounded corners;
+- does not reserve an exclusive desktop area;
+- sizes itself from the enabled sections and their current content;
+- accepts pointer input for controls, scrolling, expansion, seeking, and edit
+  mode;
+- exposes a pin while edit mode is active, then persists the pinned position.
 
-### System Monitoring
-- Uses `sysinfo::System` for CPU, memory, disk
-- CPU: Global CPU percentage
-- Memory: Used/Total bytes + percentage
-- GPU: NVIDIA GPU utilization via `nvidia-smi --query-gpu=utilization.gpu`
-  - Checks for nvidia-smi availability on initialization
-  - Falls back to 0% if not available
-- Storage: Disk usage monitoring via `sysinfo::Disks`
-  - Filters to meaningful mounts (/, /home, /mnt/*, /media/*)
-  - Excludes system partitions (/boot, /snap, /run, /sys, /proc, /dev, /tmp)
-  - Uses `lsblk -ndo NAME,VENDOR,MODEL` for hardware identification
-  - Display names: "System" for /, "Home" for /home, vendor+model for external drives
-  - Shows usage percentage and capacity for each drive
-  - Cached disk information loads instantly on startup with empty bars while refreshing
-- Battery: Logitech wireless device monitoring via Solaar CLI + gaming headset monitoring via HeadsetControl
-  - Shells out to `solaar show` and `headsetcontrol -b -o json` commands
-  - Parses device names, battery levels, and device kinds (mouse, keyboard, headset)
-  - Color-coded vertical battery icons (green > 60%, yellow > 30%, orange > 15%, red ≤ 15%)
-  - Shows connection status (connected/disconnected/connecting)
-  - Refreshes every 30 seconds (battery data doesn't change rapidly)
-  - Background thread fetches data immediately on startup for instant rendering
-  - Cached device information shows instantly with disconnected icon while loading
-  - Falls back gracefully if Solaar or HeadsetControl is not installed
-- Notifications: Desktop notification monitoring via D-Bus
-  - Uses `busctl monitor` to capture org.freedesktop.Notifications.Notify calls
-  - Parses app_name, summary, and body from D-Bus messages
-  - Groups notifications by application name with expand/collapse UI
-  - Keeps up to 5 most recent notifications in memory
-  - Background thread continuously monitors D-Bus in separate process
-  - Visual grouping with semi-transparent containers and borders
-  - Clear All button in header to dismiss all notifications
-  - Individual X buttons to dismiss single notifications or entire groups
-  - Click group headers to toggle expand/collapse
-- Media: Cider Apple Music client integration via REST API
-  - Connects to Cider's local API at `http://localhost:10767`
-  - Polls `/api/v1/playback/now-playing` every 1 second
-  - Parses JSON response for track info (name, artistName, albumName, currentPlaybackTime, durationInMillis)
-  - Displays track title, artist, album, progress bar with time
-  - Supports API token authentication when enabled in Cider
-  - Falls back to empty display when Cider is not running
-- Weather: OpenWeatherMap API integration
-  - Fetches temperature, conditions, and location data
-  - Updates every 10 minutes
-  - Dynamic weather icons with full day/night variants for all conditions
-  - Background thread handles API requests to avoid blocking UI
-- Network: Placeholder (needs implementation)
-- Disk I/O: Placeholder (needs implementation)
+`src/iced_widget/mod.rs` owns application state, subscriptions, animation
+state, sizing, and input handling. `src/iced_widget/view.rs` builds the visible
+section tree. Small custom widgets provide gauges, marquee text, sliding
+transitions, and translated content.
 
-### 3. Settings (`src/settings.rs`, `src/settings_main.rs`)
+System readings are sampled once per second. The UI interpolates utilization
+bars and temperature gauges between samples so animation cadence is independent
+from hardware polling cadence.
 
-**Purpose**: Configuration UI for the widget
+## Monitoring Pipeline
 
-**Implementation**:
-- Uses `libcosmic::Application` (normal windowed mode)
-- Reads/writes via `cosmic-config`
-- Text inputs for precise positioning
-- Apply Position button restarts widget
-
-**UI Structure**:
-```
-Settings Window (Scrollable)
-├── Monitoring Options
-│   ├── Show CPU (toggle)
-│   ├── Show Memory (toggle)
-│   ├── Show GPU (toggle)
-│   ├── Show Network (toggle)
-│   └── Show Disk (toggle)
-├── Storage Display
-│   └── Show Storage (toggle)
-├── Battery Display
-│   ├── Show Battery Section (toggle)
-│   └── Enable Solaar Integration (toggle)
-├── Widget Display
-│   ├── Show Clock (toggle)
-│   └── Show Date (toggle)
-├── Temperature Display
-│   ├── Show CPU Temperature (toggle)
-│   ├── Show GPU Temperature (toggle)
-│   └── Use Circular Temperature Display (toggle)
-├── Display Options
-│   ├── Show Percentages (toggle)
-│   └── Update Interval (text input)
-├── Weather Display
-│   ├── Show Weather (toggle)
-│   ├── Weather API Key (text input)
-│   └── Weather Location (text input)
-├── Notification Display
-│   └── Show Notifications (toggle)
-├── Media Display
-│   └── Show Media Player (toggle)
-├── Layout Order
-│   ├── Section ordering with up/down arrow buttons
-│   └── Reorderable list: Utilization, Temperatures, Storage, Battery, Weather, Notifications
-└── Widget Position
-    ├── X Position (text input)
-    ├── Y Position (text input)
-    └── Apply Position (button → restart widget)
+```text
+native APIs / D-Bus / local HTTP / sysfs
+                    |
+            background monitors
+                    |
+         synchronized snapshots/state
+                    |
+            Iced update and view
+                    |
+          Wayland layer surface
 ```
 
-**Apply Position Logic**:
-```rust
-1. pkill -f cosmic-widget
-2. sleep(300ms)
-3. spawn /usr/bin/cosmic-widget
+Slow I/O and device commands stay outside the Iced update path. Persistent
+workers and clients are reused where practical instead of creating a process,
+thread, D-Bus connection, or HTTP client for each update.
+
+## Data Sources
+
+| Section | Primary implementation |
+| --- | --- |
+| Utilization | `sysinfo`, Linux sysfs, and NVML for NVIDIA |
+| Network | Linux `/proc` and sysfs counters |
+| Disk I/O | Linux `/proc/diskstats` and sysfs metadata |
+| Temperatures | `sysinfo` hardware sensors and NVML |
+| Storage | `sysinfo` filesystem data and `/sys/class/block` model metadata |
+| Devices | Linux `power_supply`, native HID++, and native HID reports |
+| Weather | Open-Meteo through a persistent `reqwest` client |
+| Notifications | Native `zbus` monitoring and COSMIC history reconciliation |
+| Media | MPRIS over `zbus`, Cider HTTP, and Emby discovery/API access |
+
+### Devices
+
+`src/widget/battery.rs` coordinates device discovery, cached startup state,
+native readers, deduplication, and optional external fallbacks.
+
+- `battery/logitech.rs` discovers Logitech endpoints and delegates HID++
+  protocol, receiver, transport, sysfs, and Centurion handling.
+- `battery/headsets.rs` contains the explicit native headset registry and
+  dispatches to vendor protocol modules.
+- `battery/controllers/` contains model-specific controller readers.
+- Solaar and HeadsetControl are discovery/fallback paths, not primary polling
+  dependencies.
+
+The complete compatibility contract is documented in
+[Supported Devices](SUPPORTED_DEVICES.md).
+
+### Notifications
+
+One monitor connection observes FreeDesktop notification calls, replies, and
+close signals. A second reusable session-bus connection handles dismissal and
+periodic COSMIC history reconciliation.
+
+COSMIC notification history is restored through the optional
+`GetNotificationHistory` extension. When that method is unavailable, the
+overlay still captures live notifications and uses its session-scoped local
+cache. Dismissal uses the standard `CloseNotification` method and verifies the
+notification server owner before reusing an ID.
+
+### Media
+
+The media monitor merges several sources into a stable player list:
+
+- MPRIS players discovered and updated over D-Bus;
+- Cider through its local HTTP API;
+- Emby sessions found from the local client state and queried over HTTP.
+
+Controls are queued to an asynchronous command worker. Artwork is downloaded
+asynchronously through a persistent client and retained in a bounded LRU cache
+with entry, byte, and pixel limits. YouTube artwork candidates are keyed by
+video identity so lower-resolution updates cannot replace better artwork for
+the same track.
+
+## Configuration
+
+`src/config.rs` defines the versioned `cosmic-config` entry shared by all three
+installed processes. It controls:
+
+- enabled metrics and sections;
+- section order;
+- temperature presentation;
+- time and percentage display;
+- weather location;
+- notification and media visibility;
+- optional Solaar fallback and debug logging;
+- overlay position, autostart, and edit mode.
+
+The settings application writes changes directly. Most visual changes apply
+live; surface placement is committed when the user pins the overlay or resets
+its position.
+
+## Caches
+
+Files under `~/.cache/cosmic-widget-applet/` reduce empty startup states:
+
+| Cache | Contents |
+| --- | --- |
+| `widget_cache.json` | Storage identities and last confirmed peripheral battery readings |
+| `weather.json` | Resolved location and last successful weather response |
+| `notifications.json` | Session-scoped notification fallback history |
+
+Artwork is cached only in memory. Cached battery values are rendered as
+provisional until the live backend confirms the device and reading.
+
+## Source Map
+
+```text
+src/
+|- app.rs                    panel applet
+|- config.rs                 shared persistent configuration
+|- settings.rs               settings application
+|- iced_widget/              production overlay UI
+|- widget/
+|  |- battery.rs             battery monitor coordinator
+|  |- battery/               native device protocol modules
+|  |- media.rs               multi-source media coordinator
+|  |- media/                 Cider and MPRIS backends
+|  |- notifications.rs       D-Bus capture/history/dismissal
+|  |- utilization.rs         CPU, memory, and GPU utilization
+|  |- temperature.rs         hardware temperatures
+|  |- network.rs             network throughput
+|  |- disk_io.rs             disk throughput
+|  |- storage.rs             mounted filesystem usage
+|  `- weather.rs             Open-Meteo client and cache
+|- iced_widget_main.rs       production overlay entry point
+|- main.rs                   panel applet entry point
+`- settings_main.rs          settings entry point
 ```
 
-Why restart? Layer-shell margins are set at surface creation and cannot be changed at runtime.
+## Extending the Project
 
-## Configuration Flow
-
-```
-Settings Window → cosmic-config → Disk
-                       ↑            ↓
-                       └── Widget polls config
-                                    ↓
-                            Reads at startup
-                            Watches for changes
-```
-
-**Config Structure** (`src/config.rs`):
-```rust
-pub struct Config {
-    show_cpu: bool,
-    show_memory: bool,
-    show_gpu: bool,
-    show_network: bool,
-    show_disk: bool,
-    show_storage: bool,     // Storage/disk usage monitoring
-    show_battery: bool,     // Battery section display
-    enable_solaar_integration: bool,  // Enable Solaar for battery data
-    show_cpu_temp: bool,
-    show_gpu_temp: bool,
-    use_circular_temp_display: bool,
-    show_clock: bool,
-    show_date: bool,
-    use_24hour_time: bool,
-    show_weather: bool,
-    weather_api_key: String,
-    weather_location: String,
-    show_notifications: bool,  // Notification monitoring
-    max_notifications: usize,   // Maximum notifications to display
-    show_media: bool,           // Media player display (Cider)
-    cider_api_token: String,    // Cider API token (empty if auth disabled)
-    update_interval_ms: u64,
-    show_percentages: bool,
-    widget_x: i32,         // X position from left
-    widget_y: i32,         // Y position from top
-    widget_movable: bool,  // Internal (for future drag mode)
-    section_order: Vec<WidgetSection>, // Customizable section ordering
-}
-
-pub enum WidgetSection {
-    Utilization,   // CPU, RAM, GPU usage
-    Temperatures,  // CPU and GPU temperature displays
-    Storage,       // Disk usage information
-    Battery,       // Battery monitoring for wireless devices
-    Weather,       // Weather information display
-    Notifications, // Desktop notifications
-    Media,         // Media player display (Cider)
-}
-```
-
-**Storage**: `~/.config/cosmic/com.github.zoliviragh.CosmicWidget/v1/config`
-
-**Cache**: `~/.cache/cosmic-widget-applet/widget_cache.json`
-- Stores disk names and mount points
-- Stores battery device names and kinds
-- Enables instant display of placeholders on startup:
-  - Disks show empty bars with "Loading..." text
-  - Battery devices show disconnected icon with "Connecting..." text
-- Updated after first successful data fetch
-
-## Technical Challenges & Solutions
-
-### Challenge 1: Borderless Windows
-
-**Problem**: COSMIC compositor adds 10px `RESIZE_BORDER` to all windows
-**Attempted Solutions**:
-- ❌ `window_decorations(false)` - Still has border
-- ❌ CSD with `set_client_side(true)` - Still has border
-- ❌ Override redirect - Not available in Wayland
-- ❌ Subcompositor subsurfaces - Too complex, still managed
-
-**Solution**: Wayland layer-shell protocol
-- Bypasses window management completely
-- Used by bars, overlays, screen lockers
-- No borders, no titlebar, no resize handles
-- Compositor treats it as a layer, not a window
-
-### Challenge 2: Widget Positioning
-
-**Problem**: Layer-shell surfaces can't be dragged
-**Reason**: Position is set via margins at creation time, not movable
-
-**Solution**: 
-- Settings window provides text inputs for X/Y coordinates
-- "Apply Position" button kills and respawns widget
-- New widget instance reads updated config
-
-**Alternative Considered**:
-- Interactive dragging mode (tried, failed)
-- Layer-shell doesn't support grab/move operations
-- Would need to recreate surface on every pixel moved (terrible)
-
-### Challenge 3: Config Synchronization
-
-**Problem**: Multiple processes need shared config
-**Solution**: cosmic-config with polling
-- Settings writes atomically
-- Widget polls every 500ms
-- Applet doesn't need config (just spawns processes)
-
-## Dependencies
-
-### Core Dependencies
-- `libcosmic` (git) - For applet and settings UI
-- `smithay-client-toolkit` 0.19.2 - Layer-shell protocol
-- `wayland-client` 0.31 - Wayland core protocol
-- `wayland-protocols` 0.32 - Protocol definitions
-
-### Rendering
-- `cairo-rs` 0.20.1 - 2D graphics with transparency
-- `pango` 0.20.1 - Text layout
-- `pangocairo` 0.20.1 - Cairo/Pango integration
-- `chrono` 0.4 - Date/time formatting for clock display
-
-### System Monitoring
-- `sysinfo` 0.32 - CPU, memory, disk stats
-- `solaar` (external) - Optional CLI tool for Logitech wireless device battery monitoring
-- `headsetcontrol` (external) - Optional CLI tool for gaming headset battery monitoring
-
-### Configuration & Storage
-- `cosmic-config` (from libcosmic) - Settings persistence
-- `serde`/`serde_json` 1.0 - JSON serialization for cache
-- `dirs` 5.0 - Standard cache directory locations
-
-## Build Targets
-
-```toml
-[[bin]]
-name = "cosmic-widget-applet"
-path = "src/main.rs"
-
-[[bin]]
-name = "cosmic-widget"
-path = "src/widget_main.rs"
-
-[[bin]]
-name = "cosmic-widget-settings"
-path = "src/settings_main.rs"
-```
-
-## Future Enhancements
-
-### Planned
-- [ ] Actual network statistics (rx/tx bytes per second)
-- [ ] Actual disk I/O statistics
-- [ ] Storage temperature monitoring
-- [x] AMD/Intel GPU monitoring support (implemented via sysfs/radeontop/intel_gpu_top)
-- [ ] Graph visualizations (line graphs for trends)
-- [ ] Customizable colors/themes
-- [ ] Multiple widget instances with different configs
-- [ ] Click actions (e.g., click to open system monitor)
-
-### Under Consideration
-- [ ] Different anchor positions (top-right, bottom-left, etc.)
-- [ ] Transparency/opacity controls
-- [ ] Font/size customization
-- [ ] Animated updates (smooth transitions)
-
-### Not Feasible
-- ❌ Interactive dragging (layer-shell limitation)
-- ❌ COSMIC theming integration (layer-shell is separate from COSMIC window management)
-- ❌ Dynamic repositioning without restart (would need to destroy/recreate surface)
-
-## Development Notes
-
-### Debugging Widget
-```bash
-# Run with stderr output
-cosmic-widget 2>&1
-
-# Shows:
-# - Widget starting with position: X=?, Y=?
-# - Setting layer surface margins: top=?, left=?
-```
-
-### Debugging Settings
-```bash
-# Run from terminal to see button clicks
-cosmic-widget-settings 2>&1
-
-# Shows:
-# - ApplyPosition clicked! Current position: X=?, Y=?
-# - pkill status: ?
-# - Widget spawned with PID: ?
-```
-
-### Testing Config Changes
-```bash
-# Watch config file
-watch -n 0.5 cat ~/.config/cosmic/com.github.zoliviragh.CosmicWidget/v1/config
-
-# Modify settings and see updates in real-time
-```
-
-## Files Reference
-
-- `src/main.rs` - Applet entry point
-- `src/app.rs` - Applet application logic
-- `src/settings_main.rs` - Settings entry point
-- `src/settings.rs` - Settings application logic
-- `src/widget_main.rs` - Widget (layer-shell implementation)
-- `src/widget/renderer.rs` - Modular rendering system (extracted from widget_main.rs)
-- `src/widget/layout.rs` - Dynamic height calculation logic
-- `src/widget/storage.rs` - Storage/disk usage monitoring with lsblk integration
-- `src/widget/battery.rs` - Battery monitoring via Solaar (Logitech) and HeadsetControl (headsets) CLI integration
-- `src/widget/notifications.rs` - Desktop notification monitoring via D-Bus with busctl
-- `src/widget/media.rs` - Media player monitoring via Cider REST API
-- `src/widget/weather.rs` - OpenWeatherMap API integration with day/night icons
-- `src/widget/cache.rs` - Persistent cache for drives and peripherals
-- `src/widget/utilization.rs` - CPU, RAM, GPU monitoring with icon rendering
-- `src/widget/temperature.rs` - Temperature monitoring with circular gauge rendering
-- `src/widget/network.rs` - Network monitoring module
-- `src/config.rs` - Shared configuration structure
-- `src/i18n.rs` - Localization support
-- `i18n/en/cosmic_widget_applet.ftl` - English translations
-- `resources/app.desktop` - Applet desktop file
-- `resources/settings.desktop` - Settings desktop file
+- Add explicit headset USB identities to the appropriate vendor module and the
+  registry chain in `battery/headsets.rs`.
+- Add a controller-specific reader under `battery/controllers/`.
+- Keep hardware I/O off the UI thread and preserve the last confirmed reading
+  only across transient failures.
+- Update `SUPPORTED_DEVICES.md` whenever the native registry or protocol
+  coverage changes.
+- Prefer native Rust APIs and persistent connections over command output
+  parsing.
