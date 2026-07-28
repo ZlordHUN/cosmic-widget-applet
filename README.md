@@ -2,6 +2,8 @@
 
 [Overview](README.md) | [Architecture](ARCHITECTURE.md) | [Supported Devices](SUPPORTED_DEVICES.md)
 
+![COSMIC Widget overlay](screenshots/cosmic-widget-overlay.png)
+
 A configurable system monitor overlay for the
 [COSMIC desktop](https://github.com/pop-os/cosmic-epoch).
 
