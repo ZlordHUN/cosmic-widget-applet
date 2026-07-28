@@ -18,6 +18,7 @@ desktop-dst := base-dir / 'share' / 'applications' / appid + '.desktop'
 widget-desktop-dst := base-dir / 'share' / 'applications' / appid + '.Widget.desktop'
 settings-desktop-dst := base-dir / 'share' / 'applications' / appid + '.Settings.desktop'
 icon-dst := base-dir / 'share' / 'icons' / 'hicolor' / 'scalable' / 'apps' / appid + '.svg'
+headset-rules-dst := base-dir / 'lib' / 'udev' / 'rules.d' / '70-cosmic-widget-headsets.rules'
 
 # Default recipe which runs `just build-release`
 default: build-release
@@ -76,10 +77,11 @@ install:
     install -Dm0644 resources/settings.desktop {{settings-desktop-dst}}
     install -Dm0644 resources/app.metainfo.xml {{appdata-dst}}
     install -Dm0644 resources/icon.svg {{icon-dst}}
+    install -Dm0644 resources/70-cosmic-widget-headsets.rules {{headset-rules-dst}}
 
 # Uninstalls installed files
 uninstall:
-    rm {{bin-dst}} {{widget-bin-dst}} {{settings-bin-dst}} {{desktop-dst}} {{widget-desktop-dst}} {{settings-desktop-dst}} {{icon-dst}}
+    rm {{bin-dst}} {{widget-bin-dst}} {{settings-bin-dst}} {{desktop-dst}} {{widget-desktop-dst}} {{settings-desktop-dst}} {{icon-dst}} {{headset-rules-dst}}
 
 # Vendor dependencies locally
 vendor:

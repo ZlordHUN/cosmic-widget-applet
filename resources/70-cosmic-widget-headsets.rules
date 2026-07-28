@@ -1,0 +1,24 @@
+# Native battery readers for wireless headsets supported by COSMIC Widget.
+ACTION!="add|change", GOTO="cosmic_widget_headsets_end"
+
+# Logitech gaming headsets
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0b1c|0a1f|0b18|0a66|0ac4|0a5c|0a89|0a5b|0a87|0ab5|0afe|0b1f|0aa7|0aaa|0aba|0afb|0afc|0af7", TAG+="uaccess"
+
+# Corsair wireless headsets
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1b1c", ATTRS{idProduct}=="1b1c|1b27|0a14|0a16|0a17|0a1d|0a1a|1b2a|1b23|1b29|0a55|0a51|0a52|0a38|0a4f|0a2b|0a75|0a56|2a08|2a02", TAG+="uaccess"
+
+# SteelSeries wireless headsets and earbuds
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12b3|12b6|12d7|12d5|1260|12ad|1252|1280|220e|2212|2216|2236|12c2|1290|12e0|12e5|2202|22a1|227e|2206|2258|229e|22ad|223a|22a9|227a|22a4|22a5|220a|22a7|2232|2253|2269|226d|230a", TAG+="uaccess"
+
+# HyperX wireless headsets
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="03f0", ATTRS{idProduct}=="098d|0696", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0951", ATTRS{idProduct}=="16c4|1723|1718", TAG+="uaccess"
+
+# Lenovo and Sony wireless headsets
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17ef", ATTRS{idProduct}=="a07d", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ec2", TAG+="uaccess"
+
+# Audeze Maxwell and Maxwell 2
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b18|4b19|4b1a|4b1e|4b29", TAG+="uaccess"
+
+LABEL="cosmic_widget_headsets_end"

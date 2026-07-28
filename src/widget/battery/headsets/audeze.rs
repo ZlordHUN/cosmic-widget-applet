@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Native Audeze Maxwell battery reader for Linux hidraw.
+//! Native Audeze Maxwell battery readers.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -9,12 +9,28 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use hidapi::HidDevice;
+
+use super::{
+    Profile,
+    transport::{Reading, get_input, percentage, write_padded},
+};
+
 const VENDOR_ID: u16 = 0x3329;
 const DONGLE_PRODUCT_IDS: [u16; 2] = [0x4b19, 0x4b18];
 const WIRED_PRODUCT_IDS: [u16; 2] = [0x4b1a, 0x4b1e];
+const MAXWELL_2_PRODUCT_IDS: &[u16] = &[0x4b29];
 const MESSAGE_SIZE: usize = 62;
 const INPUT_REPORT_ID: u8 = 0x07;
 const PACKET_DELAY: Duration = Duration::from_millis(60);
+
+pub(super) const PROFILES: &[Profile] = &[Profile {
+    vendor_id: VENDOR_ID,
+    product_ids: MAXWELL_2_PRODUCT_IDS,
+    name: "Audeze Maxwell 2",
+    interface: Some(5),
+    query: query_maxwell_2,
+}];
 
 const STATUS_REQUESTS: [[u8; MESSAGE_SIZE]; 5] = [
     packet(&[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x22]),
@@ -37,10 +53,10 @@ const fn packet(bytes: &[u8]) -> [u8; MESSAGE_SIZE] {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BatteryState {
-    pub(super) level: Option<u8>,
-    pub(super) charging: bool,
-    pub(super) connected: bool,
+pub(crate) struct BatteryState {
+    pub(crate) level: Option<u8>,
+    pub(crate) charging: bool,
+    pub(crate) connected: bool,
 }
 
 #[derive(Debug)]
@@ -50,7 +66,7 @@ struct HidrawDevice {
     product_id: u16,
 }
 
-pub(super) fn query() -> Result<Option<BatteryState>, String> {
+pub(crate) fn query() -> Result<Option<BatteryState>, String> {
     let devices = enumerate_hidraw().map_err(|error| error.to_string())?;
     let Some(dongle) = devices.iter().find(|device| {
         device.vendor_id == VENDOR_ID && DONGLE_PRODUCT_IDS.contains(&device.product_id)
@@ -180,6 +196,75 @@ fn parse_battery_response(response: &[u8]) -> Option<u8> {
     })
 }
 
+const MAXWELL_2_INITIALIZATION_REQUESTS: &[&[u8]] = &[
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x20],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x25],
+    &[0x06, 0x07, 0x80, 0x05, 0x5a, 0x03, 0x00, 0x07, 0x1c],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x28],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x83, 0x2c, 0x01],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x83, 0x2c, 0x07],
+    &[0x06, 0x07, 0x00, 0x05, 0x5a, 0x03, 0x00, 0x07, 0x1c],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x2d],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x2c],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x83, 0x2c, 0x0b],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x24],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x2f],
+    &[
+        0x06, 0x09, 0x80, 0x05, 0x5a, 0x05, 0x00, 0x00, 0x09, 0x25, 0x00, 0x7a,
+    ],
+    &[0x06, 0x07, 0x80, 0x05, 0x5a, 0x03, 0x00, 0xd6, 0x0c],
+];
+
+const MAXWELL_2_STATUS_REQUESTS: &[&[u8]] = &[
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x22],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x83, 0x2c, 0x0b],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x24],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x01, 0x09, 0x2c],
+    &[0x06, 0x08, 0x80, 0x05, 0x5a, 0x04, 0x00, 0x83, 0x2c, 0x07],
+];
+
+fn query_maxwell_2(device: &HidDevice, _product_id: u16) -> Result<Reading, String> {
+    for request in MAXWELL_2_INITIALIZATION_REQUESTS {
+        send_maxwell_2_request(device, request)?;
+    }
+
+    let mut battery_response = None;
+    for (index, request) in MAXWELL_2_STATUS_REQUESTS.iter().enumerate() {
+        let response = send_maxwell_2_request(device, request)?;
+        if index == 0 {
+            battery_response = Some(response);
+        }
+    }
+
+    let response = battery_response.ok_or_else(|| "battery response was absent".to_string())?;
+    let level = parse_maxwell_2_battery(&response)
+        .ok_or_else(|| "Audeze Maxwell 2 battery marker was absent".to_string())?;
+    Ok(Reading::discharging(level))
+}
+
+fn send_maxwell_2_request(device: &HidDevice, request: &[u8]) -> Result<Vec<u8>, String> {
+    thread::sleep(PACKET_DELAY);
+    write_padded(device, request, MESSAGE_SIZE)?;
+    let response = get_input(device, INPUT_REPORT_ID, MESSAGE_SIZE)?;
+    if response.len() != MESSAGE_SIZE {
+        return Err(format!(
+            "Audeze Maxwell 2 returned a {}-byte input report",
+            response.len()
+        ));
+    }
+    Ok(response)
+}
+
+fn parse_maxwell_2_battery(response: &[u8]) -> Option<u8> {
+    response.windows(5).find_map(|window| {
+        (window[0..4] == [0xd6, 0x0c, 0x00, 0x00])
+            .then(|| percentage(window[4]).ok())
+            .flatten()
+    })
+}
+
 const fn hid_ioc_get_input(length: usize) -> libc::c_ulong {
     const IOC_WRITE: libc::c_ulong = 1;
     const IOC_READ: libc::c_ulong = 2;
@@ -195,8 +280,9 @@ const fn hid_ioc_get_input(length: usize) -> libc::c_ulong {
 #[cfg(test)]
 mod tests {
     use super::{
-        MESSAGE_SIZE, hid_ioc_get_input, parse_battery_response, parse_battery_state, parse_hid_id,
-        query,
+        MAXWELL_2_INITIALIZATION_REQUESTS, MAXWELL_2_STATUS_REQUESTS, MESSAGE_SIZE,
+        hid_ioc_get_input, parse_battery_response, parse_battery_state, parse_hid_id,
+        parse_maxwell_2_battery, query,
     };
 
     #[test]
@@ -214,6 +300,30 @@ mod tests {
         assert_eq!(
             parse_battery_response(&[0x07, 0xd6, 0x0c, 0x00, 0x00, 101]),
             None
+        );
+    }
+
+    #[test]
+    fn parses_maxwell_2_battery_marker() {
+        assert_eq!(
+            parse_maxwell_2_battery(&[0x07, 0xd6, 0x0c, 0x00, 0x00, 73]),
+            Some(73)
+        );
+        assert_eq!(
+            parse_maxwell_2_battery(&[0x07, 0xd6, 0x0c, 0x00, 0x00, 101]),
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_complete_maxwell_2_handshake() {
+        assert_eq!(MAXWELL_2_INITIALIZATION_REQUESTS.len(), 15);
+        assert_eq!(MAXWELL_2_STATUS_REQUESTS.len(), 6);
+        assert!(
+            MAXWELL_2_INITIALIZATION_REQUESTS
+                .iter()
+                .chain(MAXWELL_2_STATUS_REQUESTS)
+                .all(|request| request.first() == Some(&0x06) && request.len() <= MESSAGE_SIZE)
         );
     }
 

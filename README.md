@@ -33,7 +33,7 @@ A borderless floating widget that displays real-time system statistics for the C
 - **System Monitoring**: Real-time CPU, memory, GPU (NVIDIA, AMD, Intel auto-detected), storage usage, network, and disk I/O statistics
 - **Multi-Vendor GPU Support**: Automatic detection and monitoring for NVIDIA (nvidia-smi), AMD (sysfs/radeontop), and Intel (sysfs/intel_gpu_top) GPUs
 - **Storage Monitoring**: Displays disk usage for system drives and external media with intelligent labeling (vendor + model names)
-- **Battery Monitoring**: Shows battery status for Logitech wireless devices (via Solaar) and gaming headsets (via HeadsetControl) with color-coded vertical battery icons, connection status, and immediate startup rendering
+- **Battery Monitoring**: Shows battery and charging status through native readers for Logitech peripherals and gaming headsets, Audeze Maxwell and Maxwell 2, Corsair, SteelSeries, HyperX, Lenovo, Sony, and the Razer Wolverine V3 Pro 8K PC, with optional external fallbacks
 - **Media Player Integration**: Multi-source media player with support for Cider (Apple Music), browser audio (YouTube thumbnails), and any MPRIS-compatible player; includes album art, playback controls, and pagination dots for switching between active players
 - **Persistent Cache**: Remembers drives and peripherals to instantly display placeholders while loading fresh data
 - **Customizable Position**: Precise X/Y positioning via settings window
@@ -104,7 +104,7 @@ Settings are stored using cosmic-config at:
 Available options:
 - **Monitoring**: Toggle CPU, memory, GPU, network, disk stats individually
 - **Storage Display**: Toggle storage/disk usage monitoring with per-drive usage bars
-- **Battery Display**: Toggle battery section and enable Solaar integration for Logitech wireless devices
+- **Battery Display**: Toggle the battery section and optional Solaar fallback
 - **Temperature Display**: Toggle CPU and GPU temperature monitoring independently, switch between circular gauges and text display
 - **Widget Display**: Toggle clock (12/24-hour format) and date displays independently
 - **Weather Display**: Toggle weather information and configure location (no API key needed - uses Open-Meteo)
@@ -135,8 +135,8 @@ Trade-offs:
 - **chrono**: Date and time formatting
 - **sysinfo**: System statistics monitoring
 - **busctl**: System tool for D-Bus monitoring (notification capture)
-- **solaar**: (Optional) For battery monitoring of Logitech wireless devices
-- **headsetcontrol**: (Optional) For battery monitoring of gaming headsets (Audeze, SteelSeries, Logitech, HyperX, etc.)
+- **solaar**: (Optional) Fallback for Logitech devices the native HID++ reader cannot reach
+- **headsetcontrol**: (Optional) Fallback for newly supported gaming headsets not yet covered by a native reader
 - **cosmic-config**: Configuration persistence
 - **reqwest**: HTTP client for weather API requests
 - **serde/serde_json**: JSON parsing for weather data
@@ -168,28 +168,34 @@ Weather updates every 2 minutes and displays:
 
 To enable battery monitoring for wireless peripherals:
 
-### Logitech Devices (via Solaar)
+### Logitech Devices
 
-1. Install [Solaar](https://github.com/pwr-Solaar/Solaar) if not already installed:
+Logitech HID++ devices are read natively over USB, Bluetooth, Bolt, Unifying,
+Nano, Lightspeed, and legacy receivers. Solaar is not required. It can be
+installed as an optional fallback:
+
    ```bash
    sudo apt install solaar  # Debian/Ubuntu
    sudo dnf install solaar  # Fedora
    ```
 
-### Gaming Headsets (via HeadsetControl)
+### Gaming Headsets
 
-1. Install [HeadsetControl](https://github.com/Sapd/HeadsetControl) if not already installed:
-   ```bash
-   sudo apt install headsetcontrol  # Debian/Ubuntu
-   # Or build from source for latest device support
-   ```
+Battery-capable Audeze, Corsair, HyperX, Logitech, Sony, SteelSeries, and Lenovo
+headsets from the HeadsetControl device registry are read natively. The
+installation includes the required udev access rules. Reconnect a headset
+receiver after the first install so the new permissions take effect.
+
+[HeadsetControl](https://github.com/Sapd/HeadsetControl) remains an optional
+fallback for newer or unrecognized models.
 
 ### Enable in Settings
 
 1. Open Settings from the applet menu
 2. Navigate to the Battery section
 3. Enable "Show Battery Section"
-4. Enable "Enable Solaar Integration" (monitors both Solaar and HeadsetControl)
+4. Enable "Enable Solaar Integration" only if an unsupported Logitech device
+   needs the fallback
 
 The widget will display:
 - Device names (e.g., "G309 LIGHTSPEED", "MX Mechanical Mini", "Audeze Maxwell")
@@ -261,16 +267,20 @@ The widget will display:
 
 ### Supported Devices
 
-**Logitech** (via Solaar): Any wireless device that Solaar can detect (mice, keyboards, trackballs, etc.)
+**Logitech** (native HID++): Battery-capable devices connected over USB,
+Bluetooth, Bolt, Unifying, Nano, Lightspeed, legacy receivers, and the
+Centurion headset transport. Solaar remains available as a fallback.
 
-**Headsets** (via HeadsetControl):
-- Audeze Maxwell (PC & Xbox variants)
-- SteelSeries Arctis series (7, 9, Nova, Pro Wireless)
-- Logitech G series headsets (G533, G733, G935, PRO X, etc.)
-- HyperX Cloud series
-- Corsair VOID series
-- Roccat Elo 7.1 Air
-- And many more - see [HeadsetControl device list](https://github.com/Sapd/HeadsetControl#supported-headsets)
+**Headsets** (native battery readers):
+- Audeze Maxwell (PC, PlayStation, and Xbox variants) and Maxwell 2
+- Corsair VOID and Wireless V2 families
+- HyperX Cloud Alpha, Cloud Flight, and Cloud II Wireless families
+- Logitech ASTRO A50 Gen 5, G930, G522, G533, G535, G633/G635/G733/G933/G935, and G PRO families
+- Sony INZONE Buds
+- SteelSeries Arctis 1/7/9/Pro, Nova, and GameBuds families
+- Lenovo Wireless VoIP Headset
+
+HeadsetControl remains available as a compatibility fallback.
 
 ### Managing Cached Devices
 

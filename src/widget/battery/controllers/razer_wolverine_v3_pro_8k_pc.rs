@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Native battery reader for the Razer Wolverine V3 Pro 8K PC.
+//! Native Linux battery reader for the Razer Wolverine V3 Pro 8K PC.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -72,7 +72,7 @@ pub(super) fn query() -> Result<Option<BatteryState>, String> {
     let charging = match query_command(&mut handle, COMMAND_CHARGING_STATUS)? {
         CommandResult::Success(value) => value != 0,
         CommandResult::Unavailable => {
-            return Err("Wolverine charging state was unavailable".to_string());
+            return Err("Razer Wolverine V3 Pro 8K PC charging state was unavailable".to_string());
         }
     };
 
@@ -145,7 +145,7 @@ fn query_command(handle: &mut File, command: u8) -> Result<CommandResult, String
     };
     if written != HID_REPORT_SIZE as libc::c_int {
         return Err(format!(
-            "failed to send Wolverine feature report: {}",
+            "failed to send Razer Wolverine V3 Pro 8K PC feature report: {}",
             io::Error::last_os_error()
         ));
     }
@@ -163,7 +163,7 @@ fn query_command(handle: &mut File, command: u8) -> Result<CommandResult, String
     };
     if read != HID_REPORT_SIZE as libc::c_int {
         return Err(format!(
-            "failed to read Wolverine feature report: {}",
+            "failed to read Razer Wolverine V3 Pro 8K PC feature report: {}",
             io::Error::last_os_error()
         ));
     }
@@ -191,10 +191,14 @@ fn parse_response(
         || response[7] != COMMAND_CLASS_POWER
         || response[8] != expected_command
     {
-        return Err("Wolverine feature response did not match the request".to_string());
+        return Err(
+            "Razer Wolverine V3 Pro 8K PC feature response did not match the request".to_string(),
+        );
     }
     if calculate_crc(response) != response[89] {
-        return Err("Wolverine feature response checksum was invalid".to_string());
+        return Err(
+            "Razer Wolverine V3 Pro 8K PC feature response checksum was invalid".to_string(),
+        );
     }
     if response[1] != COMMAND_SUCCESS {
         return Ok(CommandResult::Unavailable);
@@ -276,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_wolverine_feature_interface() {
+    fn accepts_only_wolverine_v3_pro_8k_pc_feature_interface() {
         assert!(supports_razer_feature_report(&[
             0x05,
             0x01,
@@ -291,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_wolverine_hid_identity() {
+    fn parses_wolverine_v3_pro_8k_pc_hid_identity() {
         let uevent = "DRIVER=hid-generic\nHID_ID=0003:00001532:00000A59\n";
         assert_eq!(parse_hid_id(uevent), Some((0x1532, 0x0a59)));
     }
@@ -304,13 +308,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires a connected Razer Wolverine V3 Pro 8K PC"]
-    fn reads_connected_wolverine() {
+    fn reads_connected_wolverine_v3_pro_8k_pc() {
         let state = super::query()
-            .expect("native Wolverine query failed")
-            .expect("Wolverine dongle or wired controller was not found");
+            .expect("native Razer Wolverine V3 Pro 8K PC query failed")
+            .expect("Razer Wolverine V3 Pro 8K PC dongle or wired controller was not found");
         if state.connected {
             assert!(state.level.is_some_and(|level| level <= 100));
         }
-        println!("Wolverine native battery state: {state:?}");
+        println!("Razer Wolverine V3 Pro 8K PC native battery state: {state:?}");
     }
 }

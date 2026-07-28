@@ -325,7 +325,7 @@ impl Default for Config {
     /// Defaults are chosen to provide a useful out-of-box experience:
     /// - Basic system monitoring (CPU, Memory, Storage) enabled
     /// - Advanced features (GPU, Weather, Media) disabled until configured
-    /// - Widget auto-starts at position (50, 50)
+    /// - Widget auto-starts at position (7260, 50)
     /// - 1-second update interval for good balance of responsiveness and efficiency
     fn default() -> Self {
         Self {
@@ -370,10 +370,10 @@ impl Default for Config {
             // Display: Show percentages
             show_percentages: true,
 
-            // Position: Top-left area, auto-start enabled
-            widget_x: 50,
+            // Position: 50 px from the top and right on a 7680 px-wide display
+            widget_x: 7260,
             widget_y: 50,
-            default_widget_x: 50,
+            default_widget_x: 7260,
             default_widget_y: 50,
             position_defaults_initialized: false,
             widget_movable: false,
@@ -411,9 +411,20 @@ mod tests {
     }
 
     #[test]
+    fn default_position_matches_the_installed_layout() {
+        let config = Config::default();
+
+        assert_eq!((config.widget_x, config.widget_y), (7260, 50));
+        assert_eq!(
+            (config.default_widget_x, config.default_widget_y),
+            (7260, 50)
+        );
+    }
+
+    #[test]
     fn captures_and_restores_the_installed_position() {
         let mut config = Config::default();
-        config.widget_x = 7250;
+        config.widget_x = 7260;
         config.widget_y = 50;
 
         assert!(config.ensure_position_defaults());
@@ -424,7 +435,7 @@ mod tests {
         config.widget_movable = true;
         config.reset_widget_position();
 
-        assert_eq!((config.widget_x, config.widget_y), (7250, 50));
+        assert_eq!((config.widget_x, config.widget_y), (7260, 50));
         assert!(!config.widget_movable);
     }
 

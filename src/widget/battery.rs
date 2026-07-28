@@ -3,17 +3,17 @@
 //! # Battery Monitoring Module (External Devices)
 //!
 //! This module monitors battery levels for external peripherals like wireless mice,
-//! keyboards, headsets, and controllers. The Audeze Maxwell, Razer Wolverine,
-//! and supported Logitech devices use native Linux interfaces; other
+//! keyboards, headsets, and controllers. The Audeze Maxwell, Razer Wolverine
+//! V3 Pro 8K PC, and supported Logitech devices use native Linux interfaces; other
 //! proprietary devices use established CLI backends.
 //!
 //! ## Supported Tools
 //!
-//! - **Native HID**: Audeze Maxwell, Razer Wolverine, and Logitech Bolt
-//!   battery/charging state
+//! - **Native HID**: Audeze Maxwell, Razer Wolverine V3 Pro 8K PC, Corsair,
+//!   HyperX, Logitech, Sony, SteelSeries, and Lenovo battery/charging state
 //! - **Linux power_supply**: Logitech devices exposed by the kernel HID++ driver
-//! - **Solaar**: Fallback for unsupported Logitech receivers and devices
-//! - **HeadsetControl**: Remaining supported gaming headsets
+//! - **Solaar**: Optional fallback for devices the native reader cannot reach
+//! - **HeadsetControl**: Optional compatibility fallback for newer headsets
 //!
 //! ## Data Flow
 //!
@@ -54,15 +54,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[path = "battery/audeze_maxwell.rs"]
-mod audeze_maxwell;
+use super::cache::{CachedBatteryDevice, WidgetCache};
+
+#[path = "battery/headsets.rs"]
+mod headsets;
 #[path = "battery/logitech.rs"]
 mod logitech;
-#[path = "battery/razer_wolverine.rs"]
-mod razer_wolverine;
+#[path = "battery/controllers/razer_wolverine_v3_pro_8k_pc.rs"]
+mod razer_wolverine_v3_pro_8k_pc;
 
 const MAXWELL_DEVICE_NAME: &str = "Audeze Maxwell";
-const WOLVERINE_DEVICE_NAME: &str = "Razer Wolverine V3 Pro 8K";
+const WOLVERINE_DEVICE_NAME: &str = "Razer Wolverine V3 Pro 8K PC";
 const MAXWELL_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(2);
 const WOLVERINE_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -154,9 +156,8 @@ impl ExternalProbePlan {
 ///
 /// # Caching
 ///
-/// Device names and types are cached to disk so the widget can show
-/// meaningful device names immediately on startup, even before Solaar
-/// has time to respond.
+/// Device names, types, and last confirmed readings are cached so the widget
+/// can show a clearly marked provisional value while live probes complete.
 pub struct BatteryMonitor {
     /// Shared device list, updated by background thread
     devices: Arc<Mutex<Vec<BatteryDevice>>>,
@@ -199,14 +200,14 @@ impl BatteryMonitor {
 
         // Load cached battery devices to show immediately
         // This provides instant display while real data loads
-        let cache = super::cache::WidgetCache::load();
+        let cache = WidgetCache::load();
         let cached_devices: Vec<BatteryDevice> = cache
             .battery_devices
             .iter()
             .map(|d| BatteryDevice {
                 name: d.name.clone(),
-                level: None, // No cached level, will show "loading"
-                status: None,
+                level: d.level,
+                status: d.status.clone(),
                 kind: d.kind.clone(),
                 codename: None,
                 is_loading: true, // Mark as loading until real data arrives
@@ -226,13 +227,16 @@ impl BatteryMonitor {
 
         std::thread::spawn(move || {
             let initial_probe_started = Instant::now();
-            let mut is_first_update = true;
+            let mut last_cache_snapshot = Vec::new();
             let mut native_maxwell_authoritative = false;
             let mut native_maxwell = None;
             let mut native_wolverine = None;
             let mut active_solaar = solaar_enabled_clone.load(Ordering::Relaxed);
             let mut logitech_monitor = logitech::Monitor::new();
             let mut native_logitech = query_native_logitech(&mut logitech_monitor);
+            let mut headset_monitor = headsets::Monitor::new();
+            let mut native_headsets = query_native_headsets(&mut headset_monitor);
+            let mut native_headset_coverage = native_headsets.covered_names.clone();
 
             if !native_logitech.is_empty() {
                 log::info!(
@@ -241,6 +245,17 @@ impl BatteryMonitor {
                 );
                 merge_native_logitech(&mut devices_clone.lock().unwrap(), &native_logitech);
             }
+            if !native_headsets.states.is_empty() {
+                log::info!(
+                    "Using native monitoring for {} additional headset device(s)",
+                    native_headsets.states.len()
+                );
+            }
+            merge_native_headsets(
+                &mut devices_clone.lock().unwrap(),
+                &native_headsets.states,
+                &native_headset_coverage,
+            );
 
             match query_native_maxwell(false) {
                 Ok(state) => {
@@ -262,7 +277,7 @@ impl BatteryMonitor {
             match query_native_wolverine(false) {
                 Ok(state) => {
                     if state.is_some() {
-                        log::info!("Using native HID monitoring for Razer Wolverine V3 Pro 8K");
+                        log::info!("Using native HID monitoring for Razer Wolverine V3 Pro 8K PC");
                     }
                     native_wolverine = state;
                     merge_native_wolverine(
@@ -271,7 +286,7 @@ impl BatteryMonitor {
                     );
                 }
                 Err(error) => {
-                    log::warn!("Native Razer Wolverine query failed: {error}");
+                    log::warn!("Native Razer Wolverine V3 Pro 8K PC query failed: {error}");
                 }
             }
 
@@ -301,6 +316,7 @@ impl BatteryMonitor {
                 native_maxwell_authoritative,
                 &native_logitech,
             );
+            reconcile_native_headset_fallbacks(&mut external_state, &native_headset_coverage);
 
             let mut new_devices = combined_battery_devices(
                 &external_state,
@@ -308,17 +324,15 @@ impl BatteryMonitor {
                 native_maxwell.clone(),
                 &native_logitech,
                 native_wolverine.clone(),
+                &native_headsets.states,
+                &native_headset_coverage,
             );
             let mut devices = devices_clone.lock().unwrap();
             preserve_loading_devices(&mut new_devices, &devices);
             *devices = new_devices.clone();
             drop(devices);
 
-            if is_first_update && new_devices.iter().any(|device| !device.is_loading) {
-                let mut cache = super::cache::WidgetCache::load();
-                cache.update_battery_devices(&new_devices);
-                is_first_update = false;
-            }
+            persist_battery_readings(&mut last_cache_snapshot, &new_devices);
 
             // Clear the initial update request flag
             *update_requested_clone.lock().unwrap() = false;
@@ -372,11 +386,29 @@ impl BatteryMonitor {
 
                 native_logitech = query_native_logitech(&mut logitech_monitor);
                 merge_native_logitech(&mut devices_clone.lock().unwrap(), &native_logitech);
+                let previous_headset_coverage = native_headset_coverage.clone();
+                native_headsets = query_native_headsets(&mut headset_monitor);
+                native_headset_coverage = native_headsets.covered_names.clone();
+                let mut headset_rows_to_replace = previous_headset_coverage;
+                for name in &native_headset_coverage {
+                    if !headset_rows_to_replace
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(name))
+                    {
+                        headset_rows_to_replace.push(name.clone());
+                    }
+                }
+                merge_native_headsets(
+                    &mut devices_clone.lock().unwrap(),
+                    &native_headsets.states,
+                    &headset_rows_to_replace,
+                );
                 reconcile_external_fallbacks(
                     &mut external_state,
                     native_maxwell_authoritative,
                     &native_logitech,
                 );
+                reconcile_native_headset_fallbacks(&mut external_state, &native_headset_coverage);
 
                 // Check if update is needed (atomic check-and-clear)
                 let requested = {
@@ -410,6 +442,10 @@ impl BatteryMonitor {
                         native_maxwell_authoritative,
                         &native_logitech,
                     );
+                    reconcile_native_headset_fallbacks(
+                        &mut external_state,
+                        &native_headset_coverage,
+                    );
 
                     let mut new_devices = combined_battery_devices(
                         &external_state,
@@ -417,18 +453,17 @@ impl BatteryMonitor {
                         native_maxwell.clone(),
                         &native_logitech,
                         native_wolverine.clone(),
+                        &native_headsets.states,
+                        &native_headset_coverage,
                     );
                     let mut devices = devices_clone.lock().unwrap();
                     preserve_loading_devices(&mut new_devices, &devices);
                     *devices = new_devices.clone();
                     drop(devices);
-
-                    if is_first_update && new_devices.iter().any(|device| !device.is_loading) {
-                        let mut cache = super::cache::WidgetCache::load();
-                        cache.update_battery_devices(&new_devices);
-                        is_first_update = false;
-                    }
                 }
+
+                let current_devices = devices_clone.lock().unwrap().clone();
+                persist_battery_readings(&mut last_cache_snapshot, &current_devices);
             }
         });
 
@@ -484,12 +519,12 @@ impl BatteryMonitor {
 // ============================================================================
 
 fn query_native_maxwell(was_connected: bool) -> Result<Option<BatteryDevice>, String> {
-    let mut state = audeze_maxwell::query()?;
+    let mut state = headsets::query_audeze_maxwell()?;
     let is_connected = state.as_ref().is_some_and(|state| state.connected);
 
     if is_connected != was_connected {
         std::thread::sleep(MAXWELL_CONNECTION_SETTLE_DELAY);
-        state = audeze_maxwell::query()?;
+        state = headsets::query_audeze_maxwell()?;
     }
 
     Ok(state.map(|state| BatteryDevice {
@@ -518,12 +553,12 @@ fn merge_native_maxwell(devices: &mut Vec<BatteryDevice>, native_maxwell: Option
 }
 
 fn query_native_wolverine(was_connected: bool) -> Result<Option<BatteryDevice>, String> {
-    let mut state = razer_wolverine::query()?;
+    let mut state = razer_wolverine_v3_pro_8k_pc::query()?;
     let is_connected = state.as_ref().is_some_and(|state| state.connected);
 
     if was_connected && !is_connected && state.is_some() {
         std::thread::sleep(WOLVERINE_CONNECTION_SETTLE_DELAY);
-        state = razer_wolverine::query()?;
+        state = razer_wolverine_v3_pro_8k_pc::query()?;
     }
 
     Ok(state.map(|state| BatteryDevice {
@@ -572,9 +607,52 @@ fn query_native_logitech(monitor: &mut logitech::Monitor) -> Vec<BatteryDevice> 
         .collect()
 }
 
+fn query_native_headsets(monitor: &mut headsets::Monitor) -> headsets::Snapshot {
+    monitor.query()
+}
+
+fn native_headset_device(state: &headsets::BatteryState) -> BatteryDevice {
+    BatteryDevice {
+        name: state.name.clone(),
+        level: state.level,
+        status: state.status.clone(),
+        kind: Some("headset".to_string()),
+        codename: None,
+        is_loading: false,
+        is_connected: true,
+    }
+}
+
+fn merge_native_headsets(
+    devices: &mut Vec<BatteryDevice>,
+    native_states: &[headsets::BatteryState],
+    covered_names: &[String],
+) {
+    devices.retain(|device| {
+        !covered_names
+            .iter()
+            .any(|name| same_native_headset_name(&device.name, name))
+    });
+    devices.extend(native_states.iter().map(native_headset_device));
+}
+
+fn same_native_headset_name(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+        || (left.to_ascii_lowercase().contains("logitech")
+            || right.to_ascii_lowercase().contains("logitech"))
+            && logitech::same_device_name(left, right)
+}
+
 fn merge_native_logitech(devices: &mut Vec<BatteryDevice>, native_devices: &[BatteryDevice]) {
     for native in native_devices {
-        replace_device_in_place(devices, native.clone());
+        if let Some(existing) = devices
+            .iter_mut()
+            .find(|device| logitech::same_device_name(&device.name, &native.name))
+        {
+            *existing = native.clone();
+        } else {
+            devices.push(native.clone());
+        }
     }
 }
 
@@ -598,6 +676,40 @@ fn preserve_loading_devices(fresh: &mut Vec<BatteryDevice>, previous: &[BatteryD
             fresh.push(device.clone());
         }
     }
+}
+
+fn persist_battery_readings(
+    previous_snapshot: &mut Vec<CachedBatteryDevice>,
+    devices: &[BatteryDevice],
+) {
+    let mut snapshot: Vec<_> = devices
+        .iter()
+        .filter(|device| !device.is_loading)
+        .map(|device| CachedBatteryDevice {
+            name: device.name.clone(),
+            kind: device.kind.clone(),
+            level: if device.is_connected {
+                device.level
+            } else {
+                None
+            },
+            status: if device.is_connected && device.level.is_some() {
+                device.status.clone()
+            } else {
+                None
+            },
+        })
+        .collect();
+    snapshot.sort_by_cached_key(|device| device.name.to_ascii_lowercase());
+    if snapshot == *previous_snapshot {
+        return;
+    }
+
+    let mut cache = WidgetCache::load();
+    if cache.merge_battery_devices(devices) {
+        cache.save();
+    }
+    *previous_snapshot = snapshot;
 }
 
 fn expire_initial_readings(devices: &mut [BatteryDevice], elapsed: Duration) {
@@ -630,7 +742,7 @@ fn seed_cached_fallbacks(
     for device in cached_devices.iter().filter(|device| device.is_loading) {
         if native_logitech
             .iter()
-            .any(|native| native.name.eq_ignore_ascii_case(&device.name))
+            .any(|native| logitech::same_device_name(&native.name, &device.name))
         {
             continue;
         }
@@ -669,12 +781,12 @@ fn reconcile_external_fallbacks(
     external.solaar_fallback_names.retain(|name| {
         !native_logitech
             .iter()
-            .any(|native| native.name.eq_ignore_ascii_case(name))
+            .any(|native| logitech::same_device_name(&native.name, name))
     });
     for device in &external.solaar_devices {
         if !native_logitech
             .iter()
-            .any(|native| native.name.eq_ignore_ascii_case(&device.name))
+            .any(|native| logitech::same_device_name(&native.name, &device.name))
         {
             external
                 .solaar_fallback_names
@@ -694,6 +806,17 @@ fn reconcile_external_fallbacks(
                 .insert(device.name.to_ascii_lowercase());
         }
     }
+}
+
+fn reconcile_native_headset_fallbacks(
+    external: &mut ExternalDeviceState,
+    covered_names: &[String],
+) {
+    external.headsetcontrol_fallback_names.retain(|name| {
+        !covered_names
+            .iter()
+            .any(|native| same_native_headset_name(native, name))
+    });
 }
 
 fn external_probe_plan(
@@ -731,6 +854,8 @@ fn combined_battery_devices(
     native_maxwell: Option<BatteryDevice>,
     native_logitech: &[BatteryDevice],
     native_wolverine: Option<BatteryDevice>,
+    native_headsets: &[headsets::BatteryState],
+    native_headset_coverage: &[String],
 ) -> Vec<BatteryDevice> {
     let mut devices = Vec::new();
     for device in external
@@ -745,6 +870,7 @@ fn combined_battery_devices(
     }
     merge_native_logitech(&mut devices, native_logitech);
     merge_native_wolverine(&mut devices, native_wolverine);
+    merge_native_headsets(&mut devices, native_headsets, native_headset_coverage);
     devices
 }
 
@@ -1157,9 +1283,10 @@ mod tests {
     use super::{
         BatteryDevice, ExternalDeviceState, ExternalProbePlan, INITIAL_NATIVE_POLL_INTERVAL,
         INITIAL_PROBE_TIMEOUT, NATIVE_POLL_INTERVAL, WOLVERINE_DEVICE_NAME,
-        expire_initial_readings, external_probe_plan, merge_native_logitech, merge_native_maxwell,
-        merge_native_wolverine, native_poll_interval, parse_headsetcontrol_json,
-        preserve_loading_devices, reconcile_external_fallbacks,
+        expire_initial_readings, external_probe_plan, headsets, merge_native_headsets,
+        merge_native_logitech, merge_native_maxwell, merge_native_wolverine, native_poll_interval,
+        parse_headsetcontrol_json, preserve_loading_devices, reconcile_external_fallbacks,
+        reconcile_native_headset_fallbacks,
     };
     use std::time::Duration;
 
@@ -1366,7 +1493,7 @@ mod tests {
     fn native_logitech_replaces_matching_solaar_devices_only() {
         let mut devices = vec![
             BatteryDevice {
-                name: "G309 LIGHTSPEED".to_string(),
+                name: "Logitech G309 LIGHTSPEED".to_string(),
                 level: Some(50),
                 status: Some("discharging".to_string()),
                 kind: Some("mouse".to_string()),
@@ -1385,6 +1512,7 @@ mod tests {
             },
         ];
         let native = BatteryDevice {
+            name: "G309".to_string(),
             level: Some(100),
             ..devices[0].clone()
         };
@@ -1392,12 +1520,12 @@ mod tests {
         merge_native_logitech(&mut devices, &[native]);
 
         assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0].name, "G309 LIGHTSPEED");
+        assert_eq!(devices[0].name, "G309");
         assert_eq!(devices[1].name, "Unsupported Logitech device");
         assert_eq!(
             devices
                 .iter()
-                .find(|device| device.name == "G309 LIGHTSPEED")
+                .find(|device| device.name == "G309")
                 .and_then(|device| device.level),
             Some(100)
         );
@@ -1406,6 +1534,74 @@ mod tests {
                 .iter()
                 .any(|device| device.name == "Unsupported Logitech device")
         );
+    }
+
+    #[test]
+    fn native_headset_replaces_the_headsetcontrol_copy() {
+        let mut devices = vec![BatteryDevice {
+            name: "SteelSeries Arctis Nova 7".to_string(),
+            level: Some(25),
+            status: Some("discharging".to_string()),
+            kind: Some("headset".to_string()),
+            codename: None,
+            is_loading: false,
+            is_connected: true,
+        }];
+        let native = headsets::BatteryState {
+            name: "SteelSeries Arctis Nova 7".to_string(),
+            level: Some(75),
+            status: Some("charging".to_string()),
+        };
+
+        merge_native_headsets(
+            &mut devices,
+            &[native],
+            &["SteelSeries Arctis Nova 7".to_string()],
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].level, Some(75));
+        assert_eq!(devices[0].status.as_deref(), Some("charging"));
+        assert_eq!(devices[0].kind.as_deref(), Some("headset"));
+    }
+
+    #[test]
+    fn powered_off_native_headset_removes_stale_rows_and_cli_polling() {
+        let name = "SteelSeries Arctis Nova 7".to_string();
+        let mut devices = vec![battery_device(&name, false)];
+        let mut external = ExternalDeviceState {
+            headsetcontrol_devices: devices.clone(),
+            ..Default::default()
+        };
+        external
+            .headsetcontrol_fallback_names
+            .insert(name.to_ascii_lowercase());
+
+        merge_native_headsets(&mut devices, &[], std::slice::from_ref(&name));
+        reconcile_native_headset_fallbacks(&mut external, std::slice::from_ref(&name));
+
+        assert!(devices.is_empty());
+        assert!(external.headsetcontrol_fallback_names.is_empty());
+    }
+
+    #[test]
+    fn native_logitech_headset_replaces_a_shorter_discovered_name() {
+        let mut devices = vec![battery_device("G522", false)];
+        let native = headsets::BatteryState {
+            name: "Logitech G522 LIGHTSPEED".to_string(),
+            level: Some(90),
+            status: Some("discharging".to_string()),
+        };
+
+        merge_native_headsets(
+            &mut devices,
+            &[native],
+            &["Logitech G522 LIGHTSPEED".to_string()],
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Logitech G522 LIGHTSPEED");
+        assert_eq!(devices[0].level, Some(90));
     }
 
     #[test]

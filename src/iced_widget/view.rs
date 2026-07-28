@@ -1088,7 +1088,7 @@ fn media_subtitle(info: &MediaInfo) -> String {
         ("", album) => album.to_string(),
         (artist, album) => format!("{artist} - {album}"),
     };
-    compact_single_line(&subtitle, 42)
+    compact_single_line(&subtitle, usize::MAX)
 }
 
 fn format_media_time(milliseconds: u64) -> String {
@@ -1375,7 +1375,45 @@ fn device_icon(kind: Option<&str>) -> Element<'static, super::Message> {
 }
 
 fn battery_status(device: &BatteryDevice, spacing: u16) -> Element<'static, super::Message> {
-    let (icon, label, band, opacity) = if device.is_loading {
+    let (icon, label, band, opacity) = battery_visuals(device);
+
+    let battery_icon = widget::icon::from_name(icon)
+        .icon()
+        .size(METRIC_ICON_SIZE)
+        .opacity(opacity)
+        .class(theme::Svg::custom(move |theme| {
+            let cosmic = theme.cosmic();
+            let color = match band {
+                BatteryBand::Success => cosmic.success_color(),
+                BatteryBand::Warning => cosmic.warning_color(),
+                BatteryBand::Destructive => cosmic.destructive_color(),
+                BatteryBand::Cached => cosmic.accent_color(),
+                BatteryBand::Unavailable => cosmic.on_bg_color(),
+            };
+
+            cosmic::iced::widget::svg::Style {
+                color: Some(color.into()),
+            }
+        }));
+
+    widget::row::with_capacity(2)
+        .align_y(Alignment::Center)
+        .spacing(spacing / 2)
+        .push(battery_icon)
+        .push(widget::text::monotext(label))
+        .into()
+}
+
+fn battery_visuals(device: &BatteryDevice) -> (String, String, BatteryBand, f32) {
+    if device.is_loading && device.level.is_some() {
+        let level = device.level.unwrap_or_default();
+        (
+            battery_icon_name(level, is_charging(device.status.as_deref())),
+            format!("{level}%"),
+            BatteryBand::Cached,
+            0.8,
+        )
+    } else if device.is_loading {
         (
             "battery-missing-symbolic".to_string(),
             "...".to_string(),
@@ -1403,32 +1441,7 @@ fn battery_status(device: &BatteryDevice, spacing: u16) -> Element<'static, supe
             BatteryBand::Unavailable,
             0.6,
         )
-    };
-
-    let battery_icon = widget::icon::from_name(icon)
-        .icon()
-        .size(METRIC_ICON_SIZE)
-        .opacity(opacity)
-        .class(theme::Svg::custom(move |theme| {
-            let cosmic = theme.cosmic();
-            let color = match band {
-                BatteryBand::Success => cosmic.success_color(),
-                BatteryBand::Warning => cosmic.warning_color(),
-                BatteryBand::Destructive => cosmic.destructive_color(),
-                BatteryBand::Unavailable => cosmic.on_bg_color(),
-            };
-
-            cosmic::iced::widget::svg::Style {
-                color: Some(color.into()),
-            }
-        }));
-
-    widget::row::with_capacity(2)
-        .align_y(Alignment::Center)
-        .spacing(spacing / 2)
-        .push(battery_icon)
-        .push(widget::text::monotext(label))
-        .into()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1436,6 +1449,7 @@ enum BatteryBand {
     Success,
     Warning,
     Destructive,
+    Cached,
     Unavailable,
 }
 
@@ -1590,11 +1604,12 @@ fn format_time_parts(now: DateTime<Local>, use_24hour_time: bool) -> (String, St
 #[cfg(test)]
 mod tests {
     use super::{
-        BatteryBand, NotificationBand, battery_band, battery_icon_name, compact_single_line,
-        format_media_time, format_network_rate, format_storage_bytes, format_weather_temperature,
-        is_charging, media_subtitle, notification_band, relative_notification_time,
-        weather_icon_name,
+        BatteryBand, NotificationBand, battery_band, battery_icon_name, battery_visuals,
+        compact_single_line, format_media_time, format_network_rate, format_storage_bytes,
+        format_weather_temperature, is_charging, media_subtitle, notification_band,
+        relative_notification_time, weather_icon_name,
     };
+    use crate::battery::BatteryDevice;
     use crate::media::MediaInfo;
 
     #[test]
@@ -1628,6 +1643,26 @@ mod tests {
         );
         assert!(is_charging(Some("recharging")));
         assert!(!is_charging(Some("discharging")));
+    }
+
+    #[test]
+    fn cached_battery_readings_use_the_accent_band_until_verified() {
+        let device = BatteryDevice {
+            name: "Test Headset".to_string(),
+            level: Some(68),
+            status: Some("charging".to_string()),
+            kind: Some("headset".to_string()),
+            codename: None,
+            is_loading: true,
+            is_connected: false,
+        };
+
+        let (icon, label, band, opacity) = battery_visuals(&device);
+
+        assert_eq!(icon, "cosmic-applet-battery-level-65-charging-symbolic");
+        assert_eq!(label, "68%");
+        assert_eq!(band, BatteryBand::Cached);
+        assert_eq!(opacity, 0.8);
     }
 
     #[test]
@@ -1672,5 +1707,14 @@ mod tests {
 
         assert_eq!(media_subtitle(&info), "Deftones - Saturday Night Wrist");
         assert_eq!(format_media_time(302_000), "5:02");
+
+        let long_album = MediaInfo {
+            album: "Final Straw (20th Anniversary Edition)".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            media_subtitle(&long_album),
+            "Final Straw (20th Anniversary Edition)"
+        );
     }
 }

@@ -24,6 +24,7 @@ path = "src/iced_widget_main.rs"
 
 [dependencies]
 futures-util = "0.3.31"
+hidapi = { version = "2.6.6", default-features = false, features = ["linux-native-basic-udev"] }
 i18n-embed-fl = "0.10"
 rust-embed = "8.7.2"
 sysinfo = "0.32"

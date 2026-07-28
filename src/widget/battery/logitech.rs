@@ -1,27 +1,36 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Native Logitech battery readers for Linux power supplies and Bolt receivers.
+//! Native Logitech battery readers for Linux power supplies and HID++ devices.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "logitech/centurion.rs"]
+mod centurion;
+#[path = "logitech/protocol.rs"]
+mod protocol;
+#[path = "logitech/receiver.rs"]
+mod receiver;
+#[path = "logitech/sysfs.rs"]
+mod sysfs;
+#[path = "logitech/transport.rs"]
+mod transport;
+
+use protocol::{
+    BatteryFeature, BatteryProtocol, BatteryReading, DEVICE_FRIENDLY_NAME_FEATURE,
+    DEVICE_NAME_FEATURE, HIDPP10_BATTERY_CHARGE_REGISTER, HIDPP10_BATTERY_STATUS_REGISTER,
+    parse_hidpp10_battery,
+};
+use receiver::PairedDevice;
+use sysfs::{EndpointKind, HidrawEndpoint};
+use transport::{hidpp10_register, hidpp20_request, open as open_hidraw};
+
 const POWER_SUPPLY_ROOT: &str = "/sys/class/power_supply";
-const HIDRAW_ROOT: &str = "/sys/class/hidraw";
-const LOGITECH_VENDOR_ID: u16 = 0x046d;
-const BOLT_RECEIVER_PRODUCT_ID: u16 = 0xc548;
-const HIDPP_SHORT_REPORT_ID: u8 = 0x10;
-const HIDPP_LONG_REPORT_ID: u8 = 0x11;
-const HIDPP_SOFTWARE_ID: u16 = 0x0e;
-const DEVICE_NAME_FEATURE: u16 = 0x0005;
-const UNIFIED_BATTERY_FEATURE: u16 = 0x1004;
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+const HIDPP_SOFTWARE_ID: u16 = 0;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_UNCONFIRMED_LEVEL_CHANGE: u8 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BatteryState {
@@ -37,29 +46,27 @@ struct HidppDevice {
     slot: u8,
     name: String,
     kind: Option<String>,
-    battery_feature: u8,
+    battery_protocol: BatteryProtocol,
+    centurion: Option<centurion::Device>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PairedDevice {
-    slot: u8,
-    name: Option<String>,
-    kind: Option<String>,
+#[derive(Debug)]
+struct MonitoredEndpoint {
+    endpoint: HidrawEndpoint,
+    devices: Vec<HidppDevice>,
 }
 
 pub(super) struct Monitor {
-    bolt_path: Option<PathBuf>,
-    bolt_devices: Vec<HidppDevice>,
-    last_bolt_readings: HashMap<u8, (Option<u8>, Option<String>)>,
+    endpoints: Vec<MonitoredEndpoint>,
+    last_readings: HashMap<String, BatteryReading>,
     last_discovery: Option<Instant>,
 }
 
 impl Monitor {
     pub(super) fn new() -> Self {
         Self {
-            bolt_path: None,
-            bolt_devices: Vec::new(),
-            last_bolt_readings: HashMap::new(),
+            endpoints: Vec::new(),
+            last_readings: HashMap::new(),
             last_discovery: None,
         }
     }
@@ -67,95 +74,147 @@ impl Monitor {
     pub(super) fn query(&mut self) -> Vec<BatteryState> {
         let mut states = query_power_supplies_at(Path::new(POWER_SUPPLY_ROOT));
 
-        let Some(path) = find_bolt_receiver_at(Path::new(HIDRAW_ROOT)) else {
-            self.bolt_path = None;
-            self.bolt_devices.clear();
-            self.last_bolt_readings.clear();
-            self.last_discovery = None;
-            return states;
-        };
-
-        if self.bolt_path.as_ref() != Some(&path) {
-            self.bolt_path = Some(path.clone());
-            self.bolt_devices.clear();
-            self.last_bolt_readings.clear();
-            self.last_discovery = None;
-        }
-
-        let Ok(mut handle) = open_hidraw(&path) else {
-            return states;
-        };
-
         let discovery_due = self
             .last_discovery
             .is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL);
         if discovery_due {
-            let discovered = match paired_bolt_devices(&mut handle) {
-                Ok(paired_devices) => {
-                    drop(handle);
-                    let Ok(fresh_handle) = open_hidraw(&path) else {
-                        return states;
-                    };
-                    handle = fresh_handle;
-                    let mut discovered = Vec::new();
-                    // Sleeping Bolt endpoints can ignore the first feature call.
-                    // Reopening routes each retry through a fresh hidraw queue.
-                    for attempt in 0..3 {
-                        if attempt > 0 {
-                            let Ok(fresh_handle) = open_hidraw(&path) else {
-                                break;
-                            };
-                            handle = fresh_handle;
-                            thread::sleep(Duration::from_millis(75));
-                        }
-                        discovered = discover_paired_devices(&mut handle, paired_devices.clone());
-                        if !discovered.is_empty() {
-                            break;
-                        }
-                    }
-                    discovered
-                }
-                Err(_) => discover_devices_by_slot(&mut handle),
-            };
-            if !discovered.is_empty() || self.bolt_devices.is_empty() {
-                self.bolt_devices = discovered;
-            }
-            self.last_discovery = (!self.bolt_devices.is_empty()).then(Instant::now);
+            let discovered = discover_endpoints(&states);
+            self.endpoints = reconcile_discovered_endpoints(
+                std::mem::take(&mut self.endpoints),
+                discovered,
+                Path::exists,
+            );
+            self.last_discovery = self
+                .endpoints
+                .iter()
+                .any(|endpoint| !endpoint.devices.is_empty())
+                .then(Instant::now);
+
+            let active_names: Vec<_> = self
+                .endpoints
+                .iter()
+                .flat_map(|endpoint| &endpoint.devices)
+                .map(|device| device_identity(&device.name))
+                .collect();
+            self.last_readings
+                .retain(|name, _| active_names.iter().any(|active| active == name));
         }
 
-        for device in &self.bolt_devices {
-            let reading = query_unified_battery(&mut handle, device);
-            let state = state_from_bolt_reading(device, reading, &mut self.last_bolt_readings);
-            upsert_state(&mut states, state);
+        for endpoint in &mut self.endpoints {
+            let Ok(mut handle) = open_hidraw(&endpoint.endpoint.path) else {
+                continue;
+            };
+            for device in &mut endpoint.devices {
+                let identity = device_identity(&device.name);
+                let reading = query_confirmed_device_battery(
+                    &mut handle,
+                    device,
+                    self.last_readings.get(&identity),
+                );
+                if let Some(state) = state_from_reading(device, reading, &mut self.last_readings) {
+                    upsert_state(&mut states, state);
+                }
+            }
         }
 
         states
     }
 }
 
-fn state_from_bolt_reading(
-    device: &HidppDevice,
-    reading: Result<(Option<u8>, Option<String>), String>,
-    last_readings: &mut HashMap<u8, (Option<u8>, Option<String>)>,
-) -> BatteryState {
-    let (level, status, connected) = match reading {
-        Ok((level, status)) => {
-            last_readings.insert(device.slot, (level, status.clone()));
-            (level, status, true)
+fn reconcile_discovered_endpoints(
+    current: Vec<MonitoredEndpoint>,
+    mut discovered: Vec<MonitoredEndpoint>,
+    endpoint_is_present: impl Fn(&Path) -> bool,
+) -> Vec<MonitoredEndpoint> {
+    for previous_endpoint in current {
+        let Some(fresh_endpoint) = discovered
+            .iter_mut()
+            .find(|fresh| fresh.endpoint.path == previous_endpoint.endpoint.path)
+        else {
+            if endpoint_is_present(&previous_endpoint.endpoint.path) {
+                discovered.push(previous_endpoint);
+            }
+            continue;
+        };
+
+        for previous_device in previous_endpoint.devices {
+            if let Some(index) = fresh_endpoint
+                .devices
+                .iter()
+                .position(|fresh| fresh.slot == previous_device.slot)
+            {
+                let fresh_device = fresh_endpoint.devices[index].clone();
+                fresh_endpoint.devices[index] =
+                    prefer_discovered_device(Some(previous_device), fresh_device);
+            } else {
+                fresh_endpoint.devices.push(previous_device);
+            }
         }
-        Err(_) => match last_readings.get(&device.slot) {
-            Some((level, status)) => (*level, status.clone(), true),
-            None => (None, None, false),
-        },
+    }
+
+    discovered
+}
+
+fn query_confirmed_device_battery(
+    handle: &mut File,
+    device: &mut HidppDevice,
+    previous: Option<&BatteryReading>,
+) -> Result<BatteryReading, String> {
+    let first = query_device_battery(handle, device)?;
+    let Some(previous) = previous else {
+        return query_device_battery(handle, device).or(Ok(first));
+    };
+    if !needs_confirmation(previous, &first) {
+        return Ok(first);
+    }
+
+    let second = query_device_battery(handle, device)?;
+    if readings_agree(&first, &second) || !needs_confirmation(previous, &second) {
+        Ok(second)
+    } else {
+        Err("unconfirmed Logitech battery-level jump".to_string())
+    }
+}
+
+fn needs_confirmation(previous: &BatteryReading, candidate: &BatteryReading) -> bool {
+    match (previous.level, candidate.level) {
+        (Some(_), None) => true,
+        (Some(previous), Some(candidate)) => {
+            previous.abs_diff(candidate) > MAX_UNCONFIRMED_LEVEL_CHANGE
+        }
+        _ => false,
+    }
+}
+
+fn readings_agree(left: &BatteryReading, right: &BatteryReading) -> bool {
+    match (left.level, right.level) {
+        (Some(left), Some(right)) => left.abs_diff(right) <= 2,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn state_from_reading(
+    device: &HidppDevice,
+    reading: Result<BatteryReading, String>,
+    last_readings: &mut HashMap<String, BatteryReading>,
+) -> Option<BatteryState> {
+    let identity = device_identity(&device.name);
+    let reading = match reading {
+        Ok(reading) => {
+            last_readings.insert(identity.clone(), reading.clone());
+            reading
+        }
+        Err(_) => last_readings.get(&identity)?.clone(),
     };
 
-    BatteryState {
+    Some(BatteryState {
         name: device.name.clone(),
-        level,
-        status,
+        level: reading.level,
+        status: reading.status,
         kind: device.kind.clone(),
-        connected,
-    }
+        connected: true,
+    })
 }
 
 fn query_power_supplies_at(root: &Path) -> Vec<BatteryState> {
@@ -221,6 +280,20 @@ fn infer_kind(name: &str) -> Option<String> {
     let kind = if name.contains("keyboard") || name.contains("mechanical") || name.contains("keys")
     {
         "keyboard"
+    } else if name.contains("numpad") || name.contains("number pad") {
+        "numpad"
+    } else if name.contains("trackball") || name.contains("ergo") {
+        "trackball"
+    } else if name.contains("touchpad") {
+        "touchpad"
+    } else if name.contains("presenter") || name.contains("spotlight") {
+        "presenter"
+    } else if name.contains("headset")
+        || name.contains("headphone")
+        || name.contains("zone wireless")
+        || name.contains("pro x")
+    {
+        "headset"
     } else if name.contains("mouse")
         || name.starts_with('g')
             && name[1..].starts_with(|character: char| character.is_ascii_digit())
@@ -234,159 +307,140 @@ fn infer_kind(name: &str) -> Option<String> {
     Some(kind.to_string())
 }
 
-fn find_bolt_receiver_at(root: &Path) -> Option<PathBuf> {
-    fs::read_dir(root)
-        .ok()?
-        .filter_map(Result::ok)
-        .find_map(|entry| {
-            let uevent = fs::read_to_string(entry.path().join("device/uevent")).ok()?;
-            let (vendor_id, product_id) = parse_hid_id(&uevent)?;
-            let physical_path = uevent
-                .lines()
-                .find_map(|line| line.strip_prefix("HID_PHYS="))?;
-            (vendor_id == LOGITECH_VENDOR_ID
-                && product_id == BOLT_RECEIVER_PRODUCT_ID
-                && physical_path.ends_with("/input2"))
-            .then(|| Path::new("/dev").join(entry.file_name()))
-        })
-}
-
-fn parse_hid_id(uevent: &str) -> Option<(u16, u16)> {
-    let value = uevent
-        .lines()
-        .find_map(|line| line.strip_prefix("HID_ID="))?;
-    let mut parts = value.split(':');
-    parts.next()?;
-    let vendor_id = u32::from_str_radix(parts.next()?, 16).ok()?;
-    let product_id = u32::from_str_radix(parts.next()?, 16).ok()?;
-    Some((
-        u16::try_from(vendor_id).ok()?,
-        u16::try_from(product_id).ok()?,
-    ))
-}
-
-fn open_hidraw(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-}
-
-fn discover_paired_devices(
-    handle: &mut File,
-    paired_devices: Vec<PairedDevice>,
-) -> Vec<HidppDevice> {
-    paired_devices
+fn discover_endpoints(power_supply_states: &[BatteryState]) -> Vec<MonitoredEndpoint> {
+    sysfs::discover_hidpp_endpoints()
         .into_iter()
-        .filter_map(|paired| discover_device(handle, paired).ok())
-        .collect()
-}
+        .filter_map(|endpoint| {
+            let mut handle = open_hidraw(&endpoint.path).ok()?;
+            if let EndpointKind::Centurion(report) = endpoint.kind {
+                let device = centurion::discover(&mut handle, report).ok()?;
+                let name = centurion_device_name(&endpoint);
+                return Some(MonitoredEndpoint {
+                    endpoint,
+                    devices: vec![HidppDevice {
+                        slot: 0xff,
+                        kind: Some("headset".to_string()),
+                        name,
+                        battery_protocol: BatteryProtocol::Unknown,
+                        centurion: Some(device),
+                    }],
+                });
+            }
 
-fn discover_devices_by_slot(handle: &mut File) -> Vec<HidppDevice> {
-    (1..=6)
-        .filter_map(|slot| {
-            discover_device(
-                handle,
-                PairedDevice {
-                    slot,
-                    name: None,
-                    kind: None,
-                },
-            )
-            .ok()
+            let paired = match endpoint.kind {
+                EndpointKind::Receiver(kind) => receiver::paired_devices(&mut handle, kind).ok()?,
+                EndpointKind::Direct => {
+                    let name = clean_logitech_name(&endpoint.name);
+                    if power_supply_states
+                        .iter()
+                        .any(|state| device_identity(&state.name) == device_identity(&name))
+                    {
+                        return None;
+                    }
+                    vec![PairedDevice {
+                        slot: 0xff,
+                        name: Some(name),
+                        kind: infer_kind(&endpoint.name),
+                    }]
+                }
+                EndpointKind::Centurion(_) => unreachable!(),
+            };
+            drop(handle);
+            let devices = paired
+                .into_iter()
+                .filter_map(|paired| discover_device_with_retries(&endpoint, paired))
+                .collect();
+
+            Some(MonitoredEndpoint { endpoint, devices })
         })
         .collect()
 }
 
-fn paired_bolt_devices(handle: &mut File) -> Result<Vec<PairedDevice>, String> {
-    let connection = receiver_request(handle, 0x8102, &[])?;
-    let expected = connection
-        .get(1)
-        .copied()
-        .ok_or_else(|| "Bolt receiver connection count was missing".to_string())?
-        as usize;
-    let mut devices = Vec::with_capacity(expected);
+fn discover_device_with_retries(
+    endpoint: &HidrawEndpoint,
+    paired: PairedDevice,
+) -> Option<HidppDevice> {
+    let attempts = if matches!(endpoint.kind, EndpointKind::Receiver(_)) {
+        3
+    } else {
+        1
+    };
+    let mut best = None;
 
-    for slot in 1..=6 {
-        if devices.len() >= expected {
+    for attempt in 0..attempts {
+        let Ok(mut handle) = open_hidraw(&endpoint.path) else {
+            break;
+        };
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(75));
+        }
+        let candidate = discover_device(&mut handle, paired.clone());
+        let resolved = candidate.battery_protocol != BatteryProtocol::Unknown;
+        best = Some(prefer_discovered_device(best, candidate));
+        if resolved {
             break;
         }
-        let Ok(pairing) = receiver_request(handle, 0x83b5, &[0x50 + slot]) else {
-            continue;
-        };
-        let Some(kind) = pairing.get(1).copied().map(|value| value & 0x0f) else {
-            continue;
-        };
-        let product_id = parse_bolt_product_id(&pairing);
-        devices.push(PairedDevice {
-            slot,
-            name: product_id.and_then(known_logitech_name).map(str::to_string),
-            kind: hidpp10_kind(kind),
-        });
     }
 
-    if expected > 0 && devices.is_empty() {
-        Err("Bolt receiver did not return its paired devices".to_string())
-    } else {
-        Ok(devices)
-    }
+    best
 }
 
-fn parse_bolt_product_id(response: &[u8]) -> Option<u16> {
-    Some(u16::from_be_bytes([*response.get(3)?, *response.get(2)?]))
-}
-
-fn known_logitech_name(product_id: u16) -> Option<&'static str> {
-    match product_id {
-        0xb367 => Some("MX Mechanical Mini"),
-        _ => None,
-    }
-}
-
-fn hidpp10_kind(kind: u8) -> Option<String> {
-    let kind = match kind {
-        0x01 => "keyboard",
-        0x02 => "mouse",
-        0x03 => "numpad",
-        0x04 => "presenter",
-        0x08 => "trackball",
-        0x09 => "touchpad",
-        0x0d => "headset",
-        _ => return None,
+fn prefer_discovered_device(current: Option<HidppDevice>, candidate: HidppDevice) -> HidppDevice {
+    let Some(mut current) = current else {
+        return candidate;
     };
-    Some(kind.to_string())
+    if current.battery_protocol == BatteryProtocol::Unknown {
+        current.battery_protocol = candidate.battery_protocol;
+    }
+    if device_name_quality(&candidate.name) > device_name_quality(&current.name) {
+        current.name = candidate.name;
+    }
+    if current.kind.is_none() {
+        current.kind = candidate.kind;
+    }
+    current
 }
 
-fn discover_device(handle: &mut File, paired: PairedDevice) -> Result<HidppDevice, String> {
+fn discover_device(handle: &mut File, paired: PairedDevice) -> HidppDevice {
     let slot = paired.slot;
-    let battery_feature = feature_index(handle, slot, UNIFIED_BATTERY_FEATURE)?;
-    let (name, kind) = if let Some(name) = paired.name {
-        let kind = paired.kind.or_else(|| infer_kind(&name));
-        (name, kind)
-    } else {
-        let name_feature = feature_index(handle, slot, DEVICE_NAME_FEATURE).ok();
-        let name = name_feature
-            .and_then(|feature| query_device_name(handle, slot, feature).ok())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| format!("Logitech device {slot}"));
-        let kind = name_feature
-            .and_then(|feature| query_device_kind(handle, slot, feature).ok())
-            .or(paired.kind)
-            .or_else(|| infer_kind(&name));
-        (name, kind)
-    };
+    let name_feature = feature_index(handle, slot, DEVICE_NAME_FEATURE).ok();
+    let friendly_name_feature = feature_index(handle, slot, DEVICE_FRIENDLY_NAME_FEATURE).ok();
+    let queried_name = name_feature
+        .and_then(|feature| query_device_name(handle, slot, feature, false).ok())
+        .or_else(|| {
+            friendly_name_feature
+                .and_then(|feature| query_device_name(handle, slot, feature, true).ok())
+        })
+        .filter(|name| !name.is_empty());
+    let name = [queried_name, paired.name]
+        .into_iter()
+        .flatten()
+        .max_by_key(|name| device_name_quality(name))
+        .unwrap_or_else(|| {
+            if slot == 0xff {
+                "Logitech device".to_string()
+            } else {
+                format!("Logitech device {slot}")
+            }
+        });
+    let kind = name_feature
+        .and_then(|feature| query_device_kind(handle, slot, feature).ok())
+        .or(paired.kind)
+        .or_else(|| infer_kind(&name));
+    let battery_protocol =
+        discover_hidpp20_battery_protocol(handle, slot).unwrap_or(BatteryProtocol::Unknown);
 
-    Ok(HidppDevice {
+    HidppDevice {
         slot,
         name,
         kind,
-        battery_feature,
-    })
+        battery_protocol,
+        centurion: None,
+    }
 }
 
 fn feature_index(handle: &mut File, slot: u8, feature: u16) -> Result<u8, String> {
-    let response = hidpp_request(handle, slot, HIDPP_SOFTWARE_ID, &feature.to_be_bytes())?;
+    let response = hidpp20_request(handle, slot, HIDPP_SOFTWARE_ID, &feature.to_be_bytes())?;
     response
         .first()
         .copied()
@@ -394,8 +448,13 @@ fn feature_index(handle: &mut File, slot: u8, feature: u16) -> Result<u8, String
         .ok_or_else(|| format!("HID++ feature {feature:#06x} is unavailable"))
 }
 
-fn query_device_name(handle: &mut File, slot: u8, feature: u8) -> Result<String, String> {
-    let length = hidpp_request(
+fn query_device_name(
+    handle: &mut File,
+    slot: u8,
+    feature: u8,
+    friendly: bool,
+) -> Result<String, String> {
+    let length = hidpp20_request(
         handle,
         slot,
         (u16::from(feature) << 8) | HIDPP_SOFTWARE_ID,
@@ -409,7 +468,7 @@ fn query_device_name(handle: &mut File, slot: u8, feature: u8) -> Result<String,
     while name.len() < length {
         let offset =
             u8::try_from(name.len()).map_err(|_| "HID++ device name is too long".to_string())?;
-        let fragment = hidpp_request(
+        let fragment = hidpp20_request(
             handle,
             slot,
             (u16::from(feature) << 8) | 0x10 | HIDPP_SOFTWARE_ID,
@@ -418,14 +477,26 @@ fn query_device_name(handle: &mut File, slot: u8, feature: u8) -> Result<String,
         if fragment.is_empty() {
             return Err("HID++ device name fragment was empty".to_string());
         }
+        let fragment = if friendly {
+            fragment.get(1..).unwrap_or_default()
+        } else {
+            &fragment
+        };
         name.extend_from_slice(&fragment[..fragment.len().min(length - name.len())]);
     }
 
-    String::from_utf8(name).map_err(|error| format!("invalid HID++ device name: {error}"))
+    let name =
+        String::from_utf8(name).map_err(|error| format!("invalid HID++ device name: {error}"))?;
+    let name = name
+        .trim_matches(|character: char| character == '\0' || character.is_whitespace())
+        .to_string();
+    (!name.is_empty())
+        .then_some(name)
+        .ok_or_else(|| "HID++ device name was empty".to_string())
 }
 
 fn query_device_kind(handle: &mut File, slot: u8, feature: u8) -> Result<String, String> {
-    let response = hidpp_request(
+    let response = hidpp20_request(
         handle,
         slot,
         (u16::from(feature) << 8) | 0x20 | HIDPP_SOFTWARE_ID,
@@ -442,144 +513,117 @@ fn query_device_kind(handle: &mut File, slot: u8, feature: u8) -> Result<String,
     }
 }
 
-fn query_unified_battery(
+fn discover_hidpp20_battery_protocol(handle: &mut File, slot: u8) -> Option<BatteryProtocol> {
+    BatteryFeature::ALL.into_iter().find_map(|feature| {
+        feature_index(handle, slot, feature.id())
+            .ok()
+            .map(|index| BatteryProtocol::Hidpp20 { feature, index })
+    })
+}
+
+fn query_device_battery(
     handle: &mut File,
-    device: &HidppDevice,
-) -> Result<(Option<u8>, Option<String>), String> {
-    let response = hidpp_request(
-        handle,
-        device.slot,
-        (u16::from(device.battery_feature) << 8) | 0x10 | HIDPP_SOFTWARE_ID,
-        &[],
-    )?;
-    parse_unified_battery(&response)
-}
-
-fn parse_unified_battery(response: &[u8]) -> Result<(Option<u8>, Option<String>), String> {
-    let [discharge, approximation, status, ..] = response else {
-        return Err("HID++ unified battery response was too short".to_string());
-    };
-    let level = if *discharge > 0 && *discharge <= 100 {
-        Some(*discharge)
-    } else {
-        match approximation {
-            8 => Some(90),
-            4 => Some(50),
-            2 => Some(20),
-            1 => Some(5),
-            _ => None,
-        }
-    };
-    let status = match status {
-        0x00 => Some("discharging".to_string()),
-        0x01 | 0x02 | 0x04 => Some("charging".to_string()),
-        0x03 => Some("charged".to_string()),
-        0x05 => Some("invalid battery".to_string()),
-        0x06 => Some("thermal error".to_string()),
-        _ => None,
-    };
-    Ok((level, status))
-}
-
-fn hidpp_request(
-    handle: &mut File,
-    slot: u8,
-    request_id: u16,
-    params: &[u8],
-) -> Result<Vec<u8>, String> {
-    send_hidpp_request(handle, HIDPP_LONG_REPORT_ID, slot, request_id, params)
-}
-
-fn receiver_request(handle: &mut File, request_id: u16, params: &[u8]) -> Result<Vec<u8>, String> {
-    send_hidpp_request(handle, HIDPP_SHORT_REPORT_ID, 0xff, request_id, params)
-}
-
-fn send_hidpp_request(
-    handle: &mut File,
-    report_id: u8,
-    slot: u8,
-    request_id: u16,
-    params: &[u8],
-) -> Result<Vec<u8>, String> {
-    if params.len() > 16 {
-        return Err("HID++ request has too many parameters".to_string());
+    device: &mut HidppDevice,
+) -> Result<BatteryReading, String> {
+    if let Some(centurion) = &device.centurion {
+        return centurion::query_battery(handle, centurion);
     }
-
-    let mut stale = [0; 32];
-    while handle.read(&mut stale).is_ok_and(|read| read > 0) {}
-
-    let mut packet = [0; 20];
-    packet[0] = report_id;
-    packet[1] = slot;
-    packet[2..4].copy_from_slice(&request_id.to_be_bytes());
-    packet[4..4 + params.len()].copy_from_slice(params);
-    let packet_length = if report_id == HIDPP_SHORT_REPORT_ID {
-        7
-    } else {
-        packet.len()
-    };
-    handle
-        .write_all(&packet[..packet_length])
-        .map_err(|error| format!("failed to write HID++ request: {error}"))?;
-
-    let started = Instant::now();
-    loop {
-        let Some(remaining) = REQUEST_TIMEOUT.checked_sub(started.elapsed()) else {
-            return Err(format!("HID++ request {request_id:#06x} timed out"));
-        };
-        let timeout = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
-        let mut pollfd = libc::pollfd {
-            fd: handle.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
-        if ready < 0 {
-            return Err(format!(
-                "failed to poll HID++ receiver: {}",
-                io::Error::last_os_error()
-            ));
+    match device.battery_protocol {
+        BatteryProtocol::Hidpp20 { feature, index } => {
+            let response = hidpp20_request(
+                handle,
+                device.slot,
+                (u16::from(index) << 8) | u16::from(feature.function()) | HIDPP_SOFTWARE_ID,
+                &[],
+            )?;
+            feature.parse(&response)
         }
-        if ready == 0 {
-            return Err(format!("HID++ request {request_id:#06x} timed out"));
-        }
-
-        let mut response = [0; 32];
-        let read = match handle.read(&mut response) {
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(error) => return Err(format!("failed to read HID++ response: {error}")),
-        };
-        if read < 5 || response[1] != slot {
-            continue;
-        }
-        if response[2] == 0xff && response[3] == packet[2] && response[4] == packet[3] {
-            return Err(format!(
-                "HID++ request {request_id:#06x} failed with error {:#04x}",
-                response.get(5).copied().unwrap_or_default()
-            ));
-        }
-        if response[2] == 0x8f && response[3] == packet[2] && response[4] == packet[3] {
-            return Err(format!(
-                "HID++ receiver request {request_id:#06x} failed with error {:#04x}",
-                response.get(5).copied().unwrap_or_default()
-            ));
-        }
-        if response[2..4] == packet[2..4] {
-            if slot == 0xff && request_id == 0x83b5 && response.get(4) != params.first() {
-                continue;
+        BatteryProtocol::Hidpp10 => query_hidpp10_battery(handle, device.slot),
+        BatteryProtocol::Unknown => {
+            if let Some(protocol) = discover_hidpp20_battery_protocol(handle, device.slot) {
+                device.battery_protocol = protocol;
+                return query_device_battery(handle, device);
             }
-            return Ok(response[4..read].to_vec());
+            let reading = query_hidpp10_battery(handle, device.slot)?;
+            device.battery_protocol = BatteryProtocol::Hidpp10;
+            Ok(reading)
         }
     }
+}
+
+fn centurion_device_name(endpoint: &HidrawEndpoint) -> String {
+    let name = clean_logitech_name(&endpoint.name);
+    if !name.eq_ignore_ascii_case("USB Receiver") && !name.eq_ignore_ascii_case("device") {
+        return name;
+    }
+    match endpoint.product_id {
+        0x0af7 => "PRO X 2 LIGHTSPEED".to_string(),
+        0x0b18 | 0x0b19 => "G522".to_string(),
+        _ => "Logitech headset".to_string(),
+    }
+}
+
+fn query_hidpp10_battery(handle: &mut File, slot: u8) -> Result<BatteryReading, String> {
+    for register in [
+        HIDPP10_BATTERY_CHARGE_REGISTER,
+        HIDPP10_BATTERY_STATUS_REGISTER,
+    ] {
+        if let Ok(response) = hidpp10_register(handle, slot, register) {
+            return parse_hidpp10_battery(register, &response);
+        }
+    }
+    Err("device exposes no supported HID++ battery protocol".to_string())
+}
+
+fn clean_logitech_name(name: &str) -> String {
+    name.trim()
+        .strip_prefix("Logitech, Inc. ")
+        .or_else(|| name.trim().strip_prefix("Logitech "))
+        .unwrap_or(name.trim())
+        .to_string()
+}
+
+fn device_name_quality(name: &str) -> usize {
+    if name.chars().any(char::is_control) {
+        return 0;
+    }
+    let generic_penalty = usize::from(name.starts_with("Logitech device")) * name.len();
+    name.trim().chars().count().saturating_sub(generic_penalty)
+}
+
+pub(super) fn same_device_name(left: &str, right: &str) -> bool {
+    device_identity(left) == device_identity(right)
+}
+
+fn device_identity(name: &str) -> String {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|part| {
+            !matches!(
+                part.as_str(),
+                "logitech" | "logi" | "inc" | "wireless" | "lightspeed"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState) {
     if let Some(existing) = states
         .iter_mut()
-        .find(|existing| existing.name.eq_ignore_ascii_case(&state.name))
+        .find(|existing| device_identity(&existing.name) == device_identity(&state.name))
     {
-        *existing = state;
+        if existing.level.is_none() {
+            existing.level = state.level;
+        }
+        if existing.status.is_none() {
+            existing.status = state.status;
+        }
+        if existing.kind.is_none() {
+            existing.kind = state.kind;
+        }
+        existing.connected |= state.connected;
     } else {
         states.push(state);
     }
@@ -587,33 +631,14 @@ fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState) {
 
 #[cfg(test)]
 mod tests {
+    use super::sysfs::{Bus, EndpointKind, HidrawEndpoint, ReceiverKind};
+    use super::{BatteryProtocol, BatteryReading};
     use super::{
-        HidppDevice, infer_kind, parse_bolt_product_id, parse_hid_id, parse_unified_battery,
-        state_from_bolt_reading,
+        HidppDevice, MonitoredEndpoint, device_identity, device_name_quality, infer_kind,
+        needs_confirmation, readings_agree, reconcile_discovered_endpoints, state_from_reading,
     };
     use std::collections::HashMap;
-
-    #[test]
-    fn parses_logitech_hid_identity() {
-        let uevent = concat!(
-            "HID_ID=0003:0000046D:0000C548\n",
-            "HID_NAME=Logitech USB Receiver\n",
-            "HID_PHYS=usb-test/input2\n",
-        );
-        assert_eq!(parse_hid_id(uevent), Some((0x046d, 0xc548)));
-    }
-
-    #[test]
-    fn parses_unified_battery_percentage_and_status() {
-        assert_eq!(
-            parse_unified_battery(&[20, 2, 0, 0]),
-            Ok((Some(20), Some("discharging".to_string())))
-        );
-        assert_eq!(
-            parse_unified_battery(&[0, 4, 1, 0]),
-            Ok((Some(50), Some("charging".to_string())))
-        );
-    }
+    use std::path::PathBuf;
 
     #[test]
     fn infers_current_logitech_device_kinds() {
@@ -625,30 +650,62 @@ mod tests {
     }
 
     #[test]
-    fn parses_bolt_receiver_product_id() {
+    fn normalizes_transport_marketing_names_for_deduplication() {
         assert_eq!(
-            parse_bolt_product_id(&[0x54, 0x01, 0x67, 0xb3, 0x79, 0x66, 0x51, 0xb5,]),
-            Some(0xb367)
+            device_identity("Logitech G309 LIGHTSPEED"),
+            device_identity("G309")
         );
     }
 
     #[test]
-    fn preserves_last_bolt_reading_while_device_sleeps() {
+    fn rejects_truncated_control_character_names() {
+        assert!(
+            device_name_quality("MX Mechanical Mini") > device_name_quality("X Mechanical Mini\0")
+        );
+    }
+
+    #[test]
+    fn requires_large_battery_changes_to_repeat() {
+        let previous = BatteryReading {
+            level: Some(100),
+            status: Some("charged".to_string()),
+        };
+        let transient = BatteryReading {
+            level: Some(18),
+            status: Some("discharging".to_string()),
+        };
+        let confirmed = transient.clone();
+        let recovered = previous.clone();
+
+        assert!(needs_confirmation(&previous, &transient));
+        assert!(readings_agree(&transient, &confirmed));
+        assert!(!readings_agree(&transient, &recovered));
+        assert!(!needs_confirmation(&previous, &recovered));
+    }
+
+    #[test]
+    fn preserves_last_hidpp_reading_while_device_sleeps() {
         let device = HidppDevice {
             slot: 4,
             name: "MX Mechanical Mini".to_string(),
             kind: Some("keyboard".to_string()),
-            battery_feature: 7,
+            battery_protocol: BatteryProtocol::Unknown,
+            centurion: None,
         };
         let mut readings = HashMap::new();
 
-        let awake = state_from_bolt_reading(
+        let awake = state_from_reading(
             &device,
-            Ok((Some(20), Some("discharging".to_string()))),
+            Ok(BatteryReading {
+                level: Some(20),
+                status: Some("discharging".to_string()),
+            }),
             &mut readings,
-        );
+        )
+        .unwrap();
         let sleeping =
-            state_from_bolt_reading(&device, Err("device timed out".to_string()), &mut readings);
+            state_from_reading(&device, Err("device timed out".to_string()), &mut readings)
+                .unwrap();
 
         assert_eq!(sleeping.level, awake.level);
         assert_eq!(sleeping.status, awake.status);
@@ -656,11 +713,59 @@ mod tests {
     }
 
     #[test]
+    fn preserves_a_sleeping_receiver_device_during_rediscovery() {
+        let endpoint = HidrawEndpoint {
+            path: PathBuf::from("/dev/hidraw-bolt-test"),
+            bus: Bus::Usb,
+            product_id: 0xc548,
+            name: "Logitech USB Receiver".to_string(),
+            kind: EndpointKind::Receiver(ReceiverKind::Bolt),
+        };
+        let known_keyboard = HidppDevice {
+            slot: 1,
+            name: "MX Mechanical Mini".to_string(),
+            kind: Some("keyboard".to_string()),
+            battery_protocol: BatteryProtocol::Hidpp20 {
+                feature: super::BatteryFeature::Unified,
+                index: 4,
+            },
+            centurion: None,
+        };
+        let current = vec![MonitoredEndpoint {
+            endpoint: endpoint.clone(),
+            devices: vec![known_keyboard.clone()],
+        }];
+
+        let retained = reconcile_discovered_endpoints(current, Vec::new(), |_| true);
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].devices, vec![known_keyboard]);
+
+        let removed = reconcile_discovered_endpoints(retained, Vec::new(), |_| false);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
     #[ignore = "requires connected Logitech devices"]
     fn reads_connected_logitech_devices() {
         let started = std::time::Instant::now();
+        let power_supply_states =
+            super::query_power_supplies_at(std::path::Path::new(super::POWER_SUPPLY_ROOT));
+        let mut endpoints = super::discover_endpoints(&power_supply_states);
+        println!("Discovered Logitech HID++ endpoints: {endpoints:#?}");
+        for endpoint in &mut endpoints {
+            let mut handle = super::open_hidraw(&endpoint.endpoint.path).unwrap();
+            for device in &mut endpoint.devices {
+                let reading = super::query_device_battery(&mut handle, device);
+                println!("{}: {reading:?}", device.name);
+            }
+        }
         let mut monitor = super::Monitor::new();
         let states = monitor.query();
+        println!(
+            "Logitech native battery states in {:?}: {states:?}",
+            started.elapsed()
+        );
         assert!(!states.is_empty());
         assert!(states.iter().any(|state| state.name == "G309 LIGHTSPEED"));
         assert!(
@@ -671,9 +776,5 @@ mod tests {
         for state in &states {
             assert!(state.level.is_none_or(|level| level <= 100));
         }
-        println!(
-            "Logitech native battery states in {:?}: {states:?}",
-            started.elapsed()
-        );
     }
 }

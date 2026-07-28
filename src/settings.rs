@@ -24,6 +24,10 @@ const TEMPERATURE_STYLE_PREVIEW_HEIGHT: f32 = 104.0;
 struct CachedBatteryDevice {
     name: String,
     kind: Option<String>,
+    #[serde(default)]
+    level: Option<u8>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
