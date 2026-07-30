@@ -42,7 +42,7 @@ fn main() -> cosmic::iced::Result {
     cosmic::app::run::<widget::MonitorWidget>(settings, ())
 }
 
-use config::Config;
+use config::{Config, UPDATE_INTERVAL_MS};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use std::sync::Arc;
 use std::time::Instant;
@@ -378,7 +378,7 @@ impl MonitorWidget {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         
-        if elapsed < (self.config.update_interval_ms as f64 / 1000.0) {
+        if elapsed < (UPDATE_INTERVAL_MS as f64 / 1000.0) {
             return;
         }
         

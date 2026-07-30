@@ -11,7 +11,7 @@
 //! ## Monitoring Modules
 //! These modules collect system information:
 //!
-//! - [`utilization`]: CPU, Memory, and GPU usage monitoring via sysinfo/nvidia-smi
+//! - [`utilization`]: CPU, Memory, and GPU usage monitoring via sysinfo/NVML/sysfs
 //! - [`temperature`]: CPU and GPU temperature readings from hwmon sensors
 //! - [`network`]: Network interface bandwidth monitoring
 //! - [`storage`]: Disk space usage for mounted filesystems
@@ -38,18 +38,19 @@
 //! the renderer for display.
 
 // === Monitoring Module Declarations ===
-pub mod utilization;
-pub mod temperature;
-pub mod network;
-pub mod weather;
-pub mod storage;
 pub mod battery;
-pub mod notifications;
 pub mod media;
+pub mod network;
+pub mod notifications;
+mod nvidia;
+pub mod storage;
+pub mod temperature;
+pub mod utilization;
+pub mod weather;
 
 // === Rendering Module Declarations ===
-pub mod renderer;
 pub mod layout;
+pub mod renderer;
 pub mod theme;
 
 // === Utility Module Declarations ===
@@ -75,7 +76,7 @@ pub use weather::{WeatherMonitor, load_weather_font};
 pub use storage::StorageMonitor;
 
 /// Battery level monitoring (system + Solaar)
-pub use battery::{BatteryMonitor, BatteryDevice};
+pub use battery::{BatteryDevice, BatteryMonitor};
 
 /// Device discovery cache
 pub use cache::WidgetCache;
@@ -84,7 +85,7 @@ pub use cache::WidgetCache;
 pub use notifications::NotificationMonitor;
 
 /// Cider media player integration
-pub use media::{MediaMonitor, MediaInfo, PlaybackStatus};
+pub use media::{MediaInfo, MediaMonitor, PlaybackStatus};
 
 /// COSMIC theme integration
 pub use theme::CosmicTheme;

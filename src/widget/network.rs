@@ -32,10 +32,12 @@
 //!
 //! - **Counter reset**: Kernel updates or interface restarts reset counters to 0
 //! - **First update**: No previous data, so rate starts at 0
-//! - **Interface changes**: New interfaces are automatically included on refresh
+//! - **Interface changes**: The interface list is rediscovered every 30 seconds
 
+use std::time::{Duration, Instant};
 use sysinfo::Networks;
-use std::time::Instant;
+
+const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 // ============================================================================
 // Network Monitor Struct
@@ -74,22 +76,29 @@ pub struct NetworkMonitor {
     pub network_tx_rate: f64,
     /// Timestamp of last update for elapsed time calculation
     last_update: Instant,
+    /// Timestamp of the last full interface discovery pass
+    last_interface_refresh: Instant,
 }
 
 impl NetworkMonitor {
     /// Create a new network monitor.
     ///
     /// Initializes sysinfo's network list with immediate discovery of all
-    /// interfaces. Initial rates are 0.0 until the second update provides
-    /// a delta for calculation.
+    /// interfaces. Initial rates are 0.0 until the first update provides a
+    /// delta from the baseline captured here.
     pub fn new() -> Self {
+        let networks = Networks::new_with_refreshed_list();
+        let (network_rx_bytes, network_tx_bytes) = total_bytes(&networks);
+        let now = Instant::now();
+
         Self {
-            networks: Networks::new_with_refreshed_list(),
-            network_rx_bytes: 0,
-            network_tx_bytes: 0,
+            networks,
+            network_rx_bytes,
+            network_tx_bytes,
             network_rx_rate: 0.0,
             network_tx_rate: 0.0,
-            last_update: Instant::now(),
+            last_update: now,
+            last_interface_refresh: now,
         }
     }
 
@@ -114,33 +123,62 @@ impl NetworkMonitor {
     pub fn update(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
-        
-        // Refresh network statistics from /proc/net/dev
-        self.networks.refresh();
-        
-        // Sum bytes from ALL network interfaces (eth0, wlan0, docker0, lo, etc.)
-        let mut total_rx = 0;
-        let mut total_tx = 0;
-        for (_interface_name, network) in &self.networks {
-            total_rx += network.received();
-            total_tx += network.transmitted();
-        }
-        
-        // Handle counter resets (e.g., after kernel update or interface restart)
-        // Only calculate rates if counters have increased since last update
-        if self.network_rx_bytes > 0 && total_rx >= self.network_rx_bytes && total_tx >= self.network_tx_bytes {
-            // Normal case: calculate bytes per second
-            self.network_rx_rate = (total_rx - self.network_rx_bytes) as f64 / elapsed;
-            self.network_tx_rate = (total_tx - self.network_tx_bytes) as f64 / elapsed;
+
+        if now.duration_since(self.last_interface_refresh) >= INTERFACE_REFRESH_INTERVAL {
+            self.networks.refresh_list();
+            self.last_interface_refresh = now;
         } else {
-            // Counter was reset or this is the first update, reset rates to 0
-            self.network_rx_rate = 0.0;
-            self.network_tx_rate = 0.0;
+            self.networks.refresh();
         }
-        
+
+        let (total_rx, total_tx) = total_bytes(&self.networks);
+
+        self.network_rx_rate = rate_from_totals(self.network_rx_bytes, total_rx, elapsed);
+        self.network_tx_rate = rate_from_totals(self.network_tx_bytes, total_tx, elapsed);
+
         // Store current values for next update's delta calculation
         self.network_rx_bytes = total_rx;
         self.network_tx_bytes = total_tx;
         self.last_update = now;
+    }
+}
+
+fn total_bytes(networks: &Networks) -> (u64, u64) {
+    networks.values().fold((0, 0), |(rx, tx), network| {
+        (
+            rx.saturating_add(network.total_received()),
+            tx.saturating_add(network.total_transmitted()),
+        )
+    })
+}
+
+fn rate_from_totals(previous: u64, current: u64, elapsed_seconds: f64) -> f64 {
+    if !elapsed_seconds.is_finite() || elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+
+    current
+        .checked_sub(previous)
+        .map_or(0.0, |bytes| bytes as f64 / elapsed_seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rate_from_totals;
+
+    #[test]
+    fn calculates_bytes_per_second_from_cumulative_totals() {
+        assert_eq!(rate_from_totals(1_000, 2_024, 0.5), 2_048.0);
+    }
+
+    #[test]
+    fn counter_resets_do_not_create_invalid_rates() {
+        assert_eq!(rate_from_totals(2_000, 100, 1.0), 0.0);
+    }
+
+    #[test]
+    fn invalid_elapsed_time_produces_zero_rate() {
+        assert_eq!(rate_from_totals(100, 200, 0.0), 0.0);
+        assert_eq!(rate_from_totals(100, 200, f64::NAN), 0.0);
     }
 }

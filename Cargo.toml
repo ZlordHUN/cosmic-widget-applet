@@ -18,8 +18,13 @@ path = "src/widget_main.rs"
 name = "cosmic-widget-settings"
 path = "src/settings_main.rs"
 
+[[bin]]
+name = "cosmic-widget-iced"
+path = "src/iced_widget_main.rs"
+
 [dependencies]
 futures-util = "0.3.31"
+hidapi = { version = "2.6.6", default-features = false, features = ["linux-native-basic-udev"] }
 i18n-embed-fl = "0.10"
 rust-embed = "8.7.2"
 sysinfo = "0.32"
@@ -34,6 +39,7 @@ env_logger = "0.11"
 dirs = "5.0"
 zbus = "4.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+nvml-wrapper = "0.12.1"
 
 # Wayland layer-shell dependencies for widget
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }

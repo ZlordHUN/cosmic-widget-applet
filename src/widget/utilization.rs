@@ -12,20 +12,18 @@
 //! GPU utilization is monitored in a background thread to avoid blocking the UI.
 //! The detection order is:
 //!
-//! 1. **NVIDIA**: Uses `nvidia-smi` command if available
-//! 2. **AMD**: Reads from `/sys/class/drm/card*/device/gpu_busy_percent` (preferred)
-//!    or falls back to `radeontop`
-//! 3. **Intel**: Calculates from current/max frequency ratio in sysfs,
-//!    or falls back to `intel_gpu_top`
+//! 1. **NVIDIA**: Queries the NVIDIA Management Library through `nvml-wrapper`
+//! 2. **AMD**: Reads `/sys/class/drm/card*/device/gpu_busy_percent`
+//! 3. **Intel**: Reads current and maximum GPU frequencies from sysfs
 //!
 //! # Usage
 //!
 //! ```rust
 //! let mut monitor = UtilizationMonitor::new();
-//! 
+//!
 //! // Call periodically (e.g., every second)
 //! monitor.update();
-//! 
+//!
 //! println!("CPU: {:.1}%", monitor.cpu_usage);
 //! println!("RAM: {:.1}%", monitor.memory_usage);
 //! println!("GPU: {:.1}%", monitor.get_gpu_usage());
@@ -36,9 +34,8 @@
 //! GPU usage is stored in an `Arc<Mutex<f32>>` and updated by a background thread.
 //! The `get_gpu_usage()` method safely reads the current value.
 
-use sysinfo::System;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
+use sysinfo::System;
 
 // ============================================================================
 // GPU Vendor Detection
@@ -47,11 +44,11 @@ use std::sync::{Arc, Mutex};
 /// Supported GPU vendors for utilization monitoring.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GpuVendor {
-    /// NVIDIA GPU (uses nvidia-smi)
+    /// NVIDIA GPU (uses NVML)
     Nvidia,
-    /// AMD GPU (uses sysfs or radeontop)
+    /// AMD GPU (uses sysfs)
     Amd,
-    /// Intel integrated/discrete GPU (uses sysfs or intel_gpu_top)
+    /// Intel integrated/discrete GPU (uses sysfs)
     Intel,
     /// No supported GPU detected
     None,
@@ -68,22 +65,22 @@ enum GpuVendor {
 pub struct UtilizationMonitor {
     /// sysinfo system instance for CPU/Memory data
     sys: System,
-    
+
     /// Current CPU usage percentage (0-100)
     pub cpu_usage: f32,
-    
+
     /// Current memory usage percentage (0-100)
     pub memory_usage: f32,
-    
+
     /// Total system memory in bytes
     pub memory_total: u64,
-    
+
     /// Used system memory in bytes
     pub memory_used: u64,
-    
+
     /// GPU usage percentage, updated by background thread
     pub gpu_usage: Arc<Mutex<f32>>,
-    
+
     /// Detected GPU vendor (determines monitoring method)
     gpu_vendor: GpuVendor,
 }
@@ -100,10 +97,10 @@ impl UtilizationMonitor {
     pub fn new() -> Self {
         // Shared GPU usage value for thread-safe access
         let gpu_usage = Arc::new(Mutex::new(0.0f32));
-        
+
         // Detect which GPU monitoring method to use
         let gpu_vendor = Self::detect_gpu_vendor();
-        
+
         // Spawn background thread for GPU monitoring (if GPU detected)
         if gpu_vendor != GpuVendor::None {
             let gpu_usage_clone = Arc::clone(&gpu_usage);
@@ -111,21 +108,21 @@ impl UtilizationMonitor {
                 loop {
                     // Poll every second for smooth updates
                     std::thread::sleep(std::time::Duration::from_secs(1));
-                    
+
                     let usage = match gpu_vendor {
-                        GpuVendor::Nvidia => Self::fetch_nvidia_gpu_usage(),
+                        GpuVendor::Nvidia => super::nvidia::utilization(),
                         GpuVendor::Amd => Self::fetch_amd_gpu_usage(),
                         GpuVendor::Intel => Self::fetch_intel_gpu_usage(),
                         GpuVendor::None => None,
                     };
-                    
+
                     if let Some(usage) = usage {
                         *gpu_usage_clone.lock().unwrap() = usage;
                     }
                 }
             });
         }
-        
+
         Self {
             sys: System::new_all(),
             cpu_usage: 0.0,
@@ -155,10 +152,10 @@ impl UtilizationMonitor {
         } else {
             0.0
         };
-        
+
         // Note: GPU usage is updated in background thread
     }
-    
+
     /// Get current GPU usage percentage.
     ///
     /// Thread-safe read from the background-updated value.
@@ -166,84 +163,56 @@ impl UtilizationMonitor {
     pub fn get_gpu_usage(&self) -> f32 {
         *self.gpu_usage.lock().unwrap()
     }
-    
+
     // ========================================================================
     // GPU Vendor Detection
     // ========================================================================
-    
+
     /// Detect which GPU vendor is present on the system.
     ///
-    /// Checks for:
-    /// 1. nvidia-smi binary (NVIDIA)
-    /// 2. radeontop or rocm-smi (AMD)
-    /// 3. intel_gpu_top (Intel)
-    /// 4. sysfs driver detection (fallback)
+    /// Checks NVML first, then detects AMD or Intel DRM devices through sysfs.
     fn detect_gpu_vendor() -> GpuVendor {
-        // Check for NVIDIA first (most common discrete GPU)
-        if std::path::Path::new("/usr/bin/nvidia-smi").exists() {
+        if super::nvidia::hardware_present() {
             return GpuVendor::Nvidia;
         }
-        
-        // Check for AMD tools
-        if std::path::Path::new("/usr/bin/radeontop").exists() 
-            || std::path::Path::new("/opt/rocm/bin/rocm-smi").exists() {
-            return GpuVendor::Amd;
-        }
-        
-        // Check for Intel tools
-        if std::path::Path::new("/usr/bin/intel_gpu_top").exists() {
-            return GpuVendor::Intel;
-        }
-        
-        // Fallback: Check sysfs for GPU driver information
+
+        let mut amd_found = false;
+        let mut intel_found = false;
         if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                
-                // Look for card devices (card0, card1, etc.), not render nodes
-                if name_str.starts_with("card") && !name_str.contains("-") {
-                    if let Ok(device_path) = std::fs::read_link(entry.path()) {
-                        let device_str = device_path.to_string_lossy();
-                        if device_str.contains("amdgpu") {
-                            return GpuVendor::Amd;
-                        }
-                        if device_str.contains("i915") {
-                            return GpuVendor::Intel;
-                        }
-                    }
+
+                if !name_str.starts_with("card") || name_str.contains('-') {
+                    continue;
+                }
+
+                let vendor =
+                    std::fs::read_to_string(entry.path().join("device/vendor")).unwrap_or_default();
+                match vendor.trim().to_ascii_lowercase().as_str() {
+                    "0x1002" => amd_found = true,
+                    "0x8086" => intel_found = true,
+                    _ => {}
                 }
             }
         }
-        
-        GpuVendor::None
+
+        if amd_found {
+            GpuVendor::Amd
+        } else if intel_found {
+            GpuVendor::Intel
+        } else {
+            GpuVendor::None
+        }
     }
-    
+
     // ========================================================================
     // GPU Usage Fetching (called from background thread)
     // ========================================================================
-    
-    /// Fetch NVIDIA GPU utilization via nvidia-smi.
-    ///
-    /// Parses the CSV output for GPU utilization percentage.
-    fn fetch_nvidia_gpu_usage() -> Option<f32> {
-        let output = Command::new("nvidia-smi")
-            .arg("--query-gpu=utilization.gpu")
-            .arg("--format=csv,noheader,nounits")
-            .output();
-        
-        match output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout.trim().parse::<f32>().ok()
-            }
-            _ => None,
-        }
-    }
-    
+
     /// Fetch AMD GPU utilization.
     ///
-    /// Prefers sysfs (no external tools needed), falls back to radeontop.
+    /// Reads the kernel driver's utilization value from sysfs.
     fn fetch_amd_gpu_usage() -> Option<f32> {
         // Primary method: Read from sysfs (most reliable, no permissions needed)
         // AMD GPUs expose utilization in /sys/class/drm/card*/device/gpu_busy_percent
@@ -251,7 +220,7 @@ impl UtilizationMonitor {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                
+
                 if name_str.starts_with("card") && !name_str.contains("-") {
                     let busy_path = entry.path().join("device/gpu_busy_percent");
                     if let Ok(content) = std::fs::read_to_string(&busy_path) {
@@ -262,41 +231,13 @@ impl UtilizationMonitor {
                 }
             }
         }
-        
-        // Fallback: radeontop (requires permissions)
-        if std::path::Path::new("/usr/bin/radeontop").exists() {
-            let output = Command::new("radeontop")
-                .arg("-d")
-                .arg("-")
-                .arg("-l")
-                .arg("1")
-                .output();
-            
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    // Parse "gpu 45.67%" format
-                    for line in stdout.lines() {
-                        if line.contains("gpu") {
-                            if let Some(percent_str) = line.split_whitespace().nth(1) {
-                                if let Some(num_str) = percent_str.strip_suffix('%') {
-                                    if let Ok(usage) = num_str.parse::<f32>() {
-                                        return Some(usage);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
+
         None
     }
-    
+
     /// Fetch Intel GPU utilization.
     ///
-    /// Calculates from frequency ratio (current/max), falls back to intel_gpu_top.
+    /// Calculates from the current/maximum frequency ratio exposed by sysfs.
     fn fetch_intel_gpu_usage() -> Option<f32> {
         // Primary method: Calculate usage from frequency ratio
         // Intel GPUs expose frequency in sysfs
@@ -304,20 +245,19 @@ impl UtilizationMonitor {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                
+
                 if name_str.starts_with("card") && !name_str.contains("-") {
                     // Try gt0 (most common)
                     let cur_freq_path = entry.path().join("gt/gt0/rps_cur_freq_mhz");
                     let max_freq_path = entry.path().join("gt/gt0/rps_max_freq_mhz");
-                    
+
                     if let (Ok(cur_str), Ok(max_str)) = (
                         std::fs::read_to_string(&cur_freq_path),
-                        std::fs::read_to_string(&max_freq_path)
+                        std::fs::read_to_string(&max_freq_path),
                     ) {
-                        if let (Ok(cur_freq), Ok(max_freq)) = (
-                            cur_str.trim().parse::<f32>(),
-                            max_str.trim().parse::<f32>()
-                        ) {
+                        if let (Ok(cur_freq), Ok(max_freq)) =
+                            (cur_str.trim().parse::<f32>(), max_str.trim().parse::<f32>())
+                        {
                             if max_freq > 0.0 {
                                 return Some((cur_freq / max_freq) * 100.0);
                             }
@@ -326,31 +266,7 @@ impl UtilizationMonitor {
                 }
             }
         }
-        
-        // Fallback: intel_gpu_top (requires CAP_PERFMON or root)
-        if std::path::Path::new("/usr/bin/intel_gpu_top").exists() {
-            let output = Command::new("intel_gpu_top")
-                .arg("-J")
-                .arg("-s")
-                .arg("100")
-                .output();
-            
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    // Simple JSON parsing for "busy" field
-                    if let Some(busy_idx) = stdout.find("\"busy\":") {
-                        let after_busy = &stdout[busy_idx + 8..];
-                        if let Some(end_idx) = after_busy.find(|c: char| !c.is_numeric() && c != '.') {
-                            if let Ok(usage) = after_busy[..end_idx].parse::<f32>() {
-                                return Some(usage);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
+
         None
     }
 }
@@ -371,25 +287,25 @@ pub fn draw_cpu_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
     cr.stroke_preserve().expect("Failed to stroke");
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
-    
+
     // Draw pins on sides
     let pin_length = size * 0.2;
     let pin_spacing = size / 3.0;
-    
+
     // Left pins
     for i in 0..3 {
         let py = y + pin_spacing * (i as f64 + 0.5);
         cr.move_to(x, py);
         cr.line_to(x - pin_length, py);
     }
-    
+
     // Right pins
     for i in 0..3 {
         let py = y + pin_spacing * (i as f64 + 0.5);
         cr.move_to(x + size, py);
         cr.line_to(x + size + pin_length, py);
     }
-    
+
     cr.set_source_rgb(0.0, 0.0, 0.0);
     cr.set_line_width(2.0);
     cr.stroke_preserve().expect("Failed to stroke");
@@ -406,7 +322,7 @@ pub fn draw_ram_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
     cr.stroke_preserve().expect("Failed to stroke");
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
-    
+
     // Draw notch at top
     let notch_width = size * 0.3;
     let notch_x = x + (size - notch_width) / 2.0;
@@ -416,7 +332,7 @@ pub fn draw_ram_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
     cr.stroke_preserve().expect("Failed to stroke");
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
-    
+
     // Draw chips on the body
     let chip_size = size * 0.15;
     for i in 0..3 {
@@ -438,13 +354,19 @@ pub fn draw_gpu_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
     cr.stroke_preserve().expect("Failed to stroke");
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
-    
+
     // Draw fan (circle)
-    cr.arc(x + size * 0.65, y + size * 0.65, size * 0.25, 0.0, 2.0 * std::f64::consts::PI);
+    cr.arc(
+        x + size * 0.65,
+        y + size * 0.65,
+        size * 0.25,
+        0.0,
+        2.0 * std::f64::consts::PI,
+    );
     cr.set_source_rgb(0.0, 0.0, 0.0);
     cr.set_line_width(2.0);
     cr.stroke().expect("Failed to stroke");
-    
+
     // Draw PCIe connector
     for i in 0..3 {
         let connector_x = x + i as f64 * size * 0.15;
@@ -456,12 +378,19 @@ pub fn draw_gpu_icon(cr: &cairo::Context, x: f64, y: f64, size: f64) {
 }
 
 /// Draw a horizontal progress bar
-pub fn draw_progress_bar(cr: &cairo::Context, x: f64, y: f64, width: f64, height: f64, percentage: f32) {
+pub fn draw_progress_bar(
+    cr: &cairo::Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    percentage: f32,
+) {
     // Draw background
     cr.rectangle(x, y, width, height);
     cr.set_source_rgba(0.2, 0.2, 0.2, 0.7);
     cr.fill().expect("Failed to fill");
-    
+
     // Draw border
     cr.rectangle(x, y, width, height);
     cr.set_source_rgb(0.0, 0.0, 0.0);
@@ -470,12 +399,12 @@ pub fn draw_progress_bar(cr: &cairo::Context, x: f64, y: f64, width: f64, height
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.set_line_width(1.0);
     cr.stroke().expect("Failed to stroke");
-    
+
     // Draw filled portion
     let fill_width = width * (percentage / 100.0).min(1.0) as f64;
     if fill_width > 0.0 {
         cr.rectangle(x + 1.0, y + 1.0, fill_width - 2.0, height - 2.0);
-        
+
         // Gradient fill based on percentage
         let pattern = cairo::LinearGradient::new(x, y, x + width, y);
         if percentage < 50.0 {
@@ -488,7 +417,7 @@ pub fn draw_progress_bar(cr: &cairo::Context, x: f64, y: f64, width: f64, height
             pattern.add_color_stop_rgb(0.0, 0.9, 0.4, 0.4);
             pattern.add_color_stop_rgb(1.0, 0.9, 0.4, 0.4);
         }
-        
+
         cr.set_source(&pattern).expect("Failed to set source");
         cr.fill().expect("Failed to fill");
     }

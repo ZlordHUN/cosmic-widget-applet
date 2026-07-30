@@ -16,7 +16,7 @@
 //! # Data Stored
 //!
 //! - **Disk information**: Name and mount point of discovered disks
-//! - **Battery devices**: Name and type of discovered battery sources
+//! - **Battery devices**: Name, type, and last confirmed battery reading
 //!
 //! # Thread Safety
 //!
@@ -25,8 +25,8 @@
 //! occur, the worst case is displaying slightly stale data.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 // ============================================================================
 // Cache Data Structures
@@ -46,12 +46,18 @@ pub struct CachedDiskInfo {
 /// Cached information about a battery device.
 ///
 /// Includes both system batteries and Solaar-managed Bluetooth devices.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CachedBatteryDevice {
     /// Device name (e.g., "MX Master 3" or "BAT0")
     pub name: String,
     /// Device type if known (e.g., "Mouse", "Keyboard", None for system battery)
     pub kind: Option<String>,
+    /// Last confirmed battery percentage.
+    #[serde(default)]
+    pub level: Option<u8>,
+    /// Last confirmed charging/discharging status.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// Main cache structure containing all cached device information.
@@ -120,17 +126,195 @@ impl WidgetCache {
         self.save();
     }
 
-    /// Update cached battery device information from fresh data.
-    ///
-    /// Replaces all cached devices and saves immediately.
-    pub fn update_battery_devices(&mut self, devices: &[super::battery::BatteryDevice]) {
-        self.battery_devices = devices
-            .iter()
-            .map(|d| CachedBatteryDevice {
-                name: d.name.clone(),
-                kind: d.kind.clone(),
-            })
-            .collect();
-        self.save();
+    /// Merge confirmed battery readings without replacing them with transient
+    /// loading, disconnected, or unavailable states.
+    pub fn merge_battery_devices(&mut self, devices: &[super::battery::BatteryDevice]) -> bool {
+        let previous = self.battery_devices.clone();
+        self.normalize_battery_devices();
+
+        for device in devices {
+            let existing = self.battery_devices.iter_mut().find(|cached| {
+                super::battery::same_battery_device_name(&cached.name, &device.name)
+            });
+            let confirmed = !device.is_loading && device.is_connected && device.level.is_some();
+
+            if let Some(cached) = existing {
+                if super::battery::battery_device_name_quality(&device.name)
+                    > super::battery::battery_device_name_quality(&cached.name)
+                {
+                    cached.name.clone_from(&device.name);
+                }
+                if device.kind.is_some() {
+                    cached.kind.clone_from(&device.kind);
+                }
+                if confirmed {
+                    cached.level = device.level;
+                    cached.status.clone_from(&device.status);
+                }
+            } else {
+                self.battery_devices.push(CachedBatteryDevice {
+                    name: device.name.clone(),
+                    kind: device.kind.clone(),
+                    level: if confirmed { device.level } else { None },
+                    status: if confirmed {
+                        device.status.clone()
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+
+        self.battery_devices != previous
+    }
+
+    /// Collapse cached aliases for the same physical device while retaining the
+    /// most descriptive name and the last confirmed reading.
+    pub fn normalize_battery_devices(&mut self) -> bool {
+        let previous = self.battery_devices.clone();
+        let mut normalized: Vec<CachedBatteryDevice> = Vec::new();
+
+        for candidate in self.battery_devices.drain(..) {
+            if let Some(existing) = normalized.iter_mut().find(|cached| {
+                super::battery::same_battery_device_name(&cached.name, &candidate.name)
+            }) {
+                if super::battery::battery_device_name_quality(&candidate.name)
+                    > super::battery::battery_device_name_quality(&existing.name)
+                {
+                    existing.name.clone_from(&candidate.name);
+                }
+                if existing.kind.is_none() {
+                    existing.kind = candidate.kind;
+                }
+                if existing.level.is_none() {
+                    existing.level = candidate.level;
+                }
+                if existing.status.is_none() {
+                    existing.status = candidate.status;
+                }
+            } else {
+                normalized.push(candidate);
+            }
+        }
+
+        self.battery_devices = normalized;
+        self.battery_devices != previous
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::battery::BatteryDevice;
+    use super::{CachedBatteryDevice, WidgetCache};
+
+    fn device(level: Option<u8>, loading: bool, connected: bool) -> BatteryDevice {
+        BatteryDevice {
+            name: "Test Headset".to_string(),
+            level,
+            status: level.map(|_| "discharging".to_string()),
+            kind: Some("headset".to_string()),
+            codename: None,
+            is_loading: loading,
+            is_connected: connected,
+        }
+    }
+
+    #[test]
+    fn older_battery_cache_entries_remain_compatible() {
+        let cached: CachedBatteryDevice =
+            serde_json::from_str(r#"{"name":"Test Headset","kind":"headset"}"#).unwrap();
+
+        assert_eq!(cached.level, None);
+        assert_eq!(cached.status, None);
+    }
+
+    #[test]
+    fn confirmed_readings_replace_cached_values() {
+        let mut cache = WidgetCache {
+            battery_devices: vec![CachedBatteryDevice {
+                name: "Test Headset".to_string(),
+                kind: Some("headset".to_string()),
+                level: Some(40),
+                status: Some("charging".to_string()),
+            }],
+            ..WidgetCache::default()
+        };
+
+        assert!(cache.merge_battery_devices(&[device(Some(75), false, true)]));
+        assert_eq!(cache.battery_devices[0].level, Some(75));
+        assert_eq!(
+            cache.battery_devices[0].status.as_deref(),
+            Some("discharging")
+        );
+    }
+
+    #[test]
+    fn unresolved_readings_do_not_erase_the_last_confirmed_value() {
+        let cached = CachedBatteryDevice {
+            name: "Test Headset".to_string(),
+            kind: Some("headset".to_string()),
+            level: Some(75),
+            status: Some("discharging".to_string()),
+        };
+        let mut cache = WidgetCache {
+            battery_devices: vec![cached.clone()],
+            ..WidgetCache::default()
+        };
+
+        assert!(!cache.merge_battery_devices(&[device(None, true, false)]));
+        assert_eq!(cache.battery_devices, vec![cached]);
+    }
+
+    #[test]
+    fn duplicate_logitech_aliases_are_collapsed_to_the_best_name() {
+        let mut cache = WidgetCache {
+            battery_devices: vec![
+                CachedBatteryDevice {
+                    name: "G309".to_string(),
+                    kind: Some("mouse".to_string()),
+                    level: Some(100),
+                    status: Some("discharging".to_string()),
+                },
+                CachedBatteryDevice {
+                    name: "G309 LIGHTSPEED".to_string(),
+                    kind: Some("mouse".to_string()),
+                    level: Some(100),
+                    status: Some("discharging".to_string()),
+                },
+            ],
+            ..WidgetCache::default()
+        };
+
+        assert!(cache.normalize_battery_devices());
+        assert_eq!(cache.battery_devices.len(), 1);
+        assert_eq!(cache.battery_devices[0].name, "G309 LIGHTSPEED");
+        assert_eq!(cache.battery_devices[0].level, Some(100));
+    }
+
+    #[test]
+    fn short_live_alias_does_not_downgrade_the_cached_name() {
+        let mut cache = WidgetCache {
+            battery_devices: vec![CachedBatteryDevice {
+                name: "G309 LIGHTSPEED".to_string(),
+                kind: Some("mouse".to_string()),
+                level: Some(90),
+                status: Some("discharging".to_string()),
+            }],
+            ..WidgetCache::default()
+        };
+        let live = BatteryDevice {
+            name: "G309".to_string(),
+            level: Some(100),
+            status: Some("charged".to_string()),
+            kind: Some("mouse".to_string()),
+            codename: None,
+            is_loading: false,
+            is_connected: true,
+        };
+
+        assert!(cache.merge_battery_devices(&[live]));
+        assert_eq!(cache.battery_devices.len(), 1);
+        assert_eq!(cache.battery_devices[0].name, "G309 LIGHTSPEED");
+        assert_eq!(cache.battery_devices[0].level, Some(100));
     }
 }
