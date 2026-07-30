@@ -583,7 +583,7 @@ fn clean_logitech_name(name: &str) -> String {
         .to_string()
 }
 
-fn device_name_quality(name: &str) -> usize {
+pub(super) fn device_name_quality(name: &str) -> usize {
     if name.chars().any(char::is_control) {
         return 0;
     }
@@ -592,7 +592,9 @@ fn device_name_quality(name: &str) -> usize {
 }
 
 pub(super) fn same_device_name(left: &str, right: &str) -> bool {
-    device_identity(left) == device_identity(right)
+    let left = device_identity(left);
+    let right = device_identity(right);
+    !left.is_empty() && left == right
 }
 
 fn device_identity(name: &str) -> String {
@@ -612,8 +614,11 @@ fn device_identity(name: &str) -> String {
 fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState) {
     if let Some(existing) = states
         .iter_mut()
-        .find(|existing| device_identity(&existing.name) == device_identity(&state.name))
+        .find(|existing| same_device_name(&existing.name, &state.name))
     {
+        if device_name_quality(&state.name) > device_name_quality(&existing.name) {
+            existing.name.clone_from(&state.name);
+        }
         if existing.level.is_none() {
             existing.level = state.level;
         }
@@ -634,8 +639,9 @@ mod tests {
     use super::sysfs::{Bus, EndpointKind, HidrawEndpoint, ReceiverKind};
     use super::{BatteryProtocol, BatteryReading};
     use super::{
-        HidppDevice, MonitoredEndpoint, device_identity, device_name_quality, infer_kind,
-        needs_confirmation, readings_agree, reconcile_discovered_endpoints, state_from_reading,
+        BatteryState, HidppDevice, MonitoredEndpoint, device_identity, device_name_quality,
+        infer_kind, needs_confirmation, readings_agree, reconcile_discovered_endpoints,
+        same_device_name, state_from_reading, upsert_state,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -655,6 +661,33 @@ mod tests {
             device_identity("Logitech G309 LIGHTSPEED"),
             device_identity("G309")
         );
+        assert!(same_device_name("G309", "G309 LIGHTSPEED"));
+        assert!(!same_device_name("Logitech LIGHTSPEED", "Wireless"));
+    }
+
+    #[test]
+    fn deduplication_keeps_the_more_descriptive_device_name() {
+        let mut states = vec![BatteryState {
+            name: "G309".to_string(),
+            level: Some(100),
+            status: Some("discharging".to_string()),
+            kind: Some("mouse".to_string()),
+            connected: true,
+        }];
+
+        upsert_state(
+            &mut states,
+            BatteryState {
+                name: "G309 LIGHTSPEED".to_string(),
+                level: Some(100),
+                status: Some("discharging".to_string()),
+                kind: Some("mouse".to_string()),
+                connected: true,
+            },
+        );
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].name, "G309 LIGHTSPEED");
     }
 
     #[test]

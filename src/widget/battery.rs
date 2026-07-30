@@ -200,7 +200,10 @@ impl BatteryMonitor {
 
         // Load cached battery devices to show immediately
         // This provides instant display while real data loads
-        let cache = WidgetCache::load();
+        let mut cache = WidgetCache::load();
+        if cache.normalize_battery_devices() {
+            cache.save();
+        }
         let cached_devices: Vec<BatteryDevice> = cache
             .battery_devices
             .iter()
@@ -643,16 +646,35 @@ fn same_native_headset_name(left: &str, right: &str) -> bool {
             && logitech::same_device_name(left, right)
 }
 
+pub(crate) fn same_battery_device_name(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right) || logitech::same_device_name(left, right)
+}
+
+pub(crate) fn battery_device_name_quality(name: &str) -> usize {
+    logitech::device_name_quality(name)
+}
+
 fn merge_native_logitech(devices: &mut Vec<BatteryDevice>, native_devices: &[BatteryDevice]) {
     for native in native_devices {
-        if let Some(existing) = devices
-            .iter_mut()
-            .find(|device| logitech::same_device_name(&device.name, &native.name))
+        let first_match = devices
+            .iter()
+            .position(|device| logitech::same_device_name(&device.name, &native.name));
+        let mut replacement = native.clone();
+
+        for existing in devices
+            .iter()
+            .filter(|device| logitech::same_device_name(&device.name, &native.name))
         {
-            *existing = native.clone();
-        } else {
-            devices.push(native.clone());
+            if battery_device_name_quality(&existing.name)
+                > battery_device_name_quality(&replacement.name)
+            {
+                replacement.name.clone_from(&existing.name);
+            }
         }
+
+        devices.retain(|device| !logitech::same_device_name(&device.name, &native.name));
+        let insertion_index = first_match.unwrap_or(devices.len()).min(devices.len());
+        devices.insert(insertion_index, replacement);
     }
 }
 
@@ -671,7 +693,7 @@ fn preserve_loading_devices(fresh: &mut Vec<BatteryDevice>, previous: &[BatteryD
     for device in previous.iter().filter(|device| device.is_loading) {
         if !fresh
             .iter()
-            .any(|fresh| fresh.name.eq_ignore_ascii_case(&device.name))
+            .any(|fresh| same_battery_device_name(&fresh.name, &device.name))
         {
             fresh.push(device.clone());
         }
@@ -1520,12 +1542,12 @@ mod tests {
         merge_native_logitech(&mut devices, &[native]);
 
         assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0].name, "G309");
+        assert_eq!(devices[0].name, "Logitech G309 LIGHTSPEED");
         assert_eq!(devices[1].name, "Unsupported Logitech device");
         assert_eq!(
             devices
                 .iter()
-                .find(|device| device.name == "G309")
+                .find(|device| device.name == "Logitech G309 LIGHTSPEED")
                 .and_then(|device| device.level),
             Some(100)
         );
@@ -1534,6 +1556,44 @@ mod tests {
                 .iter()
                 .any(|device| device.name == "Unsupported Logitech device")
         );
+    }
+
+    #[test]
+    fn native_logitech_collapses_all_cached_aliases() {
+        let template = BatteryDevice {
+            name: String::new(),
+            level: Some(50),
+            status: Some("discharging".to_string()),
+            kind: Some("mouse".to_string()),
+            codename: None,
+            is_loading: true,
+            is_connected: false,
+        };
+        let mut devices = vec![
+            BatteryDevice {
+                name: "G309".to_string(),
+                ..template.clone()
+            },
+            BatteryDevice {
+                name: "G309 LIGHTSPEED".to_string(),
+                ..template.clone()
+            },
+        ];
+        let native = BatteryDevice {
+            name: "G309 LIGHTSPEED".to_string(),
+            level: Some(100),
+            is_loading: false,
+            is_connected: true,
+            ..template
+        };
+
+        merge_native_logitech(&mut devices, &[native]);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "G309 LIGHTSPEED");
+        assert_eq!(devices[0].level, Some(100));
+        assert!(!devices[0].is_loading);
+        assert!(devices[0].is_connected);
     }
 
     #[test]
