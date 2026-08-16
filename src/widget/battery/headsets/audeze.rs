@@ -76,6 +76,16 @@ pub(crate) fn query() -> Result<Option<BatteryState>, String> {
     let wired_headset_present = devices.iter().any(|device| {
         device.vendor_id == VENDOR_ID && WIRED_PRODUCT_IDS.contains(&device.product_id)
     });
+    let audio_interface_present = sound_card_present(VENDOR_ID, dongle.product_id)
+        .map_err(|error| format!("failed to inspect Maxwell audio interfaces: {error}"))?;
+    let connected = audio_interface_present || wired_headset_present;
+    if !connected {
+        return Ok(Some(BatteryState {
+            level: None,
+            charging: false,
+            connected: false,
+        }));
+    }
 
     let mut handle = OpenOptions::new()
         .read(true)
@@ -91,6 +101,7 @@ pub(crate) fn query() -> Result<Option<BatteryState>, String> {
     Ok(Some(parse_battery_state(
         &status_responses,
         &battery_response,
+        connected,
         wired_headset_present,
     )))
 }
@@ -98,14 +109,13 @@ pub(crate) fn query() -> Result<Option<BatteryState>, String> {
 fn parse_battery_state(
     status_responses: &[[u8; MESSAGE_SIZE]],
     battery_response: &[u8],
+    connected: bool,
     wired_headset_present: bool,
 ) -> BatteryState {
-    // The dongle remains enumerated and can retain its last battery report after
-    // the headset powers off. The first status response marks a live link with a
-    // nonzero byte at index 1; never expose stale level or charging state without it.
-    let connected = status_responses
-        .first()
-        .is_some_and(|response| response[1] != 0);
+    // The Xbox dongle keeps its HID interface and last battery report after the
+    // headset powers off. Its USB Audio interface exists only while the wireless
+    // link is active, so connection state must come from ALSA/sysfs rather than
+    // the cached HID response.
     if !connected {
         return BatteryState {
             level: None,
@@ -125,6 +135,22 @@ fn parse_battery_state(
         charging: wired_headset_present,
         connected: true,
     }
+}
+
+fn sound_card_present(vendor_id: u16, product_id: u16) -> io::Result<bool> {
+    for entry in fs::read_dir("/sys/class/sound")? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("card") {
+            continue;
+        }
+        let Ok(uevent) = fs::read_to_string(entry.path().join("device/uevent")) else {
+            continue;
+        };
+        if parse_usb_product(&uevent) == Some((vendor_id, product_id)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn enumerate_hidraw() -> io::Result<Vec<HidrawDevice>> {
@@ -160,6 +186,16 @@ fn parse_hid_id(uevent: &str) -> Option<(u16, u16)> {
         u16::try_from(vendor_id).ok()?,
         u16::try_from(product_id).ok()?,
     ))
+}
+
+fn parse_usb_product(uevent: &str) -> Option<(u16, u16)> {
+    let value = uevent
+        .lines()
+        .find_map(|line| line.strip_prefix("PRODUCT="))?;
+    let mut parts = value.split('/');
+    let vendor_id = u16::from_str_radix(parts.next()?, 16).ok()?;
+    let product_id = u16::from_str_radix(parts.next()?, 16).ok()?;
+    Some((vendor_id, product_id))
 }
 
 fn send_request(
@@ -282,13 +318,19 @@ mod tests {
     use super::{
         MAXWELL_2_INITIALIZATION_REQUESTS, MAXWELL_2_STATUS_REQUESTS, MESSAGE_SIZE,
         hid_ioc_get_input, parse_battery_response, parse_battery_state, parse_hid_id,
-        parse_maxwell_2_battery, query,
+        parse_maxwell_2_battery, parse_usb_product, query,
     };
 
     #[test]
     fn parses_maxwell_hid_identity() {
         let uevent = "DRIVER=hid-generic\nHID_ID=0003:00003329:00004B18\n";
         assert_eq!(parse_hid_id(uevent), Some((0x3329, 0x4b18)));
+    }
+
+    #[test]
+    fn parses_maxwell_usb_audio_identity() {
+        let uevent = "DEVTYPE=usb_interface\nPRODUCT=3329/4b18/100\nINTERFACE=1/1/0\n";
+        assert_eq!(parse_usb_product(uevent), Some((0x3329, 0x4b18)));
     }
 
     #[test]
@@ -338,7 +380,7 @@ mod tests {
         let mut battery_response = [0; MESSAGE_SIZE];
         battery_response[10..15].copy_from_slice(&[0xd6, 0x0c, 0x00, 0x00, 100]);
 
-        let state = parse_battery_state(&status_responses, &battery_response, true);
+        let state = parse_battery_state(&status_responses, &battery_response, false, true);
 
         assert_eq!(state.level, None);
         assert!(!state.charging);
@@ -346,13 +388,12 @@ mod tests {
     }
 
     #[test]
-    fn accepts_battery_and_charging_only_with_a_live_headset_link() {
-        let mut status_responses = [[0; MESSAGE_SIZE]; 5];
-        status_responses[0][1] = 1;
+    fn accepts_battery_and_charging_only_with_a_live_audio_interface() {
+        let status_responses = [[0; MESSAGE_SIZE]; 5];
         let mut battery_response = [0; MESSAGE_SIZE];
         battery_response[10..15].copy_from_slice(&[0xd6, 0x0c, 0x00, 0x00, 84]);
 
-        let state = parse_battery_state(&status_responses, &battery_response, true);
+        let state = parse_battery_state(&status_responses, &battery_response, true, true);
 
         assert_eq!(state.level, Some(84));
         assert!(state.charging);

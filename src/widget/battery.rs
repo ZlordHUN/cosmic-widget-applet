@@ -31,7 +31,7 @@
 //!
 //! 1. **Startup**: Load cached device names for instant display
 //! 2. **First update**: Immediately query tools in background thread
-//! 3. **Native updates**: Query Maxwell and Logitech devices every 5 seconds
+//! 3. **Native updates**: Query Logitech devices every second and other devices every 5 seconds
 //! 4. **External fallbacks**: Refresh only backends serving non-native devices
 //! 5. **External discovery**: Recheck inactive backends every five minutes
 //!
@@ -65,9 +65,9 @@ mod razer_wolverine_v3_pro_8k_pc;
 
 const MAXWELL_DEVICE_NAME: &str = "Audeze Maxwell";
 const WOLVERINE_DEVICE_NAME: &str = "Razer Wolverine V3 Pro 8K PC";
-const MAXWELL_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(2);
 const WOLVERINE_CONNECTION_SETTLE_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const LOGITECH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const EXTERNAL_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -157,7 +157,8 @@ impl ExternalProbePlan {
 /// - `devices`: Shared state protected by Arc<Mutex>
 /// - `update_requested`: Flag to trigger background refresh
 /// - Background thread retries unresolved startup readings every second
-/// - Native polling returns to a five-second interval after startup resolves
+/// - Connected Logitech devices are queried every second after startup resolves
+/// - Other native devices return to a five-second interval after startup resolves
 /// - Main thread calls `update()` every 30 seconds to refresh active fallbacks
 ///
 /// # Caching
@@ -191,7 +192,8 @@ impl BatteryMonitor {
     /// # Background Thread Behavior
     ///
     /// - Sleeps for 1 second while cached startup readings are unresolved
-    /// - Returns to a 5-second native polling interval after resolution
+    /// - Queries connected Logitech devices every second after resolution
+    /// - Returns other native devices to a 5-second polling interval
     /// - Only queries active fallback backends during 30-second updates
     /// - Rechecks inactive external backends every five minutes
     /// - On error, keeps previous device snapshot
@@ -254,11 +256,58 @@ impl BatteryMonitor {
             let mut native_maxwell = None;
             let mut native_wolverine = None;
             let mut active_solaar = solaar_enabled_clone.load(Ordering::Relaxed);
+
+            // Resolve Maxwell first and publish it immediately. External fallback
+            // discovery can take several seconds and must not hold a live native
+            // battery reading behind cached startup state.
+            match query_native_maxwell() {
+                Ok(state) => {
+                    if state.is_some() {
+                        log::info!("Using native HID monitoring for Audeze Maxwell");
+                    }
+                    native_maxwell_authoritative = true;
+                    native_maxwell = state;
+                    let mut devices = devices_clone.lock().unwrap();
+                    merge_native_maxwell(&mut devices, native_maxwell.clone());
+                    prepare_detected_devices(
+                        &mut devices,
+                        &cached_devices,
+                        initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
+                    );
+                }
+                Err(error) => {
+                    log::warn!("Native Audeze Maxwell query failed: {error}");
+                }
+            }
+
             let mut logitech_monitor = logitech::Monitor::new();
             let mut native_logitech = query_native_logitech(&mut logitech_monitor);
+            {
+                let mut devices = devices_clone.lock().unwrap();
+                merge_native_logitech(&mut devices, &native_logitech);
+                prepare_detected_devices(
+                    &mut devices,
+                    &cached_devices,
+                    initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
+                );
+            }
+
             let mut headset_monitor = headsets::Monitor::new();
             let mut native_headsets = query_native_headsets(&mut headset_monitor);
             let mut native_headset_coverage = native_headsets.covered_names.clone();
+            {
+                let mut devices = devices_clone.lock().unwrap();
+                merge_native_headsets(
+                    &mut devices,
+                    &native_headsets.states,
+                    &native_headset_coverage,
+                );
+                prepare_detected_devices(
+                    &mut devices,
+                    &cached_devices,
+                    initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
+                );
+            }
 
             if !native_logitech.is_empty() {
                 log::info!(
@@ -272,25 +321,19 @@ impl BatteryMonitor {
                     native_headsets.states.len()
                 );
             }
-            match query_native_maxwell(false) {
-                Ok(state) => {
-                    if state.is_some() {
-                        log::info!("Using native HID monitoring for Audeze Maxwell");
-                    }
-                    native_maxwell_authoritative = true;
-                    native_maxwell = state;
-                }
-                Err(error) => {
-                    log::warn!("Native Audeze Maxwell query failed: {error}");
-                }
-            }
-
             match query_native_wolverine(false) {
                 Ok(state) => {
                     if state.is_some() {
                         log::info!("Using native HID monitoring for Razer Wolverine V3 Pro 8K PC");
                     }
                     native_wolverine = state;
+                    let mut devices = devices_clone.lock().unwrap();
+                    merge_native_wolverine(&mut devices, native_wolverine.clone());
+                    prepare_detected_devices(
+                        &mut devices,
+                        &cached_devices,
+                        initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
+                    );
                 }
                 Err(error) => {
                     log::warn!("Native Razer Wolverine V3 Pro 8K PC query failed: {error}");
@@ -345,18 +388,27 @@ impl BatteryMonitor {
 
             // Clear the initial update request flag
             *update_requested_clone.lock().unwrap() = false;
+            let mut last_standard_native_poll = Instant::now();
 
             // Retry unresolved cached devices quickly during startup, then use the
             // normal native polling interval. The timeout prevents a broken HID
             // permission or backend from causing permanent one-second polling.
             loop {
-                let poll_interval = {
+                let (poll_interval, fast_initial_poll) = {
                     let mut devices = devices_clone.lock().unwrap();
                     let elapsed = initial_probe_started.elapsed();
                     expire_initial_readings(&mut devices, elapsed);
-                    native_poll_interval(&devices, elapsed)
+                    let fast_initial_poll = elapsed < INITIAL_PROBE_TIMEOUT
+                        && devices.iter().any(|device| device.is_loading);
+                    (
+                        native_poll_interval(&devices, elapsed, !native_logitech.is_empty()),
+                        fast_initial_poll,
+                    )
                 };
                 std::thread::sleep(poll_interval);
+
+                let standard_native_poll_due = fast_initial_poll
+                    || last_standard_native_poll.elapsed() >= NATIVE_POLL_INTERVAL;
 
                 let configured_solaar = solaar_enabled_clone.load(Ordering::Relaxed);
                 if configured_solaar != active_solaar {
@@ -370,48 +422,50 @@ impl BatteryMonitor {
                     *update_requested_clone.lock().unwrap() = true;
                 }
 
-                let was_maxwell_connected = native_maxwell
-                    .as_ref()
-                    .is_some_and(|device| device.is_connected);
-                if let Ok(state) = query_native_maxwell(was_maxwell_connected) {
-                    native_maxwell_authoritative = true;
-                    native_maxwell = state;
-                    merge_native_maxwell(
-                        &mut devices_clone.lock().unwrap(),
-                        native_maxwell.clone(),
-                    );
-                }
+                if standard_native_poll_due {
+                    if let Ok(state) = query_native_maxwell() {
+                        native_maxwell_authoritative = true;
+                        native_maxwell = state;
+                        merge_native_maxwell(
+                            &mut devices_clone.lock().unwrap(),
+                            native_maxwell.clone(),
+                        );
+                    }
 
-                let was_wolverine_connected = native_wolverine
-                    .as_ref()
-                    .is_some_and(|device| device.is_connected);
-                if let Ok(state) = query_native_wolverine(was_wolverine_connected) {
-                    native_wolverine = state;
-                    merge_native_wolverine(
-                        &mut devices_clone.lock().unwrap(),
-                        native_wolverine.clone(),
-                    );
+                    let was_wolverine_connected = native_wolverine
+                        .as_ref()
+                        .is_some_and(|device| device.is_connected);
+                    if let Ok(state) = query_native_wolverine(was_wolverine_connected) {
+                        native_wolverine = state;
+                        merge_native_wolverine(
+                            &mut devices_clone.lock().unwrap(),
+                            native_wolverine.clone(),
+                        );
+                    }
                 }
 
                 native_logitech = query_native_logitech(&mut logitech_monitor);
                 merge_native_logitech(&mut devices_clone.lock().unwrap(), &native_logitech);
-                let previous_headset_coverage = native_headset_coverage.clone();
-                native_headsets = query_native_headsets(&mut headset_monitor);
-                native_headset_coverage = native_headsets.covered_names.clone();
-                let mut headset_rows_to_replace = previous_headset_coverage;
-                for name in &native_headset_coverage {
-                    if !headset_rows_to_replace
-                        .iter()
-                        .any(|existing| existing.eq_ignore_ascii_case(name))
-                    {
-                        headset_rows_to_replace.push(name.clone());
+                if standard_native_poll_due {
+                    let previous_headset_coverage = native_headset_coverage.clone();
+                    native_headsets = query_native_headsets(&mut headset_monitor);
+                    native_headset_coverage = native_headsets.covered_names.clone();
+                    let mut headset_rows_to_replace = previous_headset_coverage;
+                    for name in &native_headset_coverage {
+                        if !headset_rows_to_replace
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(name))
+                        {
+                            headset_rows_to_replace.push(name.clone());
+                        }
                     }
+                    merge_native_headsets(
+                        &mut devices_clone.lock().unwrap(),
+                        &native_headsets.states,
+                        &headset_rows_to_replace,
+                    );
+                    last_standard_native_poll = Instant::now();
                 }
-                merge_native_headsets(
-                    &mut devices_clone.lock().unwrap(),
-                    &native_headsets.states,
-                    &headset_rows_to_replace,
-                );
                 prepare_detected_devices(
                     &mut devices_clone.lock().unwrap(),
                     &cached_devices,
@@ -534,15 +588,8 @@ impl BatteryMonitor {
 // Native Device Queries
 // ============================================================================
 
-fn query_native_maxwell(was_connected: bool) -> Result<Option<BatteryDevice>, String> {
-    let mut state = headsets::query_audeze_maxwell()?;
-    let is_connected = state.as_ref().is_some_and(|state| state.connected);
-
-    if is_connected != was_connected {
-        std::thread::sleep(MAXWELL_CONNECTION_SETTLE_DELAY);
-        state = headsets::query_audeze_maxwell()?;
-    }
-
+fn query_native_maxwell() -> Result<Option<BatteryDevice>, String> {
+    let state = headsets::query_audeze_maxwell()?;
     Ok(state.map(|state| BatteryDevice {
         name: MAXWELL_DEVICE_NAME.to_string(),
         level: state.level,
@@ -795,9 +842,15 @@ fn expire_initial_readings(devices: &mut [BatteryDevice], elapsed: Duration) {
     }
 }
 
-fn native_poll_interval(devices: &[BatteryDevice], elapsed: Duration) -> Duration {
+fn native_poll_interval(
+    devices: &[BatteryDevice],
+    elapsed: Duration,
+    has_native_logitech: bool,
+) -> Duration {
     if elapsed < INITIAL_PROBE_TIMEOUT && devices.iter().any(|device| device.is_loading) {
         INITIAL_NATIVE_POLL_INTERVAL
+    } else if has_native_logitech {
+        LOGITECH_POLL_INTERVAL
     } else {
         NATIVE_POLL_INTERVAL
     }
@@ -1365,7 +1418,7 @@ fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
 mod tests {
     use super::{
         BatteryDevice, ExternalDeviceState, ExternalProbePlan, INITIAL_NATIVE_POLL_INTERVAL,
-        INITIAL_PROBE_TIMEOUT, NATIVE_POLL_INTERVAL, WOLVERINE_DEVICE_NAME,
+        INITIAL_PROBE_TIMEOUT, LOGITECH_POLL_INTERVAL, NATIVE_POLL_INTERVAL, WOLVERINE_DEVICE_NAME,
         expire_initial_readings, external_probe_plan, headsets, merge_native_headsets,
         merge_native_logitech, merge_native_maxwell, merge_native_wolverine, native_poll_interval,
         parse_headsetcontrol_json, parse_solaar_json, parse_solaar_text, prepare_detected_devices,
@@ -1452,14 +1505,19 @@ mod tests {
         let mut devices = vec![battery_device("Audeze Maxwell", true)];
 
         assert_eq!(
-            native_poll_interval(&devices, Duration::from_secs(2)),
+            native_poll_interval(&devices, Duration::from_secs(2), false),
             INITIAL_NATIVE_POLL_INTERVAL
         );
 
         devices[0].is_loading = false;
         assert_eq!(
-            native_poll_interval(&devices, Duration::from_secs(2)),
+            native_poll_interval(&devices, Duration::from_secs(2), false),
             NATIVE_POLL_INTERVAL
+        );
+
+        assert_eq!(
+            native_poll_interval(&devices, Duration::from_secs(2), true),
+            LOGITECH_POLL_INTERVAL
         );
     }
 
@@ -1480,7 +1538,7 @@ mod tests {
         assert!(!devices[0].is_loading);
         assert!(devices[0].is_connected);
         assert_eq!(
-            native_poll_interval(&devices, INITIAL_PROBE_TIMEOUT),
+            native_poll_interval(&devices, INITIAL_PROBE_TIMEOUT, false),
             NATIVE_POLL_INTERVAL
         );
     }

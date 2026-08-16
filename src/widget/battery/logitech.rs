@@ -111,8 +111,9 @@ impl Monitor {
                     device,
                     self.last_readings.get(&identity),
                 );
+                let reading_is_live = reading.is_ok();
                 if let Some(state) = state_from_reading(device, reading, &mut self.last_readings) {
-                    upsert_state(&mut states, state);
+                    upsert_state(&mut states, state, reading_is_live);
                 }
             }
         }
@@ -611,7 +612,7 @@ fn device_identity(name: &str) -> String {
         .join(" ")
 }
 
-fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState) {
+fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState, prefer_reading: bool) {
     if let Some(existing) = states
         .iter_mut()
         .find(|existing| same_device_name(&existing.name, &state.name))
@@ -619,10 +620,10 @@ fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState) {
         if device_name_quality(&state.name) > device_name_quality(&existing.name) {
             existing.name.clone_from(&state.name);
         }
-        if existing.level.is_none() {
+        if prefer_reading || existing.level.is_none() {
             existing.level = state.level;
         }
-        if existing.status.is_none() {
+        if prefer_reading || existing.status.is_none() {
             existing.status = state.status;
         }
         if existing.kind.is_none() {
@@ -684,10 +685,62 @@ mod tests {
                 kind: Some("mouse".to_string()),
                 connected: true,
             },
+            true,
         );
 
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].name, "G309 LIGHTSPEED");
+    }
+
+    #[test]
+    fn live_hidpp_reading_overrides_generic_power_supply_value() {
+        let mut states = vec![BatteryState {
+            name: "G309 LIGHTSPEED".to_string(),
+            level: Some(63),
+            status: Some("discharging".to_string()),
+            kind: Some("mouse".to_string()),
+            connected: true,
+        }];
+
+        upsert_state(
+            &mut states,
+            BatteryState {
+                name: "G309 LIGHTSPEED".to_string(),
+                level: Some(100),
+                status: Some("charged".to_string()),
+                kind: Some("mouse".to_string()),
+                connected: true,
+            },
+            true,
+        );
+
+        assert_eq!(states[0].level, Some(100));
+        assert_eq!(states[0].status.as_deref(), Some("charged"));
+    }
+
+    #[test]
+    fn remembered_hidpp_reading_does_not_override_live_power_supply_value() {
+        let mut states = vec![BatteryState {
+            name: "MX Mechanical Mini".to_string(),
+            level: Some(80),
+            status: Some("discharging".to_string()),
+            kind: Some("keyboard".to_string()),
+            connected: true,
+        }];
+
+        upsert_state(
+            &mut states,
+            BatteryState {
+                name: "MX Mechanical Mini".to_string(),
+                level: Some(65),
+                status: Some("discharging".to_string()),
+                kind: Some("keyboard".to_string()),
+                connected: true,
+            },
+            false,
+        );
+
+        assert_eq!(states[0].level, Some(80));
     }
 
     #[test]
