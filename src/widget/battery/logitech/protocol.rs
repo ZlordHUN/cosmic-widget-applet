@@ -77,10 +77,12 @@ fn parse_battery_status(response: &[u8]) -> Result<BatteryReading, String> {
     let [discharge, _, status, ..] = response else {
         return Err("HID++ battery-status response was too short".to_string());
     };
+    let status = parse_hidpp20_status(*status)
+        .ok_or_else(|| "HID++ battery-status response had an unknown status".to_string())?;
 
     Ok(BatteryReading {
         level: reported_percentage(*discharge),
-        status: parse_hidpp20_status(*status),
+        status: Some(status),
     })
 }
 
@@ -88,6 +90,8 @@ pub(super) fn parse_unified_battery(response: &[u8]) -> Result<BatteryReading, S
     let [discharge, approximation, status, ..] = response else {
         return Err("HID++ unified-battery response was too short".to_string());
     };
+    let status = parse_hidpp20_status(*status)
+        .ok_or_else(|| "HID++ unified-battery response had an unknown status".to_string())?;
     let level = reported_percentage(*discharge).or_else(|| match approximation {
         8 => Some(90),
         4 => Some(50),
@@ -98,7 +102,7 @@ pub(super) fn parse_unified_battery(response: &[u8]) -> Result<BatteryReading, S
 
     Ok(BatteryReading {
         level,
-        status: parse_hidpp20_status(*status),
+        status: Some(status),
     })
 }
 
@@ -307,6 +311,11 @@ mod tests {
                 status: Some("charging".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn rejects_unified_battery_data_with_an_unknown_status() {
+        assert!(parse_unified_battery(&[1, 1, 0xff, 0]).is_err());
     }
 
     #[test]

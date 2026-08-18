@@ -162,15 +162,22 @@ fn query_confirmed_device_battery(
     previous: Option<&BatteryReading>,
 ) -> Result<BatteryReading, String> {
     let first = query_device_battery(handle, device)?;
-    let Some(previous) = previous else {
-        return query_device_battery(handle, device).or(Ok(first));
-    };
-    if !needs_confirmation(previous, &first) {
+    if previous.is_some_and(|previous| !needs_confirmation(previous, &first)) {
         return Ok(first);
     }
 
     let second = query_device_battery(handle, device)?;
-    if readings_agree(&first, &second) || !needs_confirmation(previous, &second) {
+    confirm_repeated_reading(previous, first, second)
+}
+
+fn confirm_repeated_reading(
+    previous: Option<&BatteryReading>,
+    first: BatteryReading,
+    second: BatteryReading,
+) -> Result<BatteryReading, String> {
+    if readings_agree(&first, &second)
+        || previous.is_some_and(|previous| !needs_confirmation(previous, &second))
+    {
         Ok(second)
     } else {
         Err("unconfirmed Logitech battery-level jump".to_string())
@@ -640,9 +647,9 @@ mod tests {
     use super::sysfs::{Bus, EndpointKind, HidrawEndpoint, ReceiverKind};
     use super::{BatteryProtocol, BatteryReading};
     use super::{
-        BatteryState, HidppDevice, MonitoredEndpoint, device_identity, device_name_quality,
-        infer_kind, needs_confirmation, readings_agree, reconcile_discovered_endpoints,
-        same_device_name, state_from_reading, upsert_state,
+        BatteryState, HidppDevice, MonitoredEndpoint, confirm_repeated_reading, device_identity,
+        device_name_quality, infer_kind, needs_confirmation, readings_agree,
+        reconcile_discovered_endpoints, same_device_name, state_from_reading, upsert_state,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -767,6 +774,27 @@ mod tests {
         assert!(readings_agree(&transient, &confirmed));
         assert!(!readings_agree(&transient, &recovered));
         assert!(!needs_confirmation(&previous, &recovered));
+    }
+
+    #[test]
+    fn rejects_conflicting_initial_battery_readings() {
+        let malformed = BatteryReading {
+            level: Some(1),
+            status: Some("discharging".to_string()),
+        };
+        let live = BatteryReading {
+            level: Some(85),
+            status: Some("discharging".to_string()),
+        };
+
+        assert!(
+            confirm_repeated_reading(None, malformed, live.clone()).is_err(),
+            "a contradictory startup sample must not become authoritative"
+        );
+        assert_eq!(
+            confirm_repeated_reading(None, live.clone(), live.clone()),
+            Ok(live)
+        );
     }
 
     #[test]
