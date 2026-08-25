@@ -162,7 +162,10 @@ fn query_confirmed_device_battery(
     previous: Option<&BatteryReading>,
 ) -> Result<BatteryReading, String> {
     let first = query_device_battery(handle, device)?;
-    if previous.is_some_and(|previous| !needs_confirmation(previous, &first)) {
+    let Some(previous) = previous else {
+        return Ok(first);
+    };
+    if !needs_confirmation(previous, &first) {
         return Ok(first);
     }
 
@@ -171,13 +174,11 @@ fn query_confirmed_device_battery(
 }
 
 fn confirm_repeated_reading(
-    previous: Option<&BatteryReading>,
+    previous: &BatteryReading,
     first: BatteryReading,
     second: BatteryReading,
 ) -> Result<BatteryReading, String> {
-    if readings_agree(&first, &second)
-        || previous.is_some_and(|previous| !needs_confirmation(previous, &second))
-    {
+    if readings_agree(&first, &second) || !needs_confirmation(previous, &second) {
         Ok(second)
     } else {
         Err("unconfirmed Logitech battery-level jump".to_string())
@@ -777,23 +778,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_initial_battery_readings() {
-        let malformed = BatteryReading {
-            level: Some(1),
-            status: Some("discharging".to_string()),
-        };
-        let live = BatteryReading {
+    fn confirms_large_battery_changes_against_a_second_reading() {
+        let previous = BatteryReading {
             level: Some(85),
             status: Some("discharging".to_string()),
         };
+        let transient = BatteryReading {
+            level: Some(1),
+            status: Some("discharging".to_string()),
+        };
+        let recovered = previous.clone();
+        let conflicting = BatteryReading {
+            level: Some(50),
+            status: Some("discharging".to_string()),
+        };
 
-        assert!(
-            confirm_repeated_reading(None, malformed, live.clone()).is_err(),
-            "a contradictory startup sample must not become authoritative"
+        assert_eq!(
+            confirm_repeated_reading(&previous, transient.clone(), recovered.clone()),
+            Ok(recovered)
         );
         assert_eq!(
-            confirm_repeated_reading(None, live.clone(), live.clone()),
-            Ok(live)
+            confirm_repeated_reading(&previous, transient.clone(), transient.clone()),
+            Ok(transient.clone())
+        );
+        assert!(
+            confirm_repeated_reading(&previous, transient, conflicting).is_err(),
+            "two contradictory large changes must not become authoritative"
         );
     }
 
