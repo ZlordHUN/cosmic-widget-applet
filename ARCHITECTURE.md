@@ -118,10 +118,15 @@ close signals. A second reusable session-bus connection handles dismissal and
 periodic COSMIC history reconciliation.
 
 COSMIC notification history is restored through the optional
-`GetNotificationHistory` extension. When that method is unavailable, the
-overlay still captures live notifications and uses its session-scoped local
-cache. Dismissal uses the standard `CloseNotification` method and verifies the
-notification server owner before reusing an ID.
+`GetNotificationHistory` extension. Its backward-compatible
+`GetNotificationHistoryV2` variant also retains desktop identity and advertised
+action keys. Standalone Discord notifications can therefore invoke their
+validated default action through `InvokeNotificationAction`, letting Discord
+open the originating server channel, thread, or DM without parsing message
+text. When these extensions are unavailable, the overlay still captures live
+notifications and uses its session-scoped local cache. Dismissal uses the
+standard `CloseNotification` method and verifies the notification server owner
+before reusing an ID.
 
 ### Media
 

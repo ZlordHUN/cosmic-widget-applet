@@ -817,7 +817,23 @@ fn notification_item<'a>(
             timestamp: notification.timestamp,
         })
         .interaction(cosmic::iced::mouse::Interaction::Pointer);
-    let actionable = allow_open_action && notification.open_folder.is_some();
+    let open_message = notification
+        .open_folder
+        .as_ref()
+        .map(|_| super::Message::OpenNotificationFolder {
+            app_name: notification.app_name.clone(),
+            timestamp: notification.timestamp,
+        })
+        .or_else(|| {
+            notification
+                .activation_action
+                .as_ref()
+                .map(|_| super::Message::ActivateNotification {
+                    app_name: notification.app_name.clone(),
+                    timestamp: notification.timestamp,
+                })
+        });
+    let actionable = allow_open_action && open_message.is_some();
     let age_or_action: Element<'a, super::Message> = if actionable && hovered {
         widget::container(
             widget::button::standard("Open")
@@ -825,10 +841,7 @@ fn notification_item<'a>(
                 .padding([0, 8])
                 .font_size(12)
                 .line_height(17)
-                .on_press(super::Message::OpenNotificationFolder {
-                    app_name: notification.app_name.clone(),
-                    timestamp: notification.timestamp,
-                }),
+                .on_press(open_message.expect("actionable notifications have an open message")),
         )
         .width(Length::Fill)
         .align_x(cosmic::iced::alignment::Horizontal::Right)

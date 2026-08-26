@@ -304,6 +304,10 @@ pub enum Message {
         app_name: String,
         timestamp: u64,
     },
+    ActivateNotification {
+        app_name: String,
+        timestamp: u64,
+    },
     NotificationFolderOpened(Result<(), String>),
     PreviousMedia,
     PlayPauseMedia,
@@ -708,6 +712,14 @@ impl App {
                         open_notification_folder(folder),
                         Message::NotificationFolderOpened,
                     ));
+                }
+            }
+            Message::ActivateNotification {
+                app_name,
+                timestamp,
+            } => {
+                if !self.sampler.activate_notification(&app_name, timestamp) {
+                    log::warn!("Notification no longer has an actionable target");
                 }
             }
             Message::NotificationFolderOpened(result) => {
@@ -1877,6 +1889,7 @@ mod tests {
             body: "System is up to date.".to_string(),
             timestamp: 1_000,
             open_folder: None,
+            activation_action: None,
         }
     }
 

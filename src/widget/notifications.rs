@@ -94,6 +94,9 @@ pub struct Notification {
     /// Verified local directory that can be opened for this notification.
     #[serde(default)]
     pub open_folder: Option<PathBuf>,
+    /// Validated notification-server action that opens the originating item.
+    #[serde(default)]
+    pub activation_action: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,6 +108,11 @@ struct NotificationCache {
 enum NotificationDbusCommand {
     RefreshHistory,
     Close(Vec<(u32, String)>),
+    Activate {
+        id: u32,
+        server_owner: String,
+        action: String,
+    },
 }
 
 // ============================================================================
@@ -169,8 +177,9 @@ impl NotificationMonitor {
         };
         let (mut cached, retention_limit) = match cosmic_history_connection.as_ref() {
             Some(connection) => match load_cosmic_notification_history(connection) {
-                Ok(Some(history)) => {
+                Ok(Some(mut history)) => {
                     log::info!("Loaded {} notifications from COSMIC", history.len());
+                    preserve_notification_targets(&cached, &mut history);
                     (history, COSMIC_NOTIFICATION_HISTORY_LIMIT)
                 }
                 Ok(None) => (cached, max_notifications),
@@ -295,7 +304,7 @@ impl NotificationMonitor {
             drop(dismissed);
 
             let existing = notifications.lock().unwrap().clone();
-            preserve_open_folders(&existing, &mut history);
+            preserve_notification_targets(&existing, &mut history);
             downloads::resolve_open_folders(&mut history);
 
             let mut current = notifications.lock().unwrap();
@@ -455,6 +464,33 @@ impl NotificationMonitor {
         log::info!("Removed notification: {} at {}", app_name, timestamp);
     }
 
+    /// Invoke the validated default action for a retained notification.
+    pub fn activate_notification(&self, app_name: &str, timestamp: u64) -> bool {
+        let target = self
+            .notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|notification| {
+                notification.app_name == app_name && notification.timestamp == timestamp
+            })
+            .and_then(|notification| {
+                let (id, server_owner) = remote_notification_id(notification)?;
+                let action = notification.activation_action.clone()?;
+                Some((id, server_owner, action))
+            });
+        let Some((id, server_owner, action)) = target else {
+            return false;
+        };
+        self.dbus_commands
+            .send(NotificationDbusCommand::Activate {
+                id,
+                server_owner,
+                action,
+            })
+            .is_ok()
+    }
+
     fn persist(&self, notifications: &[Notification]) {
         if let Err(error) =
             persist_cached_notifications(&self.cache_path, &self.session_key, notifications)
@@ -490,6 +526,13 @@ impl NotificationMonitor {
             NotificationDbusCommand::RefreshHistory => {}
             NotificationDbusCommand::Close(notifications) => {
                 close_remote_notifications(connection, &notifications);
+            }
+            NotificationDbusCommand::Activate {
+                id,
+                server_owner,
+                action,
+            } => {
+                activate_remote_notification(connection, id, &server_owner, &action);
             }
         }
         *refresh_due = Some(Instant::now() + COSMIC_HISTORY_EVENT_DEBOUNCE);
@@ -541,6 +584,7 @@ struct PendingNotification {
     summary: String,
     body: String,
     timestamp: u64,
+    activation_action: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -574,11 +618,18 @@ impl NotificationMessageParser {
                 let Some(sender) = header.sender().map(ToString::to_string) else {
                     return Ok(None);
                 };
-                let (app_name, _, _, summary, body, _, _, _): NotifyArguments =
+                let (app_name, _, _, summary, body, actions, hints, _): NotifyArguments =
                     message.body().deserialize()?;
                 if summary.is_empty() {
                     return Ok(None);
                 }
+                let desktop_entry = notification_string_hint(&hints, "desktop-entry");
+                let action_keys = actions
+                    .chunks_exact(2)
+                    .map(|pair| pair[0].clone())
+                    .collect::<Vec<_>>();
+                let activation_action =
+                    discord_activation_action(&app_name, desktop_entry.as_deref(), &action_keys);
                 self.pending.insert(
                     (sender, message.primary_header().serial_num().get()),
                     PendingNotification {
@@ -588,6 +639,7 @@ impl NotificationMessageParser {
                         summary,
                         body,
                         timestamp,
+                        activation_action,
                     },
                 );
                 Ok(None)
@@ -610,6 +662,7 @@ impl NotificationMessageParser {
                     body: pending.body,
                     timestamp: pending.timestamp,
                     open_folder: None,
+                    activation_action: pending.activation_action,
                 })))
             }
             MessageType::Error => {
@@ -659,9 +712,14 @@ fn upsert_notification(
             .open_folder
             .clone()
             .or_else(|| notifications[index].open_folder.clone());
+        let activation_action = notification
+            .activation_action
+            .clone()
+            .or_else(|| notifications[index].activation_action.clone());
         notifications[index] = Notification {
             timestamp,
             open_folder,
+            activation_action,
             ..notification
         };
     } else {
@@ -670,27 +728,61 @@ fn upsert_notification(
     }
 }
 
-fn preserve_open_folders(existing: &[Notification], refreshed: &mut [Notification]) {
+fn preserve_notification_targets(existing: &[Notification], refreshed: &mut [Notification]) {
     for notification in refreshed {
-        if notification.open_folder.is_some() {
-            continue;
-        }
-        notification.open_folder = existing
-            .iter()
-            .find(|candidate| {
-                match (
-                    remote_notification_id(candidate),
-                    remote_notification_id(notification),
-                ) {
-                    (Some(left), Some(right)) => left == right,
-                    _ => {
-                        candidate.app_name == notification.app_name
-                            && candidate.timestamp == notification.timestamp
-                    }
+        let previous = existing.iter().find(|candidate| {
+            match (
+                remote_notification_id(candidate),
+                remote_notification_id(notification),
+            ) {
+                (Some(left), Some(right)) => left == right,
+                _ => {
+                    candidate.app_name == notification.app_name
+                        && candidate.timestamp == notification.timestamp
                 }
-            })
-            .and_then(|candidate| candidate.open_folder.clone());
+            }
+        });
+        if notification.open_folder.is_none() {
+            notification.open_folder = previous.and_then(|candidate| candidate.open_folder.clone());
+        }
+        if notification.activation_action.is_none() {
+            notification.activation_action =
+                previous.and_then(|candidate| candidate.activation_action.clone());
+        }
     }
+}
+
+fn notification_string_hint(
+    hints: &HashMap<String, zbus::zvariant::OwnedValue>,
+    name: &str,
+) -> Option<String> {
+    hints
+        .get(name)
+        .and_then(|value| value.try_clone().ok())
+        .and_then(|value| String::try_from(value).ok())
+}
+
+fn discord_activation_action(
+    app_name: &str,
+    desktop_entry: Option<&str>,
+    action_keys: &[String],
+) -> Option<String> {
+    let discord_app = app_name.eq_ignore_ascii_case("discord")
+        || desktop_entry.is_some_and(|entry| {
+            let entry = entry
+                .trim()
+                .trim_end_matches(".desktop")
+                .to_ascii_lowercase();
+            entry == "discord" || entry == "com.discordapp.discord"
+        });
+    discord_app
+        .then(|| {
+            action_keys
+                .iter()
+                .find(|action| action.as_str() == "default")
+                .cloned()
+        })
+        .flatten()
 }
 
 fn remote_notification_id(notification: &Notification) -> Option<(u32, String)> {
@@ -785,7 +877,61 @@ fn close_remote_notifications_inner(
     Ok(())
 }
 
+fn activate_remote_notification(
+    connection: &mut Option<zbus::blocking::Connection>,
+    id: u32,
+    server_owner: &str,
+    action: &str,
+) {
+    for attempt in 0..2 {
+        if !ensure_notification_connection(connection) {
+            return;
+        }
+        let active_connection = connection.as_ref().expect("connection was ensured");
+        match activate_remote_notification_inner(active_connection, id, server_owner, action) {
+            Ok(()) => return,
+            Err(error) if matches!(error, zbus::Error::InputOutput(_)) && attempt == 0 => {
+                *connection = None;
+            }
+            Err(error) => {
+                log::warn!("Failed to activate COSMIC notification: {error}");
+                return;
+            }
+        }
+    }
+}
+
+fn activate_remote_notification_inner(
+    connection: &zbus::blocking::Connection,
+    id: u32,
+    server_owner: &str,
+    action: &str,
+) -> zbus::Result<()> {
+    use zbus::blocking::Proxy;
+    use zbus::names::OwnedUniqueName;
+
+    let bus = Proxy::new(
+        connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )?;
+    let current_owner: OwnedUniqueName = bus.call("GetNameOwner", &NOTIFICATIONS_SERVICE)?;
+    if current_owner.as_str() != server_owner {
+        return Ok(());
+    }
+    let notifications_proxy = Proxy::new(
+        connection,
+        NOTIFICATIONS_SERVICE,
+        NOTIFICATIONS_PATH,
+        NOTIFICATIONS_INTERFACE,
+    )?;
+    let _: () = notifications_proxy.call("InvokeNotificationAction", &(id, action))?;
+    Ok(())
+}
+
 type CosmicNotificationHistoryEntry = (u32, String, String, String, u64);
+type CosmicNotificationHistoryEntryV2 = (u32, String, String, String, u64, Vec<String>, String);
 
 fn load_cosmic_notification_history(
     connection: &zbus::blocking::Connection,
@@ -806,6 +952,41 @@ fn load_cosmic_notification_history(
         NOTIFICATIONS_PATH,
         NOTIFICATIONS_INTERFACE,
     )?;
+    let v2_entries: Option<Vec<CosmicNotificationHistoryEntryV2>> =
+        match proxy.call("GetNotificationHistoryV2", &()) {
+            Ok(entries) => Some(entries),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+    if let Some(entries) = v2_entries {
+        return Ok(Some(
+            entries
+                .into_iter()
+                .map(
+                    |(id, app_name, summary, body, timestamp, actions, desktop_entry)| {
+                        let activation_action =
+                            discord_activation_action(&app_name, Some(&desktop_entry), &actions);
+                        Notification {
+                            id: Some(id),
+                            server_owner: Some(owner.to_string()),
+                            app_name,
+                            summary,
+                            body,
+                            timestamp,
+                            open_folder: None,
+                            activation_action,
+                        }
+                    },
+                )
+                .collect(),
+        ));
+    }
+
     let entries: Vec<CosmicNotificationHistoryEntry> =
         match proxy.call("GetNotificationHistory", &()) {
             Ok(entries) => entries,
@@ -827,6 +1008,7 @@ fn load_cosmic_notification_history(
             body,
             timestamp,
             open_folder: None,
+            activation_action: None,
         })
         .collect::<Vec<_>>();
     Ok(Some(notifications))
@@ -913,14 +1095,14 @@ mod tests {
         NOTIFICATIONS_INTERFACE, NOTIFICATIONS_PATH, NOTIFICATIONS_SERVICE, Notification,
         NotificationBusEvent, NotificationMessageParser, apply_local_dismissal_suppression,
         load_cached_notifications, open_notification_monitor_connection,
-        persist_cached_notifications, preserve_open_folders, upsert_notification,
+        persist_cached_notifications, preserve_notification_targets, upsert_notification,
     };
     use std::collections::{HashMap, HashSet};
     use std::sync::mpsc;
     use std::time::Duration;
     use zbus::Message;
     use zbus::blocking::{Connection, MessageIterator, Proxy};
-    use zbus::zvariant::OwnedValue;
+    use zbus::zvariant::{OwnedValue, Value};
 
     fn cache_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -938,6 +1120,7 @@ mod tests {
             body: "Body".to_string(),
             timestamp,
             open_folder: None,
+            activation_action: None,
         }
     }
 
@@ -966,6 +1149,40 @@ mod tests {
             .sender(":1.82")
             .unwrap()
             .build(&15_u32)
+            .unwrap();
+        (notify, reply)
+    }
+
+    fn discord_notify_exchange() -> (Message, Message) {
+        let mut hints = HashMap::new();
+        hints.insert(
+            "desktop-entry".to_string(),
+            OwnedValue::try_from(Value::from("com.discordapp.Discord")).unwrap(),
+        );
+        let notify = Message::method(NOTIFICATIONS_PATH, "Notify")
+            .unwrap()
+            .sender(":1.9000")
+            .unwrap()
+            .destination(NOTIFICATIONS_SERVICE)
+            .unwrap()
+            .interface(NOTIFICATIONS_INTERFACE)
+            .unwrap()
+            .build(&(
+                "Friend (Direct Message)".to_string(),
+                0_u32,
+                String::new(),
+                "Friend".to_string(),
+                "New message".to_string(),
+                vec!["default".to_string(), "Open".to_string()],
+                hints,
+                -1_i32,
+            ))
+            .unwrap();
+        let reply = Message::method_reply(&notify)
+            .unwrap()
+            .sender(":1.82")
+            .unwrap()
+            .build(&16_u32)
             .unwrap();
         (notify, reply)
     }
@@ -1042,6 +1259,23 @@ mod tests {
         );
         assert_eq!(notification.timestamp, 42);
         assert!(notification.open_folder.is_none());
+        assert!(notification.activation_action.is_none());
+    }
+
+    #[test]
+    fn captures_discord_default_action_from_desktop_entry() {
+        let mut parser = NotificationMessageParser::default();
+        let (notify, reply) = discord_notify_exchange();
+        assert!(parser.push_message(&notify, 42).unwrap().is_none());
+        let Some(NotificationBusEvent::Upsert(notification)) =
+            parser.push_message(&reply, 43).unwrap()
+        else {
+            panic!("expected a notification event");
+        };
+
+        assert_eq!(notification.id, Some(16));
+        assert_eq!(notification.app_name, "Friend (Direct Message)");
+        assert_eq!(notification.activation_action.as_deref(), Some("default"));
     }
 
     #[test]
@@ -1054,9 +1288,23 @@ mod tests {
         let mut refreshed = existing.clone();
         refreshed.open_folder = None;
 
-        preserve_open_folders(&[existing], std::slice::from_mut(&mut refreshed));
+        preserve_notification_targets(&[existing], std::slice::from_mut(&mut refreshed));
 
         assert_eq!(refreshed.open_folder, Some(folder));
+    }
+
+    #[test]
+    fn cosmic_history_refresh_preserves_notification_activation() {
+        let mut existing = notification("Discord message", 42);
+        existing.id = Some(15);
+        existing.server_owner = Some(":1.82".to_string());
+        existing.activation_action = Some("default".to_string());
+        let mut refreshed = existing.clone();
+        refreshed.activation_action = None;
+
+        preserve_notification_targets(&[existing], std::slice::from_mut(&mut refreshed));
+
+        assert_eq!(refreshed.activation_action.as_deref(), Some("default"));
     }
 
     #[test]

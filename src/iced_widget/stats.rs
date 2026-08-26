@@ -166,6 +166,11 @@ impl StatsSampler {
             .remove_notification(app_name, timestamp);
     }
 
+    pub fn activate_notification(&self, app_name: &str, timestamp: u64) -> bool {
+        self.notification_monitor
+            .activate_notification(app_name, timestamp)
+    }
+
     pub fn set_cider_token(&self, token: String) {
         self.media_monitor
             .set_cider_token((!token.is_empty()).then_some(token));
