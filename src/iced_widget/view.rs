@@ -36,6 +36,7 @@ pub fn widget_view<'a>(
     stats: &'a SystemSnapshot,
     expanded_notification_group: Option<&'a str>,
     expanded_notification: Option<&'a super::NotificationKey>,
+    hovered_notification: Option<&'a super::NotificationKey>,
     notification_group_progress: f32,
     notification_group_expanded: bool,
     notification_progress: f32,
@@ -97,6 +98,7 @@ pub fn widget_view<'a>(
                 stats,
                 expanded_notification_group,
                 expanded_notification,
+                hovered_notification,
                 notification_group_progress,
                 notification_group_expanded,
                 notification_progress,
@@ -449,6 +451,7 @@ fn notifications_view<'a>(
     stats: &'a SystemSnapshot,
     expanded_notification_group: Option<&'a str>,
     expanded_notification: Option<&'a super::NotificationKey>,
+    hovered_notification: Option<&'a super::NotificationKey>,
     notification_group_progress: f32,
     notification_group_expanded: bool,
     notification_progress: f32,
@@ -488,6 +491,8 @@ fn notifications_view<'a>(
                 let notification = group.notifications[0];
                 let expanded =
                     expanded_notification.is_some_and(|selected| selected.matches(notification));
+                let hovered =
+                    hovered_notification.is_some_and(|selected| selected.matches(notification));
                 let dismissal_progress =
                     notification_dismissal_progress(dismissing_notifications, notification);
                 let extra_height = if expanded {
@@ -501,6 +506,8 @@ fn notifications_view<'a>(
                         notification,
                         expanded,
                         dismissal_progress.is_some(),
+                        true,
+                        hovered,
                         now_timestamp,
                         item_spacing,
                     ),
@@ -545,6 +552,8 @@ fn notifications_view<'a>(
                             notification,
                             expanded,
                             dismissal_progress.is_some(),
+                            false,
+                            false,
                             now_timestamp,
                             item_spacing,
                         ),
@@ -733,6 +742,8 @@ fn notification_item<'a>(
     notification: &'a Notification,
     expanded: bool,
     dismissing: bool,
+    allow_open_action: bool,
+    hovered: bool,
     now_timestamp: u64,
     spacing: u16,
 ) -> Element<'a, super::Message> {
@@ -806,26 +817,62 @@ fn notification_item<'a>(
             timestamp: notification.timestamp,
         })
         .interaction(cosmic::iced::mouse::Interaction::Pointer);
-    let age = widget::container(widget::text::caption(relative_notification_time(
-        now_timestamp,
-        notification.timestamp,
-    )))
-    .width(Length::Fill)
-    .align_x(cosmic::iced::alignment::Horizontal::Right);
+    let actionable = allow_open_action && notification.open_folder.is_some();
+    let age_or_action: Element<'a, super::Message> = if actionable && hovered {
+        widget::container(
+            widget::button::standard("Open")
+                .height(Length::Fixed(28.0))
+                .padding([0, 8])
+                .font_size(12)
+                .line_height(17)
+                .on_press(super::Message::OpenNotificationFolder {
+                    app_name: notification.app_name.clone(),
+                    timestamp: notification.timestamp,
+                }),
+        )
+        .width(Length::Fill)
+        .align_x(cosmic::iced::alignment::Horizontal::Right)
+        .into()
+    } else {
+        widget::container(widget::text::caption(relative_notification_time(
+            now_timestamp,
+            notification.timestamp,
+        )))
+        .width(Length::Fill)
+        .align_x(cosmic::iced::alignment::Horizontal::Right)
+        .into()
+    };
     let metadata = widget::row::with_capacity(2)
         .width(Length::Fixed(88.0))
         .align_y(Alignment::Center)
         .spacing(2)
-        .push(age)
+        .push(age_or_action)
         .push(dismiss);
 
-    widget::row::with_capacity(2)
+    let row: Element<'a, super::Message> = widget::row::with_capacity(2)
         .width(Length::Fill)
         .align_y(Alignment::Center)
         .spacing(spacing)
         .push(content)
         .push(metadata)
-        .into()
+        .into();
+
+    if actionable {
+        widget::mouse_area(row)
+            .on_enter(super::Message::NotificationHoverChanged {
+                app_name: notification.app_name.clone(),
+                timestamp: notification.timestamp,
+                hovered: true,
+            })
+            .on_exit(super::Message::NotificationHoverChanged {
+                app_name: notification.app_name.clone(),
+                timestamp: notification.timestamp,
+                hovered: false,
+            })
+            .into()
+    } else {
+        row
+    }
 }
 
 fn filled_notification_icon() -> Element<'static, super::Message> {

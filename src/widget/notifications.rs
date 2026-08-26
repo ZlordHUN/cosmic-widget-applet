@@ -46,6 +46,9 @@
 //! - List is capped at `max_notifications` to prevent unbounded growth
 //! - Provides methods to clear all, clear by app, or remove specific notifications
 
+#[path = "notifications/downloads.rs"]
+mod downloads;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -88,6 +91,9 @@ pub struct Notification {
     pub body: String,
     /// Unix timestamp when notification was captured (seconds since epoch)
     pub timestamp: u64,
+    /// Verified local directory that can be opened for this notification.
+    #[serde(default)]
+    pub open_folder: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,7 +167,7 @@ impl NotificationMonitor {
                 None
             }
         };
-        let (cached, retention_limit) = match cosmic_history_connection.as_ref() {
+        let (mut cached, retention_limit) = match cosmic_history_connection.as_ref() {
             Some(connection) => match load_cosmic_notification_history(connection) {
                 Ok(Some(history)) => {
                     log::info!("Loaded {} notifications from COSMIC", history.len());
@@ -175,6 +181,7 @@ impl NotificationMonitor {
             },
             None => (cached, max_notifications),
         };
+        downloads::resolve_open_folders(&mut cached);
         if let Err(error) = persist_cached_notifications(&cache_path, &session_key, &cached) {
             log::warn!("Failed to initialize notification cache: {error}");
         }
@@ -287,6 +294,10 @@ impl NotificationMonitor {
             apply_local_dismissal_suppression(&mut history, &mut dismissed);
             drop(dismissed);
 
+            let existing = notifications.lock().unwrap().clone();
+            preserve_open_folders(&existing, &mut history);
+            downloads::resolve_open_folders(&mut history);
+
             let mut current = notifications.lock().unwrap();
             if *current == history {
                 continue;
@@ -344,13 +355,14 @@ impl NotificationMonitor {
             if let Some(event) = event {
                 let mut notifs = notifications.lock().unwrap();
                 match event {
-                    NotificationBusEvent::Upsert(notification) => {
+                    NotificationBusEvent::Upsert(mut notification) => {
                         log::info!(
                             "Captured notification {}: {} - {}",
                             notification.id.unwrap_or_default(),
                             notification.app_name,
                             notification.summary
                         );
+                        downloads::resolve_open_folders(std::slice::from_mut(&mut notification));
                         upsert_notification(&mut notifs, notification, max_count);
                     }
                     NotificationBusEvent::Closed { id, server_owner } => {
@@ -597,6 +609,7 @@ impl NotificationMessageParser {
                     summary: pending.summary,
                     body: pending.body,
                     timestamp: pending.timestamp,
+                    open_folder: None,
                 })))
             }
             MessageType::Error => {
@@ -642,13 +655,41 @@ fn upsert_notification(
     });
     if let Some(index) = existing {
         let timestamp = notifications[index].timestamp;
+        let open_folder = notification
+            .open_folder
+            .clone()
+            .or_else(|| notifications[index].open_folder.clone());
         notifications[index] = Notification {
             timestamp,
+            open_folder,
             ..notification
         };
     } else {
         notifications.insert(0, notification);
         notifications.truncate(max_count);
+    }
+}
+
+fn preserve_open_folders(existing: &[Notification], refreshed: &mut [Notification]) {
+    for notification in refreshed {
+        if notification.open_folder.is_some() {
+            continue;
+        }
+        notification.open_folder = existing
+            .iter()
+            .find(|candidate| {
+                match (
+                    remote_notification_id(candidate),
+                    remote_notification_id(notification),
+                ) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => {
+                        candidate.app_name == notification.app_name
+                            && candidate.timestamp == notification.timestamp
+                    }
+                }
+            })
+            .and_then(|candidate| candidate.open_folder.clone());
     }
 }
 
@@ -785,6 +826,7 @@ fn load_cosmic_notification_history(
             summary,
             body,
             timestamp,
+            open_folder: None,
         })
         .collect::<Vec<_>>();
     Ok(Some(notifications))
@@ -871,7 +913,7 @@ mod tests {
         NOTIFICATIONS_INTERFACE, NOTIFICATIONS_PATH, NOTIFICATIONS_SERVICE, Notification,
         NotificationBusEvent, NotificationMessageParser, apply_local_dismissal_suppression,
         load_cached_notifications, open_notification_monitor_connection,
-        persist_cached_notifications, upsert_notification,
+        persist_cached_notifications, preserve_open_folders, upsert_notification,
     };
     use std::collections::{HashMap, HashSet};
     use std::sync::mpsc;
@@ -895,6 +937,7 @@ mod tests {
             summary: summary.to_string(),
             body: "Body".to_string(),
             timestamp,
+            open_folder: None,
         }
     }
 
@@ -998,6 +1041,22 @@ mod tests {
             "Capturing the assigned ID.\nWithout text parsing."
         );
         assert_eq!(notification.timestamp, 42);
+        assert!(notification.open_folder.is_none());
+    }
+
+    #[test]
+    fn cosmic_history_refresh_preserves_resolved_open_folders() {
+        let folder = std::path::PathBuf::from("/mnt/Downloads");
+        let mut existing = notification("Download completed", 42);
+        existing.id = Some(15);
+        existing.server_owner = Some(":1.82".to_string());
+        existing.open_folder = Some(folder.clone());
+        let mut refreshed = existing.clone();
+        refreshed.open_folder = None;
+
+        preserve_open_folders(&[existing], std::slice::from_mut(&mut refreshed));
+
+        assert_eq!(refreshed.open_folder, Some(folder));
     }
 
     #[test]

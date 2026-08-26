@@ -22,6 +22,7 @@ use cosmic::iced::platform_specific::shell::commands::{blur, corner_radius};
 use cosmic::iced::{self, Color, Point, Rectangle, Size, Subscription, Task, window};
 use futures_util::SinkExt;
 use stats::{StatsSampler, SystemSnapshot};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "com.github.zoliviragh.CosmicWidget.Iced";
@@ -45,7 +46,7 @@ const NOTIFICATION_LINE_HEIGHT: u32 = 17;
 const NOTIFICATION_CHARS_PER_LINE: usize = 32;
 const NOTIFICATION_EXPANSION_DURATION: Duration = Duration::from_millis(220);
 const NOTIFICATION_GROUP_EXPANSION_DURATION: Duration = Duration::from_millis(320);
-const EMPTY_MEDIA_HEIGHT: u32 = 95;
+const EMPTY_MEDIA_HEIGHT: u32 = 107;
 const MEDIA_SECTION_HEIGHT: u32 = 248;
 const MEDIA_CONTROL_GRACE: Duration = Duration::from_secs(2);
 const UI_TICK_SETTLE_DELAY: Duration = Duration::from_millis(5);
@@ -265,6 +266,7 @@ struct App {
     corners_ready_at: Instant,
     expanded_notification_group: Option<String>,
     expanded_notification: Option<NotificationKey>,
+    hovered_notification: Option<NotificationKey>,
     notification_group_expansion: ExpansionAnimation,
     notification_expansion: ExpansionAnimation,
     dismissing_notifications: Vec<DismissingNotification>,
@@ -282,9 +284,27 @@ pub enum Message {
     Tick,
     AnimationTick,
     ClearNotifications,
-    ToggleNotificationGroup { source: String },
-    ToggleNotification { app_name: String, timestamp: u64 },
-    DismissNotification { app_name: String, timestamp: u64 },
+    ToggleNotificationGroup {
+        source: String,
+    },
+    ToggleNotification {
+        app_name: String,
+        timestamp: u64,
+    },
+    DismissNotification {
+        app_name: String,
+        timestamp: u64,
+    },
+    NotificationHoverChanged {
+        app_name: String,
+        timestamp: u64,
+        hovered: bool,
+    },
+    OpenNotificationFolder {
+        app_name: String,
+        timestamp: u64,
+    },
+    NotificationFolderOpened(Result<(), String>),
     PreviousMedia,
     PlayPauseMedia,
     NextMedia,
@@ -343,6 +363,7 @@ impl App {
                 corners_ready_at: Instant::now() + CORNER_RADIUS_STARTUP_DELAY,
                 expanded_notification_group: None,
                 expanded_notification: None,
+                hovered_notification: None,
                 notification_group_expansion: ExpansionAnimation::with_duration(
                     NOTIFICATION_GROUP_EXPANSION_DURATION,
                 ),
@@ -404,6 +425,15 @@ impl App {
                 }) {
                     self.expanded_notification = None;
                     self.notification_expansion.reset();
+                }
+                if self.hovered_notification.as_ref().is_some_and(|key| {
+                    !self
+                        .snapshot
+                        .notifications
+                        .iter()
+                        .any(|notification| key.matches(notification))
+                }) {
+                    self.hovered_notification = None;
                 }
                 if self
                     .expanded_notification_group
@@ -646,6 +676,45 @@ impl App {
                     animation,
                 });
             }
+            Message::NotificationHoverChanged {
+                app_name,
+                timestamp,
+                hovered,
+            } => {
+                let key = NotificationKey {
+                    app_name,
+                    timestamp,
+                };
+                if hovered {
+                    self.hovered_notification = Some(key);
+                } else if self.hovered_notification.as_ref() == Some(&key) {
+                    self.hovered_notification = None;
+                }
+            }
+            Message::OpenNotificationFolder {
+                app_name,
+                timestamp,
+            } => {
+                if let Some(folder) = self
+                    .snapshot
+                    .notifications
+                    .iter()
+                    .find(|notification| {
+                        notification.app_name == app_name && notification.timestamp == timestamp
+                    })
+                    .and_then(|notification| notification.open_folder.clone())
+                {
+                    tasks.push(Task::perform(
+                        open_notification_folder(folder),
+                        Message::NotificationFolderOpened,
+                    ));
+                }
+            }
+            Message::NotificationFolderOpened(result) => {
+                if let Err(error) = result {
+                    log::warn!("Failed to open notification folder: {error}");
+                }
+            }
             Message::NotificationScrolled(offset) => {
                 if self.notification_group_expansion.is_animating() {
                     self.notification_scroll.snap_to(offset);
@@ -772,6 +841,7 @@ impl App {
             &self.snapshot,
             self.expanded_notification_group.as_deref(),
             self.expanded_notification.as_ref(),
+            self.hovered_notification.as_ref(),
             self.notification_group_expansion.progress,
             self.notification_group_expansion.target > 0.0,
             self.notification_expansion.progress,
@@ -846,6 +916,24 @@ impl App {
             self.notification_group_expansion.target,
         )
     }
+}
+
+async fn open_notification_folder(folder: PathBuf) -> Result<(), String> {
+    if !folder.is_dir() {
+        return Err(format!(
+            "{} is not an accessible directory",
+            folder.display()
+        ));
+    }
+    let status = tokio::process::Command::new("xdg-open")
+        .arg(&folder)
+        .status()
+        .await
+        .map_err(|error| format!("could not start xdg-open: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("xdg-open exited with {status}"))
 }
 
 fn create_overlay_surface(
@@ -1353,12 +1441,12 @@ fn estimated_wrapped_lines(text: &str, line_width: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_SURFACE_HEIGHT, DISK_IO_SECTION_HEIGHT, ExpansionAnimation, NETWORK_SECTION_HEIGHT,
-        NOTIFICATION_EXPANSION_DURATION, NotificationKey, PendingPlayback, SURFACE_WIDTH,
-        ScrollAnimation, UI_TICK_SETTLE_DELAY, delay_until_next_tick, desired_surface_height,
-        desired_surface_height_with_expansion, dragged_overlay_position,
-        notification_viewport_height_with_animation, reconcile_media_state,
-        rounded_surface_regions,
+        BASE_SURFACE_HEIGHT, DISK_IO_SECTION_HEIGHT, EMPTY_MEDIA_HEIGHT, ExpansionAnimation,
+        MEDIA_SECTION_HEIGHT, NETWORK_SECTION_HEIGHT, NOTIFICATION_EXPANSION_DURATION,
+        NotificationKey, PendingPlayback, SURFACE_WIDTH, ScrollAnimation, UI_TICK_SETTLE_DELAY,
+        delay_until_next_tick, desired_surface_height, desired_surface_height_with_expansion,
+        dragged_overlay_position, notification_viewport_height_with_animation,
+        reconcile_media_state, rounded_surface_regions,
     };
     use crate::battery::BatteryDevice;
     use crate::config::{Config, WidgetSection};
@@ -1682,14 +1770,20 @@ mod tests {
             media(),
         ));
 
-        assert_eq!(empty_height, 651);
-        assert_eq!(desired_surface_height(&config, &snapshot), 804);
+        assert_eq!(empty_height, BASE_SURFACE_HEIGHT + EMPTY_MEDIA_HEIGHT);
+        assert_eq!(
+            desired_surface_height(&config, &snapshot),
+            BASE_SURFACE_HEIGHT + MEDIA_SECTION_HEIGHT
+        );
 
         snapshot.media.players.push((
             PlayerId::Mpris("org.mpris.MediaPlayer2.cider".to_string()),
             media(),
         ));
-        assert_eq!(desired_surface_height(&config, &snapshot), 804);
+        assert_eq!(
+            desired_surface_height(&config, &snapshot),
+            BASE_SURFACE_HEIGHT + MEDIA_SECTION_HEIGHT
+        );
     }
 
     #[test]
@@ -1782,6 +1876,7 @@ mod tests {
             summary: "Package manager updated".to_string(),
             body: "System is up to date.".to_string(),
             timestamp: 1_000,
+            open_folder: None,
         }
     }
 
