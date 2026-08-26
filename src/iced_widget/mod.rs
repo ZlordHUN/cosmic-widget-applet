@@ -50,6 +50,7 @@ const MEDIA_SECTION_HEIGHT: u32 = 248;
 const MEDIA_CONTROL_GRACE: Duration = Duration::from_secs(2);
 const UI_TICK_SETTLE_DELAY: Duration = Duration::from_millis(5);
 const CORNER_RADIUS_STARTUP_DELAY: Duration = Duration::from_secs(1);
+const SURFACE_RECOVERY_DELAY: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone)]
 struct PendingPlayback {
@@ -273,6 +274,7 @@ struct App {
     pending_playback: Option<PendingPlayback>,
     overlay_cursor: Point,
     overlay_drag_cursor: Option<Point>,
+    surface_recovery_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +297,8 @@ pub enum Message {
     BeginOverlayDrag,
     EndOverlayDrag,
     PinOverlay,
+    OutputTopologyChanged,
+    RecoverSurface(u64),
 }
 
 impl App {
@@ -321,30 +325,7 @@ impl App {
         let snapshot = SystemSnapshot::default();
         let surface_height = desired_surface_height(&config, &snapshot);
 
-        let create_surface = layer_surface::get_layer_surface(SctkLayerSurfaceSettings {
-            id: surface_id,
-            layer: Layer::Bottom,
-            keyboard_interactivity: KeyboardInteractivity::OnDemand,
-            anchor: Anchor::TOP.union(Anchor::BOTTOM).union(Anchor::LEFT),
-            namespace: "cosmic-widget-iced".to_string(),
-            margin: IcedMargin {
-                top: config.widget_y,
-                left: config.widget_x,
-                ..IcedMargin::default()
-            },
-            // An unspecified size becomes 1x1 for a surface anchored to only
-            // one horizontal and vertical edge in the pinned Iced backend.
-            size: Some((Some(SURFACE_WIDTH), None)),
-            input_zone: Some(vec![surface_region(surface_height)]),
-            exclusive_zone: -1,
-            ..SctkLayerSurfaceSettings::default()
-        });
-
-        let create_surface = if frosted {
-            create_surface.chain(set_surface_blur(surface_id, true, surface_height))
-        } else {
-            create_surface
-        };
+        let create_surface = create_overlay_surface(surface_id, &config, surface_height, frosted);
 
         (
             Self {
@@ -373,6 +354,7 @@ impl App {
                 pending_playback: None,
                 overlay_cursor: Point::ORIGIN,
                 overlay_drag_cursor: None,
+                surface_recovery_generation: 0,
             },
             create_surface,
         )
@@ -762,6 +744,22 @@ impl App {
                     log::error!("Failed to save the pinned overlay position: {error}");
                 }
             }
+            Message::OutputTopologyChanged => {
+                self.surface_recovery_generation = self.surface_recovery_generation.wrapping_add(1);
+                let generation = self.surface_recovery_generation;
+                tasks.push(Task::perform(
+                    async move {
+                        tokio::time::sleep(SURFACE_RECOVERY_DELAY).await;
+                        generation
+                    },
+                    Message::RecoverSurface,
+                ));
+            }
+            Message::RecoverSurface(generation) => {
+                if generation == self.surface_recovery_generation {
+                    tasks.push(self.recreate_surface());
+                }
+            }
         }
 
         Task::batch(tasks)
@@ -788,15 +786,40 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let stats = Subscription::run_with(self.ui_tick_interval(), aligned_tick_stream)
             .map(|_| Message::Tick);
+        let output_changes = iced::event::listen_with(|event, _status, _window| {
+            matches!(
+                event,
+                iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(
+                    iced::event::wayland::Event::Output(_, _)
+                ))
+            )
+            .then_some(Message::OutputTopologyChanged)
+        });
 
         if self.animations_active() {
             Subscription::batch([
                 stats,
+                output_changes,
                 iced::window::frames().map(|_| Message::AnimationTick),
             ])
         } else {
-            stats
+            Subscription::batch([stats, output_changes])
         }
+    }
+
+    fn recreate_surface(&mut self) -> Task<Message> {
+        let previous_id = self.surface_id;
+        let surface_id = window::Id::unique();
+        self.surface_id = surface_id;
+        self.corners = None;
+        self.corners_ready_at = Instant::now() + CORNER_RADIUS_STARTUP_DELAY;
+
+        layer_surface::destroy_layer_surface(previous_id).chain(create_overlay_surface(
+            surface_id,
+            &self.config,
+            self.surface_height,
+            self.frosted,
+        ))
     }
 
     fn animations_active(&self) -> bool {
@@ -822,6 +845,38 @@ impl App {
             self.notification_expansion.target,
             self.notification_group_expansion.target,
         )
+    }
+}
+
+fn create_overlay_surface(
+    id: window::Id,
+    config: &Config,
+    height: u32,
+    frosted: bool,
+) -> Task<Message> {
+    let create_surface = layer_surface::get_layer_surface(SctkLayerSurfaceSettings {
+        id,
+        layer: Layer::Bottom,
+        keyboard_interactivity: KeyboardInteractivity::OnDemand,
+        anchor: Anchor::TOP.union(Anchor::BOTTOM).union(Anchor::LEFT),
+        namespace: "cosmic-widget-iced".to_string(),
+        margin: IcedMargin {
+            top: config.widget_y,
+            left: config.widget_x,
+            ..IcedMargin::default()
+        },
+        // An unspecified size becomes 1x1 for a surface anchored to only
+        // one horizontal and vertical edge in the pinned Iced backend.
+        size: Some((Some(SURFACE_WIDTH), None)),
+        input_zone: Some(vec![surface_region(height)]),
+        exclusive_zone: -1,
+        ..SctkLayerSurfaceSettings::default()
+    });
+
+    if frosted {
+        create_surface.chain(set_surface_blur(id, true, height))
+    } else {
+        create_surface
     }
 }
 
