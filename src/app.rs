@@ -29,6 +29,14 @@ use cosmic::iced::{Limits, Subscription, window::Id};
 use cosmic::prelude::*;
 use cosmic::widget;
 use futures_util::SinkExt;
+use std::io;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
+
+const WIDGET_STARTUP_DELAY: Duration = Duration::from_secs(2);
+const WIDGET_RETRY_DELAY: Duration = Duration::from_secs(3);
+const WIDGET_STARTUP_ATTEMPTS: usize = 5;
 
 // ============================================================================
 // Application Model
@@ -116,7 +124,7 @@ impl AppModel {
     /// # Returns
     /// `true` if the widget process is found, `false` otherwise.
     fn check_widget_running() -> bool {
-        if let Ok(output) = std::process::Command::new("pgrep")
+        if let Ok(output) = Command::new("pgrep")
             .args(["-r", "R,S,D,T,t,W,I"])
             .arg("-x")
             .arg("cosmic-widget")
@@ -126,6 +134,66 @@ impl AppModel {
             !output.stdout.is_empty()
         } else {
             false
+        }
+    }
+
+    /// Resolves an installed companion binary next to the running applet.
+    /// Falling back to PATH keeps development builds and custom installs working.
+    fn companion_binary(name: &str) -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|executable| executable.parent().map(|parent| parent.join(name)))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from(name))
+    }
+
+    /// Spawns a child and waits for it on a background thread so it cannot become
+    /// a zombie after exiting.
+    fn spawn_reaped(mut command: Command) -> io::Result<()> {
+        let mut child = command.spawn()?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
+
+    fn spawn_companion(name: &str) -> io::Result<()> {
+        Self::spawn_reaped(Command::new(Self::companion_binary(name)))
+    }
+
+    fn auto_start_widget() {
+        std::thread::sleep(WIDGET_STARTUP_DELAY);
+
+        for attempt in 1..=WIDGET_STARTUP_ATTEMPTS {
+            if Self::check_widget_running() {
+                log::info!("Widget is running; auto-start finished");
+                return;
+            }
+
+            match Self::spawn_companion("cosmic-widget") {
+                Ok(()) => log::info!(
+                    "Widget auto-start attempt {}/{} launched",
+                    attempt,
+                    WIDGET_STARTUP_ATTEMPTS
+                ),
+                Err(error) => log::error!(
+                    "Widget auto-start attempt {}/{} failed: {}",
+                    attempt,
+                    WIDGET_STARTUP_ATTEMPTS,
+                    error
+                ),
+            }
+
+            std::thread::sleep(WIDGET_RETRY_DELAY);
+        }
+
+        if Self::check_widget_running() {
+            log::info!("Widget is running; auto-start finished");
+        } else {
+            log::error!(
+                "Widget failed to remain running after {} auto-start attempts",
+                WIDGET_STARTUP_ATTEMPTS
+            );
         }
     }
 }
@@ -187,23 +255,8 @@ impl cosmic::Application for AppModel {
             if Self::check_widget_running() {
                 log::info!("Auto-start enabled, but the widget is already running");
             } else {
-                log::info!(
-                    "Auto-start enabled, launching widget with 2s delay for compositor init"
-                );
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-
-                    // The panel may have restarted more than once during this
-                    // delay. Re-check immediately before spawning; the widget's
-                    // instance lock closes the remaining race between checks.
-                    if AppModel::check_widget_running() {
-                        log::info!("Widget started while autostart was waiting; skipping launch");
-                    } else if let Err(e) = std::process::Command::new("cosmic-widget").spawn() {
-                        log::error!("Failed to auto-start widget: {}", e);
-                    } else {
-                        log::info!("Widget auto-started successfully after delay");
-                    }
-                });
+                log::info!("Auto-start enabled; waiting for the compositor before launching");
+                std::thread::spawn(Self::auto_start_widget);
             }
             true
         } else {
@@ -323,10 +376,9 @@ impl cosmic::Application for AppModel {
                     // Kill the widget process
                     // Use exact match to avoid killing cosmic-widget-applet too
                     log::info!("Stopping widget via pkill");
-                    let _ = std::process::Command::new("pkill")
-                        .arg("-x")
-                        .arg("cosmic-widget")
-                        .spawn();
+                    let mut command = Command::new("pkill");
+                    command.arg("-x").arg("cosmic-widget");
+                    let _ = Self::spawn_reaped(command);
                     self.widget_running = false;
 
                     // Disable auto-start since user explicitly hid the widget
@@ -335,7 +387,7 @@ impl cosmic::Application for AppModel {
                 } else {
                     // Launch the widget process
                     log::info!("Launching widget");
-                    if std::process::Command::new("cosmic-widget").spawn().is_ok() {
+                    if Self::spawn_companion("cosmic-widget").is_ok() {
                         self.widget_running = true;
 
                         // Enable auto-start since user explicitly showed the widget
@@ -343,14 +395,14 @@ impl cosmic::Application for AppModel {
                         self.save_config();
                         log::info!("Widget launched successfully");
                     } else {
-                        log::error!("Failed to launch widget - is cosmic-widget in PATH?");
+                        log::error!("Failed to launch widget");
                     }
                 }
             }
 
             Message::OpenSettings => {
                 // Launch the settings application as a separate process
-                let _ = std::process::Command::new("cosmic-widget-settings").spawn();
+                let _ = Self::spawn_companion("cosmic-widget-settings");
             }
 
             Message::TogglePopup => {

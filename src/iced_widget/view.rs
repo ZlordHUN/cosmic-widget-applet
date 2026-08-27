@@ -29,6 +29,7 @@ const MEDIA_CONTROL_ICON_SIZE: u16 = 20;
 const MEDIA_CONTROL_PADDING: u16 = 6;
 const MEDIA_CONTROL_SPACING: u16 = 8;
 const MEDIA_TIMELINE_FOOTER_GAP: f32 = 4.0;
+const CLEAR_ALL_BUTTON_WIDTH: f32 = 64.0;
 
 pub fn widget_view<'a>(
     config: &Config,
@@ -41,6 +42,8 @@ pub fn widget_view<'a>(
     notification_group_expanded: bool,
     notification_progress: f32,
     dismissing_notifications: &'a [super::DismissingNotification],
+    clearing_notifications: bool,
+    clear_button_visibility: f32,
     notification_scroll_translation: f32,
     surface_height: u32,
     media_seek_preview: Option<f64>,
@@ -103,6 +106,8 @@ pub fn widget_view<'a>(
                 notification_group_expanded,
                 notification_progress,
                 dismissing_notifications,
+                clearing_notifications,
+                clear_button_visibility,
                 notification_scroll_translation,
                 now_timestamp,
                 spacing.space_xs,
@@ -456,26 +461,38 @@ fn notifications_view<'a>(
     notification_group_expanded: bool,
     notification_progress: f32,
     dismissing_notifications: &'a [super::DismissingNotification],
+    clearing_notifications: bool,
+    clear_button_visibility: f32,
     notification_scroll_translation: f32,
     now_timestamp: u64,
     section_spacing: u16,
     item_spacing: u16,
 ) -> Element<'a, super::Message> {
-    let clear_all = widget::button::standard("Clear all")
+    let mut heading = widget::row::with_capacity(4)
         .height(Length::Fixed(28.0))
-        .padding([0, 8])
-        .font_size(12)
-        .line_height(17)
-        .on_press_maybe(
-            (!stats.notifications.is_empty()).then_some(super::Message::ClearNotifications),
-        );
-    let heading = widget::row::with_capacity(4)
         .align_y(Alignment::Center)
         .spacing(8)
         .push(filled_notification_icon())
         .push(widget::text::heading("Notifications"))
-        .push(widget::space::horizontal())
-        .push(clear_all);
+        .push(widget::space::horizontal());
+    if !stats.notifications.is_empty()
+        || clearing_notifications
+        || clear_button_visibility > f32::EPSILON
+    {
+        let clear_all: Element<'a, super::Message> = widget::button::standard("Clear all")
+            .width(Length::Fixed(CLEAR_ALL_BUTTON_WIDTH))
+            .height(Length::Fixed(28.0))
+            .padding([0, 8])
+            .font_size(12)
+            .line_height(17)
+            .on_press_maybe((!clearing_notifications).then_some(super::Message::ClearNotifications))
+            .into();
+        heading = heading.push(if clear_button_visibility < 1.0 {
+            super::shrink::out(clear_all, 1.0 - clear_button_visibility)
+        } else {
+            clear_all
+        });
+    }
     let mut notifications = widget::column::with_capacity(2)
         .spacing(section_spacing)
         .push(heading);
@@ -520,6 +537,8 @@ fn notifications_view<'a>(
             }
 
             let group_mounted = expanded_notification_group == Some(group.source);
+            let dismissal_progress =
+                notification_group_dismissal_progress(dismissing_notifications, &group);
             list = list.push(notification_list_entry(
                 notification_group_item(
                     &group,
@@ -528,7 +547,7 @@ fn notifications_view<'a>(
                 ),
                 super::NOTIFICATION_ITEM_HEIGHT as f32,
                 has_entries,
-                None,
+                dismissal_progress,
             ));
             has_entries = true;
             if group_mounted {
@@ -670,6 +689,19 @@ fn notification_dismissal_progress(
         .iter()
         .find(|dismissal| dismissal.matches(notification))
         .map(|dismissal| dismissal.animation.progress)
+}
+
+fn notification_group_dismissal_progress(
+    dismissals: &[super::DismissingNotification],
+    group: &NotificationGroup<'_>,
+) -> Option<f32> {
+    group
+        .notifications
+        .iter()
+        .map(|notification| notification_dismissal_progress(dismissals, notification))
+        .try_fold(1.0_f32, |progress, item| {
+            item.map(|item_progress| progress.min(item_progress))
+        })
 }
 
 struct NotificationGroup<'a> {

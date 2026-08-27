@@ -2,6 +2,7 @@
 
 mod gauge;
 mod marquee;
+mod shrink;
 mod slide;
 mod stats;
 mod translate;
@@ -74,6 +75,19 @@ struct DismissingNotification {
 }
 
 impl DismissingNotification {
+    fn new(notification: &crate::notifications::Notification, now: Instant) -> Self {
+        let mut animation = ExpansionAnimation::default();
+        animation.transition_to(1.0, now);
+        Self {
+            key: NotificationKey {
+                app_name: notification.app_name.clone(),
+                timestamp: notification.timestamp,
+            },
+            source: notification_source(notification).to_string(),
+            animation,
+        }
+    }
+
     fn matches(&self, notification: &crate::notifications::Notification) -> bool {
         self.key.matches(notification)
     }
@@ -270,6 +284,8 @@ struct App {
     notification_group_expansion: ExpansionAnimation,
     notification_expansion: ExpansionAnimation,
     dismissing_notifications: Vec<DismissingNotification>,
+    clearing_notifications: bool,
+    clear_button_animation: ExpansionAnimation,
     notification_scroll: ScrollAnimation,
     media_seek_preview: Option<f64>,
     media_timeline_hovered: bool,
@@ -373,6 +389,8 @@ impl App {
                 ),
                 notification_expansion: ExpansionAnimation::default(),
                 dismissing_notifications: Vec::new(),
+                clearing_notifications: false,
+                clear_button_animation: ExpansionAnimation::default(),
                 notification_scroll: ScrollAnimation::default(),
                 media_seek_preview: None,
                 media_timeline_hovered: false,
@@ -407,6 +425,7 @@ impl App {
         match message {
             Message::Tick => {
                 self.now = Local::now();
+                let had_notifications = !self.snapshot.notifications.is_empty();
                 let mut snapshot = self.sampler.snapshot();
                 reconcile_media_state(
                     &mut snapshot.media,
@@ -414,6 +433,14 @@ impl App {
                     Instant::now(),
                 );
                 self.snapshot = snapshot;
+                let has_notifications = !self.snapshot.notifications.is_empty();
+                transition_clear_button_for_notification_change(
+                    &mut self.clear_button_animation,
+                    had_notifications,
+                    has_notifications,
+                    self.clearing_notifications,
+                    Instant::now(),
+                );
                 self.dismissing_notifications.retain(|dismissal| {
                     self.snapshot
                         .notifications
@@ -526,35 +553,68 @@ impl App {
                 let was_animating = self.animations_active();
                 self.notification_expansion.advance(now);
                 self.notification_group_expansion.advance(now);
+                self.clear_button_animation.advance(now);
                 self.notification_scroll.advance(now);
-                let mut completed_dismissals = Vec::new();
-                self.dismissing_notifications.retain_mut(|dismissal| {
+                for dismissal in &mut self.dismissing_notifications {
                     dismissal.animation.advance(now);
-                    let completed =
-                        !dismissal.animation.is_animating() && dismissal.animation.target == 1.0;
-                    if completed {
-                        completed_dismissals
-                            .push((dismissal.key.clone(), dismissal.source.clone()));
-                    }
-                    !completed
-                });
+                }
 
-                for (key, source) in completed_dismissals {
-                    self.sampler
-                        .dismiss_notification(&key.app_name, key.timestamp);
-                    self.snapshot
-                        .notifications
-                        .retain(|notification| !key.matches(notification));
-                    if self.expanded_notification.as_ref() == Some(&key) {
-                        self.expanded_notification = None;
-                        self.notification_expansion.reset();
-                    }
-                    if self.expanded_notification_group.as_deref() == Some(&source)
-                        && notification_group_size(&self.snapshot, &source) < 2
-                    {
+                if self.clearing_notifications {
+                    let rows_completed = self.dismissing_notifications.iter().all(|dismissal| {
+                        !dismissal.animation.is_animating() && dismissal.animation.target == 1.0
+                    });
+                    let clear_completed = rows_completed
+                        && !self.clear_button_animation.is_animating()
+                        && self.clear_button_animation.target == 0.0;
+                    if clear_completed {
+                        self.sampler.clear_notifications();
+                        self.snapshot.notifications.clear();
                         self.expanded_notification_group = None;
+                        self.expanded_notification = None;
+                        self.hovered_notification = None;
                         self.notification_group_expansion.reset();
+                        self.notification_expansion.reset();
+                        self.dismissing_notifications.clear();
+                        self.clearing_notifications = false;
+                        self.notification_scroll = ScrollAnimation::default();
                     }
+                } else {
+                    let had_notifications = !self.snapshot.notifications.is_empty();
+                    let mut completed_dismissals = Vec::new();
+                    self.dismissing_notifications.retain(|dismissal| {
+                        let completed = !dismissal.animation.is_animating()
+                            && dismissal.animation.target == 1.0;
+                        if completed {
+                            completed_dismissals
+                                .push((dismissal.key.clone(), dismissal.source.clone()));
+                        }
+                        !completed
+                    });
+
+                    for (key, source) in completed_dismissals {
+                        self.sampler
+                            .dismiss_notification(&key.app_name, key.timestamp);
+                        self.snapshot
+                            .notifications
+                            .retain(|notification| !key.matches(notification));
+                        if self.expanded_notification.as_ref() == Some(&key) {
+                            self.expanded_notification = None;
+                            self.notification_expansion.reset();
+                        }
+                        if self.expanded_notification_group.as_deref() == Some(&source)
+                            && notification_group_size(&self.snapshot, &source) < 2
+                        {
+                            self.expanded_notification_group = None;
+                            self.notification_group_expansion.reset();
+                        }
+                    }
+                    transition_clear_button_for_notification_change(
+                        &mut self.clear_button_animation,
+                        had_notifications,
+                        !self.snapshot.notifications.is_empty(),
+                        false,
+                        now,
+                    );
                 }
 
                 if self.notification_expansion.is_collapsed() {
@@ -582,19 +642,20 @@ impl App {
                 }
             }
             Message::ClearNotifications => {
-                self.sampler.clear_notifications();
-                self.snapshot.notifications.clear();
-                self.expanded_notification_group = None;
-                self.expanded_notification = None;
-                self.notification_group_expansion.reset();
-                self.notification_expansion.reset();
-                self.dismissing_notifications.clear();
-                self.notification_scroll = ScrollAnimation::default();
-                let target = desired_surface_height(&self.config, &self.snapshot);
-                if target != self.surface_height {
-                    self.surface_height = target;
-                    tasks.push(set_surface_regions(self.surface_id, target, self.frosted));
+                if self.snapshot.notifications.is_empty() || self.clearing_notifications {
+                    return Task::none();
                 }
+
+                let now = Instant::now();
+                self.dismissing_notifications = self
+                    .snapshot
+                    .notifications
+                    .iter()
+                    .map(|notification| DismissingNotification::new(notification, now))
+                    .collect();
+                self.clearing_notifications = true;
+                self.clear_button_animation.transition_to(0.0, now);
+                self.hovered_notification = None;
             }
             Message::ToggleNotificationGroup { source } => {
                 let now = Instant::now();
@@ -651,6 +712,9 @@ impl App {
                 app_name,
                 timestamp,
             } => {
+                if self.clearing_notifications {
+                    return Task::none();
+                }
                 let key = NotificationKey {
                     app_name,
                     timestamp,
@@ -662,23 +726,16 @@ impl App {
                 {
                     return Task::none();
                 }
-                let Some(source) = self
+                let Some(notification) = self
                     .snapshot
                     .notifications
                     .iter()
                     .find(|notification| key.matches(notification))
-                    .map(notification_source)
-                    .map(str::to_string)
                 else {
                     return Task::none();
                 };
-                let mut animation = ExpansionAnimation::default();
-                animation.transition_to(1.0, Instant::now());
-                self.dismissing_notifications.push(DismissingNotification {
-                    key,
-                    source,
-                    animation,
-                });
+                self.dismissing_notifications
+                    .push(DismissingNotification::new(notification, Instant::now()));
             }
             Message::NotificationHoverChanged {
                 app_name,
@@ -858,6 +915,8 @@ impl App {
             self.notification_group_expansion.target > 0.0,
             self.notification_expansion.progress,
             &self.dismissing_notifications,
+            self.clearing_notifications,
+            self.clear_button_animation.progress,
             self.notification_scroll.translation(),
             self.surface_height,
             self.media_seek_preview,
@@ -911,6 +970,7 @@ impl App {
                 .dismissing_notifications
                 .iter()
                 .any(|dismissal| dismissal.animation.is_animating())
+            || self.clear_button_animation.is_animating()
             || self.notification_scroll.is_animating()
     }
 
@@ -1314,6 +1374,20 @@ fn notification_source(notification: &crate::notifications::Notification) -> &st
     }
 }
 
+fn transition_clear_button_for_notification_change(
+    animation: &mut ExpansionAnimation,
+    had_notifications: bool,
+    has_notifications: bool,
+    clearing_notifications: bool,
+    now: Instant,
+) {
+    if clearing_notifications || had_notifications == has_notifications {
+        return;
+    }
+
+    animation.transition_to(if has_notifications { 1.0 } else { 0.0 }, now);
+}
+
 fn notification_group_size(snapshot: &SystemSnapshot, source: &str) -> usize {
     snapshot
         .notifications
@@ -1459,6 +1533,7 @@ mod tests {
         delay_until_next_tick, desired_surface_height, desired_surface_height_with_expansion,
         dragged_overlay_position, notification_viewport_height_with_animation,
         reconcile_media_state, rounded_surface_regions,
+        transition_clear_button_for_notification_change,
     };
     use crate::battery::BatteryDevice;
     use crate::config::{Config, WidgetSection};
@@ -1668,6 +1743,35 @@ mod tests {
 
         animation.transition_to(0.0, started + NOTIFICATION_EXPANSION_DURATION / 2);
         animation.advance(started + NOTIFICATION_EXPANSION_DURATION * 2);
+        assert_eq!(animation.progress, 0.0);
+        assert!(animation.is_collapsed());
+    }
+
+    #[test]
+    fn clear_button_growth_reverses_when_notifications_disappear() {
+        let started = Instant::now();
+        let mut animation = ExpansionAnimation::default();
+
+        transition_clear_button_for_notification_change(
+            &mut animation,
+            false,
+            true,
+            false,
+            started,
+        );
+        animation.advance(started + NOTIFICATION_EXPANSION_DURATION / 2);
+        assert!((animation.progress - 0.5).abs() < 0.01);
+
+        let reversed_at = started + NOTIFICATION_EXPANSION_DURATION / 2;
+        transition_clear_button_for_notification_change(
+            &mut animation,
+            true,
+            false,
+            false,
+            reversed_at,
+        );
+        animation.advance(reversed_at + NOTIFICATION_EXPANSION_DURATION / 2);
+
         assert_eq!(animation.progress, 0.0);
         assert!(animation.is_collapsed());
     }
