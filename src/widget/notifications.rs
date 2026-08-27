@@ -91,7 +91,7 @@ pub struct Notification {
     pub body: String,
     /// Unix timestamp when notification was captured (seconds since epoch)
     pub timestamp: u64,
-    /// Verified local directory that can be opened for this notification.
+    /// Verified local file or directory that can be revealed for this notification.
     #[serde(default)]
     pub open_folder: Option<PathBuf>,
     /// Validated notification-server action that opens the originating item.

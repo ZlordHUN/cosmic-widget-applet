@@ -23,7 +23,7 @@ use cosmic::iced::platform_specific::shell::commands::{blur, corner_radius};
 use cosmic::iced::{self, Color, Point, Rectangle, Size, Subscription, Task, window};
 use futures_util::SinkExt;
 use stats::{StatsSampler, SystemSnapshot};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "com.github.zoliviragh.CosmicWidget.Iced";
@@ -990,15 +990,45 @@ impl App {
     }
 }
 
-async fn open_notification_folder(folder: PathBuf) -> Result<(), String> {
-    if !folder.is_dir() {
+async fn open_notification_folder(target: PathBuf) -> Result<(), String> {
+    if target.is_file() {
+        let cosmic_files = tokio::process::Command::new("cosmic-files")
+            .arg(&target)
+            .status()
+            .await;
+        if cosmic_files
+            .as_ref()
+            .is_ok_and(std::process::ExitStatus::success)
+        {
+            return Ok(());
+        }
+
+        let parent = target
+            .parent()
+            .filter(|path| path.is_dir())
+            .ok_or_else(|| format!("{} does not have an accessible parent", target.display()))?;
+        return open_directory(parent).await.map_err(|fallback_error| {
+            let cosmic_error = match cosmic_files {
+                Ok(status) => format!("cosmic-files exited with {status}"),
+                Err(error) => format!("could not start cosmic-files: {error}"),
+            };
+            format!("{cosmic_error}; {fallback_error}")
+        });
+    }
+
+    if !target.is_dir() {
         return Err(format!(
-            "{} is not an accessible directory",
-            folder.display()
+            "{} is not an accessible file or directory",
+            target.display()
         ));
     }
+
+    open_directory(&target).await
+}
+
+async fn open_directory(directory: &Path) -> Result<(), String> {
     let status = tokio::process::Command::new("xdg-open")
-        .arg(&folder)
+        .arg(directory)
         .status()
         .await
         .map_err(|error| format!("could not start xdg-open: {error}"))?;

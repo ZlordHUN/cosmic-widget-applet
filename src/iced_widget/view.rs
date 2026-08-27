@@ -556,6 +556,8 @@ fn notifications_view<'a>(
                 for notification in group.notifications {
                     let expanded = expanded_notification
                         .is_some_and(|selected| selected.matches(notification));
+                    let hovered =
+                        hovered_notification.is_some_and(|selected| selected.matches(notification));
                     let dismissal_progress =
                         notification_dismissal_progress(dismissing_notifications, notification);
                     let extra_height = if expanded {
@@ -571,8 +573,8 @@ fn notifications_view<'a>(
                             notification,
                             expanded,
                             dismissal_progress.is_some(),
-                            false,
-                            false,
+                            true,
+                            hovered,
                             now_timestamp,
                             item_spacing,
                         ),
