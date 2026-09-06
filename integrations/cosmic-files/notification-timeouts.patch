@@ -1,0 +1,303 @@
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -28,11 +28,22 @@
+ use enumflags2::BitFlags;
+ use iced::Alignment;
+ use std::borrow::Cow;
+-use std::collections::VecDeque;
++use std::collections::{HashMap, VecDeque};
+ use std::time::Duration;
+ use tokio::sync::mpsc;
+ 
+ static NOTIFICATIONS_APPLET: &str = "com.system76.CosmicAppletNotifications";
++
++fn notification_timeout(notification: &Notification, config: &NotificationsConfig) -> Duration {
++    let timeout = u32::try_from(notification.expire_timeout).unwrap_or(3000);
++    let max_timeout = match notification.urgency() {
++        2 => config.max_timeout_urgent,
++        1 => config.max_timeout_normal,
++        _ => config.max_timeout_low,
++    }
++    .unwrap_or(timeout);
++    Duration::from_millis(u64::from(timeout.min(max_timeout)))
++}
+ 
+ pub fn run() -> cosmic::iced::Result {
+     cosmic::app::run::<CosmicNotifications>(
+@@ -55,6 +66,8 @@
+     window_id: SurfaceId,
+     cards: Vec<Notification>,
+     hidden: VecDeque<Notification>,
++    timeout_generations: HashMap<u32, u64>,
++    next_timeout_generation: u64,
+     notifications_id: id::Id,
+     notifications_tx: Option<mpsc::Sender<notifications::Input>>,
+     config: NotificationsConfig,
+@@ -70,7 +83,7 @@
+     ActivationToken(Option<String>, u32, Option<ActionId>),
+     Dismissed(u32),
+     Notification(notifications::Event),
+-    Timeout(u32),
++    Timeout(u32, u64),
+     Config(NotificationsConfig),
+     PanelConfig(CosmicPanelConfig),
+     DockConfig(CosmicPanelConfig),
+@@ -81,6 +94,7 @@
+ 
+ impl CosmicNotifications {
+     fn expire(&mut self, i: u32) -> Task<Message> {
++        self.timeout_generations.remove(&i);
+         let Some((c_pos, _)) = self.cards.iter().enumerate().find(|(_, n)| n.id == i) else {
+             return Task::none();
+         };
+@@ -102,6 +116,7 @@
+     }
+ 
+     fn close(&mut self, i: u32, reason: CloseReason) -> Option<Task<Message>> {
++        self.timeout_generations.remove(&i);
+         let c_pos = self.cards.iter().position(|n| n.id == i);
+         let notification = c_pos.map(|c_pos| self.cards.remove(c_pos)).or_else(|| {
+             self.hidden
+@@ -266,29 +281,29 @@
+             .unwrap_or((Anchor::TOP, None))
+     }
+ 
++    fn schedule_timeout(&mut self, notification: &Notification) -> Task<Message> {
++        // Replacing a card also replaces its lifetime. Invalidate any already queued
++        // timeout, including when the replacement requests an indefinite lifetime.
++        let id = notification.id;
++        self.timeout_generations.remove(&id);
++        let timeout = notification_timeout(notification, &self.config);
++        if timeout.is_zero() {
++            return Task::none();
++        }
++
++        let generation = self.next_timeout_generation;
++        self.next_timeout_generation = self.next_timeout_generation.wrapping_add(1);
++        self.timeout_generations.insert(id, generation);
++        iced::Task::perform(tokio::time::sleep(timeout), move |_| {
++            cosmic::action::app(Message::Timeout(id, generation))
++        })
++    }
++
+     fn push_notification(
+         &mut self,
+         notification: Notification,
+     ) -> Task<<CosmicNotifications as cosmic::app::Application>::Message> {
+-        let mut timeout = u32::try_from(notification.expire_timeout).unwrap_or(3000);
+-        let max_timeout = if notification.urgency() == 2 {
+-            self.config.max_timeout_urgent
+-        } else if notification.urgency() == 1 {
+-            self.config.max_timeout_normal
+-        } else {
+-            self.config.max_timeout_low
+-        }
+-        .unwrap_or(u32::try_from(notification.expire_timeout).unwrap_or(3000));
+-        timeout = timeout.min(max_timeout);
+-
+-        let mut tasks = vec![if timeout > 0 {
+-            iced::Task::perform(
+-                tokio::time::sleep(Duration::from_millis(timeout as u64)),
+-                move |_| cosmic::action::app(Message::Timeout(notification.id)),
+-            )
+-        } else {
+-            iced::Task::none()
+-        }];
++        let mut tasks = vec![self.schedule_timeout(&notification)];
+ 
+         if self.cards.is_empty() && !self.config.do_not_disturb {
+             let (anchor, _output) = self.anchor.clone().unwrap_or((Anchor::TOP, None));
+@@ -624,9 +639,10 @@
+     }
+ 
+     fn replace_notification(&mut self, notification: Notification) -> Task<Message> {
+-        if let Some(notif) = self.cards.iter_mut().find(|n| n.id == notification.id) {
+-            *notif = notification;
+-            Task::none()
++        if let Some(pos) = self.cards.iter().position(|n| n.id == notification.id) {
++            let task = self.schedule_timeout(&notification);
++            self.cards[pos] = notification;
++            task
+         } else {
+             tracing::error!("Notification not found... pushing instead");
+             self.push_notification(notification)
+@@ -730,6 +746,8 @@
+                 notifications_tx: None,
+                 cards: Vec::with_capacity(50),
+                 hidden: VecDeque::new(),
++                timeout_generations: HashMap::new(),
++                next_timeout_generation: 0,
+                 popups: Vec::with_capacity(3),
+             },
+             Task::none(),
+@@ -790,7 +808,10 @@
+                     return c;
+                 }
+             }
+-            Message::Timeout(id) => {
++            Message::Timeout(id, generation) => {
++                if self.timeout_generations.get(&id) != Some(&generation) {
++                    return Task::none();
++                }
+                 let mut tasks = Vec::with_capacity(2);
+                 tasks.push(self.expire(id));
+                 if self.cards.is_empty() && self.active_surface {
+@@ -900,3 +921,158 @@
+         ])
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use cosmic::iced::futures::StreamExt;
++    use cosmic_notifications_util::Hint;
++    use std::time::SystemTime;
++
++    fn app() -> CosmicNotifications {
++        CosmicNotifications {
++            core: Core::default(),
++            active_surface: false,
++            window_id: SurfaceId::unique(),
++            cards: Vec::new(),
++            hidden: VecDeque::new(),
++            timeout_generations: HashMap::new(),
++            next_timeout_generation: 0,
++            notifications_id: id::Id::unique(),
++            notifications_tx: None,
++            config: NotificationsConfig {
++                do_not_disturb: true,
++                max_notifications: 0,
++                max_timeout_normal: Some(12),
++                ..NotificationsConfig::default()
++            },
++            dock_config: CosmicPanelConfig::default(),
++            panel_config: CosmicPanelConfig::default(),
++            anchor: None,
++            popups: Vec::new(),
++        }
++    }
++
++    fn notification(expire_timeout: i32, summary: &str) -> Notification {
++        Notification {
++            id: 42,
++            app_name: "Transfer timeout regression".into(),
++            app_icon: String::new(),
++            summary: summary.into(),
++            body: String::new(),
++            actions: Vec::new(),
++            hints: Vec::new(),
++            expire_timeout,
++            time: SystemTime::now(),
++        }
++    }
++
++    async fn timeout_message(task: Task<Message>) -> Message {
++        let mut stream = iced::runtime::task::into_stream(task)
++            .expect("a finite notification lifetime must schedule a task");
++        match tokio::time::timeout(Duration::from_secs(1), stream.next())
++            .await
++            .expect("notification timeout did not run")
++        {
++            Some(iced::runtime::Action::Output(cosmic::Action::App(
++                message @ Message::Timeout(..),
++            ))) => message,
++            other => panic!("expected notification timeout, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn persistent_transfer_completion_expires_and_keeps_history() {
++        for timeout in [-1, 12] {
++            let mut app = app();
++            let _ = app.push_notification(notification(0, "Copying"));
++            assert!(app.timeout_generations.is_empty());
++
++            let task = app.replace_notification(notification(timeout, "Copy complete"));
++            let message = timeout_message(task).await;
++            let _ = app.update(message);
++
++            assert!(app.cards.is_empty());
++            assert!(app.timeout_generations.is_empty());
++            assert_eq!(app.hidden.len(), 1);
++            assert_eq!(app.hidden[0].summary, "Copy complete");
++        }
++    }
++
++    #[tokio::test]
++    async fn replacement_restarts_timeout_and_ignores_previous_timer() {
++        let mut app = app();
++        let old = app.push_notification(notification(1, "First"));
++        let replacement = app.replace_notification(notification(12, "Updated"));
++
++        let _ = app.update(timeout_message(old).await);
++        assert_eq!(app.cards.len(), 1);
++        assert_eq!(app.cards[0].summary, "Updated");
++        assert!(app.hidden.is_empty());
++
++        let _ = app.update(timeout_message(replacement).await);
++        assert!(app.cards.is_empty());
++        assert_eq!(app.hidden[0].summary, "Updated");
++    }
++
++    #[tokio::test]
++    async fn persistent_replacement_cancels_previous_timeout() {
++        let mut app = app();
++        let old = app.push_notification(notification(1, "Starting"));
++        let replacement = app.replace_notification(notification(0, "Copying"));
++        assert!(iced::runtime::task::into_stream(replacement).is_none());
++
++        let _ = app.update(timeout_message(old).await);
++        assert_eq!(app.cards.len(), 1);
++        assert_eq!(app.cards[0].summary, "Copying");
++        assert!(app.hidden.is_empty());
++        assert!(app.timeout_generations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn close_clears_timeout_without_reusing_its_generation() {
++        let mut app = app();
++        let old = app.push_notification(notification(1, "First"));
++        let _ = app.close(42, CloseReason::CloseNotification);
++        assert!(app.timeout_generations.is_empty());
++
++        let replacement = app.push_notification(notification(12, "Reused id"));
++        let _ = app.update(timeout_message(old).await);
++        assert_eq!(app.cards.len(), 1);
++        assert!(app.hidden.is_empty());
++
++        let _ = app.update(timeout_message(replacement).await);
++        assert!(app.cards.is_empty());
++        assert_eq!(app.hidden[0].summary, "Reused id");
++        let _ = app.close(42, CloseReason::Dismissed);
++        assert!(app.hidden.is_empty());
++        assert!(app.timeout_generations.is_empty());
++    }
++
++    #[test]
++    fn timeout_preserves_default_explicit_and_urgency_limits() {
++        let config = NotificationsConfig {
++            max_timeout_low: Some(1000),
++            max_timeout_normal: Some(2000),
++            max_timeout_urgent: None,
++            ..NotificationsConfig::default()
++        };
++        for (urgency, expected_default, expected_long) in
++            [(0, 1000, 1000), (1, 2000, 2000), (2, 3000, 8000)]
++        {
++            for (timeout, expected) in [
++                (0, 0),
++                (-1, expected_default),
++                (100, 100),
++                (8000, expected_long),
++            ] {
++                let mut notification = notification(timeout, "Timeout policy");
++                notification.hints.push(Hint::Urgency(urgency));
++                assert_eq!(
++                    notification_timeout(&notification, &config),
++                    Duration::from_millis(expected)
++                );
++            }
++        }
++    }
++}

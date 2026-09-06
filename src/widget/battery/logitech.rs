@@ -3,7 +3,9 @@
 //! Native Logitech battery readers for Linux power supplies and HID++ devices.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -31,6 +33,7 @@ const POWER_SUPPLY_ROOT: &str = "/sys/class/power_supply";
 const HIDPP_SOFTWARE_ID: u16 = 0;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_UNCONFIRMED_LEVEL_CHANGE: u8 = 15;
+const MAX_BATTERY_EVENT_REPORTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BatteryState {
@@ -45,6 +48,7 @@ pub(super) struct BatteryState {
 struct HidppDevice {
     slot: u8,
     name: String,
+    pairing_name: Option<String>,
     kind: Option<String>,
     battery_protocol: BatteryProtocol,
     centurion: Option<centurion::Device>,
@@ -56,9 +60,16 @@ struct MonitoredEndpoint {
     devices: Vec<HidppDevice>,
 }
 
+struct EventEndpoint {
+    endpoint: HidrawEndpoint,
+    handle: File,
+}
+
 pub(super) struct Monitor {
     endpoints: Vec<MonitoredEndpoint>,
+    event_endpoints: Vec<EventEndpoint>,
     last_readings: HashMap<String, BatteryReading>,
+    pending_event_readings: HashMap<String, BatteryReading>,
     last_discovery: Option<Instant>,
 }
 
@@ -66,7 +77,9 @@ impl Monitor {
     pub(super) fn new() -> Self {
         Self {
             endpoints: Vec::new(),
+            event_endpoints: Vec::new(),
             last_readings: HashMap::new(),
+            pending_event_readings: HashMap::new(),
             last_discovery: None,
         }
     }
@@ -78,11 +91,14 @@ impl Monitor {
             .last_discovery
             .is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL);
         if discovery_due {
-            let discovered = discover_endpoints(&states);
+            let present_endpoints = sysfs::discover_hidpp_endpoints();
+            self.reconcile_event_endpoints(&present_endpoints);
+            let discovered =
+                discover_endpoints_with_known(&states, &present_endpoints, &self.endpoints);
             self.endpoints = reconcile_discovered_endpoints(
                 std::mem::take(&mut self.endpoints),
                 discovered,
-                Path::exists,
+                |endpoint| present_endpoints.contains(endpoint),
             );
             self.last_discovery = self
                 .endpoints
@@ -98,8 +114,11 @@ impl Monitor {
                 .collect();
             self.last_readings
                 .retain(|name, _| active_names.iter().any(|active| active == name));
+            self.pending_event_readings
+                .retain(|name, _| active_names.iter().any(|active| active == name));
         }
 
+        self.read_battery_events(&mut states);
         for endpoint in &mut self.endpoints {
             let Ok(mut handle) = open_hidraw(&endpoint.endpoint.path) else {
                 continue;
@@ -112,31 +131,170 @@ impl Monitor {
                     self.last_readings.get(&identity),
                 );
                 let reading_is_live = reading.is_ok();
+                if reading_is_live {
+                    self.pending_event_readings.remove(&identity);
+                }
                 if let Some(state) = state_from_reading(device, reading, &mut self.last_readings) {
                     upsert_state(&mut states, state, reading_is_live);
                 }
             }
         }
+        self.read_battery_events(&mut states);
 
         states
     }
+
+    fn reconcile_event_endpoints(&mut self, present_endpoints: &[HidrawEndpoint]) {
+        self.event_endpoints
+            .retain(|listener| present_endpoints.contains(&listener.endpoint));
+        for endpoint in present_endpoints {
+            if matches!(endpoint.kind, EndpointKind::Centurion(_))
+                || self
+                    .event_endpoints
+                    .iter()
+                    .any(|listener| listener.endpoint == *endpoint)
+            {
+                continue;
+            }
+            // Keep an independent hidraw input queue open between polls. Request
+            // handles deliberately drain unrelated reports and cannot retain the
+            // battery event a keyboard emits before going back to sleep.
+            if let Ok(handle) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&endpoint.path)
+            {
+                self.event_endpoints.push(EventEndpoint {
+                    endpoint: endpoint.clone(),
+                    handle,
+                });
+            }
+        }
+    }
+
+    fn read_battery_events(&mut self, states: &mut Vec<BatteryState>) {
+        let mut closed = false;
+        self.event_endpoints.retain_mut(|listener| {
+            let devices = self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.endpoint == listener.endpoint)
+                .map(|endpoint| endpoint.devices.as_slice())
+                .unwrap_or_default();
+            let present = drain_battery_events(
+                &mut listener.handle,
+                devices,
+                &mut self.last_readings,
+                &mut self.pending_event_readings,
+                states,
+            );
+            closed |= !present;
+            present
+        });
+        if closed {
+            self.last_discovery = None;
+        }
+    }
+}
+
+fn drain_battery_events(
+    handle: &mut impl Read,
+    devices: &[HidppDevice],
+    last_readings: &mut HashMap<String, BatteryReading>,
+    pending_readings: &mut HashMap<String, BatteryReading>,
+    states: &mut Vec<BatteryState>,
+) -> bool {
+    for _ in 0..MAX_BATTERY_EVENT_REPORTS {
+        let mut report = [0; 64];
+        let read = match handle.read(&mut report) {
+            Ok(0) => return false,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        for device in devices {
+            let Some(reading) = parse_battery_notification(device, &report[..read]) else {
+                continue;
+            };
+            if let Some(state) =
+                apply_battery_notification(device, reading, last_readings, pending_readings)
+            {
+                upsert_state(states, state, true);
+            }
+        }
+    }
+    true
+}
+
+fn parse_battery_notification(device: &HidppDevice, report: &[u8]) -> Option<BatteryReading> {
+    match report.first() {
+        Some(0x10) if report.len() == 7 => {}
+        Some(0x11) if report.len() == 20 => {}
+        _ => return None,
+    }
+    if (report[1] != device.slot && !(device.slot == 0xff && report[1] == 0)) || report[3] != 0 {
+        return None;
+    }
+    let BatteryProtocol::Hidpp20 { feature, index } = device.battery_protocol else {
+        return None;
+    };
+    if index == 0 || report[2] != index {
+        return None;
+    }
+    match feature {
+        BatteryFeature::Status | BatteryFeature::Voltage | BatteryFeature::AdcMeasurement => {}
+        BatteryFeature::Unified if report.len() >= 8 => {}
+        _ => return None,
+    }
+    feature.parse(&report[4..]).ok()
+}
+
+fn apply_battery_notification(
+    device: &HidppDevice,
+    mut reading: BatteryReading,
+    last_readings: &mut HashMap<String, BatteryReading>,
+    pending_readings: &mut HashMap<String, BatteryReading>,
+) -> Option<BatteryState> {
+    let identity = device_identity(&device.name);
+    if let Some(previous) = last_readings.get(&identity)
+        && needs_confirmation(previous, &reading)
+    {
+        let confirmed = pending_readings
+            .remove(&identity)
+            .and_then(|first| confirm_repeated_reading(previous, first, reading.clone()).ok());
+        if let Some(confirmed) = confirmed {
+            reading = confirmed;
+        } else {
+            pending_readings.insert(identity, reading.clone());
+            // Confirm suspicious percentages independently: a valid status
+            // event must still update the charging indicator immediately.
+            reading.level = previous.level;
+            return state_from_reading(device, Ok(reading), last_readings);
+        }
+    }
+    pending_readings.remove(&identity);
+    state_from_reading(device, Ok(reading), last_readings)
 }
 
 fn reconcile_discovered_endpoints(
     current: Vec<MonitoredEndpoint>,
     mut discovered: Vec<MonitoredEndpoint>,
-    endpoint_is_present: impl Fn(&Path) -> bool,
+    endpoint_is_present: impl Fn(&HidrawEndpoint) -> bool,
 ) -> Vec<MonitoredEndpoint> {
     for previous_endpoint in current {
         let Some(fresh_endpoint) = discovered
             .iter_mut()
             .find(|fresh| fresh.endpoint.path == previous_endpoint.endpoint.path)
         else {
-            if endpoint_is_present(&previous_endpoint.endpoint.path) {
+            if endpoint_is_present(&previous_endpoint.endpoint) {
                 discovered.push(previous_endpoint);
             }
             continue;
         };
+        if fresh_endpoint.endpoint != previous_endpoint.endpoint {
+            continue;
+        }
 
         for previous_device in previous_endpoint.devices {
             if let Some(index) = fresh_endpoint
@@ -145,8 +303,10 @@ fn reconcile_discovered_endpoints(
                 .position(|fresh| fresh.slot == previous_device.slot)
             {
                 let fresh_device = fresh_endpoint.devices[index].clone();
-                fresh_endpoint.devices[index] =
-                    prefer_discovered_device(Some(previous_device), fresh_device);
+                if same_pairing(&previous_device, &fresh_device) {
+                    fresh_endpoint.devices[index] =
+                        prefer_discovered_device(Some(previous_device), fresh_device);
+                }
             } else {
                 fresh_endpoint.devices.push(previous_device);
             }
@@ -316,9 +476,19 @@ fn infer_kind(name: &str) -> Option<String> {
     Some(kind.to_string())
 }
 
+#[cfg(test)]
 fn discover_endpoints(power_supply_states: &[BatteryState]) -> Vec<MonitoredEndpoint> {
-    sysfs::discover_hidpp_endpoints()
-        .into_iter()
+    discover_endpoints_with_known(power_supply_states, &sysfs::discover_hidpp_endpoints(), &[])
+}
+
+fn discover_endpoints_with_known(
+    power_supply_states: &[BatteryState],
+    present_endpoints: &[HidrawEndpoint],
+    known: &[MonitoredEndpoint],
+) -> Vec<MonitoredEndpoint> {
+    present_endpoints
+        .iter()
+        .cloned()
         .filter_map(|endpoint| {
             let mut handle = open_hidraw(&endpoint.path).ok()?;
             if let EndpointKind::Centurion(report) = endpoint.kind {
@@ -330,6 +500,7 @@ fn discover_endpoints(power_supply_states: &[BatteryState]) -> Vec<MonitoredEndp
                         slot: 0xff,
                         kind: Some("headset".to_string()),
                         name,
+                        pairing_name: None,
                         battery_protocol: BatteryProtocol::Unknown,
                         centurion: Some(device),
                     }],
@@ -355,14 +526,65 @@ fn discover_endpoints(power_supply_states: &[BatteryState]) -> Vec<MonitoredEndp
                 EndpointKind::Centurion(_) => unreachable!(),
             };
             drop(handle);
-            let devices = paired
-                .into_iter()
-                .filter_map(|paired| discover_device_with_retries(&endpoint, paired))
-                .collect();
+            let devices =
+                discover_paired_devices(&endpoint, paired, known, discover_device_with_retries);
 
             Some(MonitoredEndpoint { endpoint, devices })
         })
         .collect()
+}
+
+fn discover_paired_devices(
+    endpoint: &HidrawEndpoint,
+    paired: Vec<PairedDevice>,
+    known: &[MonitoredEndpoint],
+    mut discover: impl FnMut(&HidrawEndpoint, PairedDevice) -> Option<HidppDevice>,
+) -> Vec<HidppDevice> {
+    let previous = known.iter().find(|known| known.endpoint == *endpoint);
+    paired
+        .into_iter()
+        .filter_map(|paired| {
+            // Feature indices and device names are stable for a paired device.
+            // Re-querying them on every scan stalls battery polling when another
+            // paired device sleeps. Receiver metadata still detects changed slots.
+            let resolved = previous.and_then(|previous| {
+                previous.devices.iter().find(|device| {
+                    device.battery_protocol != BatteryProtocol::Unknown
+                        && device.slot == paired.slot
+                        && pairing_names_match(
+                            device.pairing_name.as_deref(),
+                            paired.name.as_deref(),
+                        )
+                        && compatible_device_kinds(&device.kind, &paired.kind)
+                })
+            });
+            resolved.cloned().or_else(|| discover(endpoint, paired))
+        })
+        .collect()
+}
+
+fn pairing_names_match(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            device_name_quality(left) > 0
+                && device_name_quality(right) > 0
+                && same_device_name(left, right)
+        }
+        _ => false,
+    }
+}
+
+fn compatible_device_kinds(left: &Option<String>, right: &Option<String>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => true,
+    }
+}
+
+fn same_pairing(left: &HidppDevice, right: &HidppDevice) -> bool {
+    left.slot == right.slot
+        && pairing_names_match(left.pairing_name.as_deref(), right.pairing_name.as_deref())
+        && compatible_device_kinds(&left.kind, &right.kind)
 }
 
 fn discover_device_with_retries(
@@ -412,6 +634,7 @@ fn prefer_discovered_device(current: Option<HidppDevice>, candidate: HidppDevice
 
 fn discover_device(handle: &mut File, paired: PairedDevice) -> HidppDevice {
     let slot = paired.slot;
+    let pairing_name = paired.name.clone();
     let name_feature = feature_index(handle, slot, DEVICE_NAME_FEATURE).ok();
     let friendly_name_feature = feature_index(handle, slot, DEVICE_FRIENDLY_NAME_FEATURE).ok();
     let queried_name = name_feature
@@ -442,6 +665,7 @@ fn discover_device(handle: &mut File, paired: PairedDevice) -> HidppDevice {
     HidppDevice {
         slot,
         name,
+        pairing_name,
         kind,
         battery_protocol,
         centurion: None,
@@ -645,12 +869,15 @@ fn upsert_state(states: &mut Vec<BatteryState>, state: BatteryState, prefer_read
 
 #[cfg(test)]
 mod tests {
+    use super::receiver::PairedDevice;
     use super::sysfs::{Bus, EndpointKind, HidrawEndpoint, ReceiverKind};
     use super::{BatteryProtocol, BatteryReading};
     use super::{
-        BatteryState, HidppDevice, MonitoredEndpoint, confirm_repeated_reading, device_identity,
-        device_name_quality, infer_kind, needs_confirmation, readings_agree,
-        reconcile_discovered_endpoints, same_device_name, state_from_reading, upsert_state,
+        BatteryState, HidppDevice, MAX_BATTERY_EVENT_REPORTS, MonitoredEndpoint,
+        apply_battery_notification, confirm_repeated_reading, device_identity, device_name_quality,
+        discover_paired_devices, drain_battery_events, infer_kind, needs_confirmation,
+        parse_battery_notification, readings_agree, reconcile_discovered_endpoints,
+        same_device_name, state_from_reading, upsert_state,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -812,6 +1039,7 @@ mod tests {
         let device = HidppDevice {
             slot: 4,
             name: "MX Mechanical Mini".to_string(),
+            pairing_name: Some("KEYS".to_string()),
             kind: Some("keyboard".to_string()),
             battery_protocol: BatteryProtocol::Unknown,
             centurion: None,
@@ -836,25 +1064,310 @@ mod tests {
         assert!(sleeping.connected);
     }
 
-    #[test]
-    fn preserves_a_sleeping_receiver_device_during_rediscovery() {
-        let endpoint = HidrawEndpoint {
+    fn bolt_endpoint() -> HidrawEndpoint {
+        HidrawEndpoint {
             path: PathBuf::from("/dev/hidraw-bolt-test"),
             bus: Bus::Usb,
             product_id: 0xc548,
             name: "Logitech USB Receiver".to_string(),
             kind: EndpointKind::Receiver(ReceiverKind::Bolt),
-        };
-        let known_keyboard = HidppDevice {
+        }
+    }
+
+    fn resolved_keyboard() -> HidppDevice {
+        HidppDevice {
             slot: 1,
             name: "MX Mechanical Mini".to_string(),
+            pairing_name: Some("KEYS".to_string()),
             kind: Some("keyboard".to_string()),
             battery_protocol: BatteryProtocol::Hidpp20 {
                 feature: super::BatteryFeature::Unified,
                 index: 4,
             },
             centurion: None,
+        }
+    }
+
+    fn keyboard_pairing() -> PairedDevice {
+        PairedDevice {
+            slot: 1,
+            name: Some("KEYS".to_string()),
+            kind: Some("keyboard".to_string()),
+        }
+    }
+
+    fn keyboard_battery_event(level: u8, status: u8) -> [u8; 20] {
+        let mut report = [0; 20];
+        report[..8].copy_from_slice(&[0x11, 1, 4, 0, level, 4, status, 0]);
+        report
+    }
+
+    #[test]
+    fn accepts_only_matching_complete_battery_events() {
+        let keyboard = resolved_keyboard();
+        let report = keyboard_battery_event(20, 1);
+        assert_eq!(
+            parse_battery_notification(&keyboard, &report),
+            Some(BatteryReading {
+                level: Some(20),
+                status: Some("charging".to_string())
+            })
+        );
+        for length in 0..report.len() {
+            assert!(parse_battery_notification(&keyboard, &report[..length]).is_none());
+        }
+        for (offset, value) in [(0, 0x12), (1, 2), (2, 5), (3, 1), (3, 0x10), (6, 0xff)] {
+            let mut unrelated = report;
+            unrelated[offset] = value;
+            assert!(parse_battery_notification(&keyboard, &unrelated).is_none());
+        }
+        let unknown = HidppDevice {
+            battery_protocol: BatteryProtocol::Unknown,
+            ..keyboard
         };
+        assert!(parse_battery_notification(&unknown, &report).is_none());
+    }
+
+    #[test]
+    fn charging_and_unplug_events_update_a_sleeping_keyboard() {
+        let keyboard = resolved_keyboard();
+        let mut readings = HashMap::new();
+        let mut pending = HashMap::new();
+        state_from_reading(
+            &keyboard,
+            Ok(BatteryReading {
+                level: Some(20),
+                status: Some("discharging".to_string()),
+            }),
+            &mut readings,
+        );
+
+        for (status, expected) in [(1, "charging"), (0, "discharging")] {
+            let reading =
+                parse_battery_notification(&keyboard, &keyboard_battery_event(20, status)).unwrap();
+            let event_state =
+                apply_battery_notification(&keyboard, reading, &mut readings, &mut pending)
+                    .unwrap();
+            let sleeping =
+                state_from_reading(&keyboard, Err("device asleep".to_string()), &mut readings)
+                    .unwrap();
+            assert_eq!(event_state, sleeping);
+            assert_eq!(sleeping.level, Some(20));
+            assert_eq!(sleeping.status.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn battery_events_confirm_level_jumps_without_delaying_charging_status() {
+        let keyboard = resolved_keyboard();
+        let mut readings = HashMap::new();
+        let mut pending = HashMap::new();
+        state_from_reading(
+            &keyboard,
+            Ok(BatteryReading {
+                level: Some(20),
+                status: Some("discharging".to_string()),
+            }),
+            &mut readings,
+        );
+        let reading =
+            parse_battery_notification(&keyboard, &keyboard_battery_event(80, 1)).unwrap();
+
+        let first =
+            apply_battery_notification(&keyboard, reading.clone(), &mut readings, &mut pending)
+                .unwrap();
+        assert_eq!(first.level, Some(20));
+        assert_eq!(first.status.as_deref(), Some("charging"));
+        let confirmed =
+            apply_battery_notification(&keyboard, reading, &mut readings, &mut pending).unwrap();
+        assert_eq!(confirmed.level, Some(80));
+        assert_eq!(confirmed.status.as_deref(), Some("charging"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn bounds_event_draining_when_other_clients_keep_sending_reports() {
+        struct Flood {
+            reads: usize,
+        }
+        impl std::io::Read for Flood {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                buffer[..20].copy_from_slice(&keyboard_battery_event(20, 1));
+                Ok(20)
+            }
+        }
+        let mut flood = Flood { reads: 0 };
+        let mut states = Vec::new();
+
+        assert!(drain_battery_events(
+            &mut flood,
+            &[resolved_keyboard()],
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut states,
+        ));
+        assert_eq!(flood.reads, MAX_BATTERY_EVENT_REPORTS);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].status.as_deref(), Some("charging"));
+    }
+
+    #[test]
+    fn reuses_resolved_features_without_waking_a_paired_device() {
+        let endpoint = bolt_endpoint();
+        let keyboard = resolved_keyboard();
+        let known = vec![MonitoredEndpoint {
+            endpoint: endpoint.clone(),
+            devices: vec![keyboard.clone()],
+        }];
+
+        let devices =
+            discover_paired_devices(&endpoint, vec![keyboard_pairing()], &known, |_, _| {
+                panic!("a resolved pairing must not repeat device discovery")
+            });
+
+        assert_eq!(devices, vec![keyboard]);
+    }
+
+    #[test]
+    fn discovers_new_unknown_and_changed_pairings() {
+        let endpoint = bolt_endpoint();
+        let keyboard = resolved_keyboard();
+        let mut unknown = keyboard.clone();
+        unknown.battery_protocol = BatteryProtocol::Unknown;
+        let cases = [
+            (unknown, keyboard_pairing()),
+            (
+                keyboard.clone(),
+                PairedDevice {
+                    slot: 2,
+                    ..keyboard_pairing()
+                },
+            ),
+            (
+                keyboard.clone(),
+                PairedDevice {
+                    name: Some("MX Keys Mini".to_string()),
+                    ..keyboard_pairing()
+                },
+            ),
+            (
+                keyboard.clone(),
+                PairedDevice {
+                    name: None,
+                    ..keyboard_pairing()
+                },
+            ),
+            (
+                keyboard,
+                PairedDevice {
+                    kind: Some("mouse".to_string()),
+                    ..keyboard_pairing()
+                },
+            ),
+        ];
+
+        for (previous, paired) in cases {
+            let known = vec![MonitoredEndpoint {
+                endpoint: endpoint.clone(),
+                devices: vec![previous],
+            }];
+            let mut probes = Vec::new();
+            discover_paired_devices(&endpoint, vec![paired.clone()], &known, |_, candidate| {
+                probes.push(candidate);
+                None
+            });
+            assert_eq!(probes, vec![paired]);
+        }
+    }
+
+    #[test]
+    fn discovers_again_when_an_endpoint_changes() {
+        let endpoint = bolt_endpoint();
+        let known = vec![MonitoredEndpoint {
+            endpoint: endpoint.clone(),
+            devices: vec![resolved_keyboard()],
+        }];
+        let changed_endpoints = [
+            HidrawEndpoint {
+                path: PathBuf::from("/dev/hidraw-new"),
+                ..endpoint.clone()
+            },
+            HidrawEndpoint {
+                product_id: 0xc52b,
+                ..endpoint.clone()
+            },
+            HidrawEndpoint {
+                bus: Bus::Bluetooth,
+                ..endpoint.clone()
+            },
+            HidrawEndpoint {
+                name: "Replacement Receiver".to_string(),
+                ..endpoint.clone()
+            },
+            HidrawEndpoint {
+                kind: EndpointKind::Direct,
+                ..endpoint
+            },
+        ];
+
+        for endpoint in changed_endpoints {
+            let mut probes = Vec::new();
+            discover_paired_devices(&endpoint, vec![keyboard_pairing()], &known, |_, paired| {
+                probes.push(paired);
+                None
+            });
+            assert_eq!(probes, vec![keyboard_pairing()]);
+        }
+    }
+
+    #[test]
+    fn does_not_restore_old_features_for_a_replaced_pairing() {
+        let endpoint = bolt_endpoint();
+        let replacement = HidppDevice {
+            name: "MX Keys Mini".to_string(),
+            pairing_name: Some("MX Keys Mini".to_string()),
+            battery_protocol: BatteryProtocol::Unknown,
+            ..resolved_keyboard()
+        };
+        let current = vec![MonitoredEndpoint {
+            endpoint: endpoint.clone(),
+            devices: vec![resolved_keyboard()],
+        }];
+        let discovered = vec![MonitoredEndpoint {
+            endpoint,
+            devices: vec![replacement.clone()],
+        }];
+
+        let reconciled = reconcile_discovered_endpoints(current, discovered, |_| true);
+
+        assert_eq!(reconciled[0].devices, vec![replacement]);
+    }
+
+    #[test]
+    fn does_not_restore_devices_for_a_reused_hidraw_path() {
+        let endpoint = bolt_endpoint();
+        let current = vec![MonitoredEndpoint {
+            endpoint: endpoint.clone(),
+            devices: vec![resolved_keyboard()],
+        }];
+        let discovered = vec![MonitoredEndpoint {
+            endpoint: HidrawEndpoint {
+                product_id: 0xc52b,
+                ..endpoint
+            },
+            devices: Vec::new(),
+        }];
+
+        let reconciled = reconcile_discovered_endpoints(current, discovered, |_| true);
+
+        assert!(reconciled[0].devices.is_empty());
+    }
+
+    #[test]
+    fn preserves_a_sleeping_receiver_device_during_rediscovery() {
+        let endpoint = bolt_endpoint();
+        let known_keyboard = resolved_keyboard();
         let current = vec![MonitoredEndpoint {
             endpoint: endpoint.clone(),
             devices: vec![known_keyboard.clone()],
@@ -889,6 +1402,19 @@ mod tests {
         println!(
             "Logitech native battery states in {:?}: {states:?}",
             started.elapsed()
+        );
+        let warm_started = std::time::Instant::now();
+        let warm_states = monitor.query();
+        println!(
+            "Warm Logitech query in {:?}: {warm_states:?}",
+            warm_started.elapsed()
+        );
+        monitor.last_discovery = None;
+        let rediscovery_started = std::time::Instant::now();
+        let rediscovered_states = monitor.query();
+        println!(
+            "Logitech rediscovery in {:?}: {rediscovered_states:?}",
+            rediscovery_started.elapsed()
         );
         assert!(!states.is_empty());
         assert!(states.iter().any(|state| state.name == "G309 LIGHTSPEED"));

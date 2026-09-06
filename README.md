@@ -67,6 +67,9 @@ Only one overlay instance can run at a time.
   support for headset models newer than the built-in registry.
 - Cider's local API adds direct Apple Music polling and controls. Standard
   MPRIS players work without Cider.
+- [COSMIC Files transfer progress](integrations/cosmic-files/README.md) shows copy
+  and move progress, then updates the same notification when the operation ends.
+  This requires the included COSMIC Files companion and notification timeout patches.
 
 ## Data Locations
 

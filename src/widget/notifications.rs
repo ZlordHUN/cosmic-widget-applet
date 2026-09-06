@@ -48,6 +48,13 @@
 
 #[path = "notifications/downloads.rs"]
 mod downloads;
+#[path = "notifications/file_transfers.rs"]
+mod file_transfers;
+
+pub use file_transfers::FileTransfer;
+// The legacy renderer does not display transfer states, but shares this module.
+#[allow(unused_imports)]
+pub use file_transfers::FileTransferState;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -83,6 +90,9 @@ pub struct Notification {
     /// Unique D-Bus owner that assigned `id`; IDs must not cross daemon restarts.
     #[serde(default)]
     pub server_owner: Option<String>,
+    /// Sender connection used to retire abandoned live transfers.
+    #[serde(default)]
+    pub sender_owner: Option<String>,
     /// Application that sent the notification (e.g., "Firefox", "System")
     pub app_name: String,
     /// Notification title/headline
@@ -97,6 +107,33 @@ pub struct Notification {
     /// Validated notification-server action that opens the originating item.
     #[serde(default)]
     pub activation_action: Option<String>,
+    /// Explicit COSMIC Files copy/move progress; absent for other notifications.
+    #[serde(default)]
+    pub file_transfer: Option<FileTransfer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NotificationIdentity {
+    Remote { id: u32, server_owner: String },
+    Local { app_name: String, timestamp: u64 },
+}
+
+impl Notification {
+    pub fn identity(&self) -> NotificationIdentity {
+        match remote_notification_id(self) {
+            Some((id, server_owner)) => NotificationIdentity::Remote { id, server_owner },
+            None => NotificationIdentity::Local {
+                app_name: self.app_name.clone(),
+                timestamp: self.timestamp,
+            },
+        }
+    }
+}
+
+impl NotificationIdentity {
+    pub fn matches(&self, notification: &Notification) -> bool {
+        *self == notification.identity()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,6 +180,9 @@ pub struct NotificationMonitor {
     cache_path: Arc<PathBuf>,
     session_key: Arc<String>,
     locally_dismissed: Arc<Mutex<HashSet<(u32, String)>>>,
+    /// Transient transfers are absent from history until they finish, so their
+    /// dismissals must survive history refreshes and subsequent progress ticks.
+    dismissed_transfers: Arc<Mutex<HashSet<(u32, String)>>>,
     dbus_commands: Sender<NotificationDbusCommand>,
 }
 
@@ -178,9 +218,12 @@ impl NotificationMonitor {
         let (mut cached, retention_limit) = match cosmic_history_connection.as_ref() {
             Some(connection) => match load_cosmic_notification_history(connection) {
                 Ok(Some(mut history)) => {
-                    log::info!("Loaded {} notifications from COSMIC", history.len());
-                    preserve_notification_targets(&cached, &mut history);
-                    (history, COSMIC_NOTIFICATION_HISTORY_LIMIT)
+                    log::info!(
+                        "Loaded {} notifications from COSMIC",
+                        history.notifications.len()
+                    );
+                    preserve_notification_targets(&cached, &mut history.notifications);
+                    (history.notifications, COSMIC_NOTIFICATION_HISTORY_LIMIT)
                 }
                 Ok(None) => (cached, max_notifications),
                 Err(error) => {
@@ -196,6 +239,7 @@ impl NotificationMonitor {
         }
         let notifications = Arc::new(Mutex::new(cached));
         let locally_dismissed = Arc::new(Mutex::new(HashSet::new()));
+        let dismissed_transfers = Arc::new(Mutex::new(HashSet::new()));
         let (dbus_commands, dbus_command_receiver) = std::sync::mpsc::channel();
 
         // Spawn background thread to monitor D-Bus
@@ -205,6 +249,8 @@ impl NotificationMonitor {
         let session_key_clone = Arc::clone(&session_key);
         let max_count = retention_limit;
         let dbus_commands_clone = dbus_commands.clone();
+        let dismissed_transfers_clone = Arc::clone(&dismissed_transfers);
+        let locally_dismissed_monitor = Arc::clone(&locally_dismissed);
 
         std::thread::spawn(move || {
             Self::monitor_notifications(
@@ -213,6 +259,8 @@ impl NotificationMonitor {
                 &cache_path_clone,
                 &session_key_clone,
                 dbus_commands_clone,
+                dismissed_transfers_clone,
+                locally_dismissed_monitor,
             );
         });
 
@@ -220,6 +268,7 @@ impl NotificationMonitor {
         let cache_path_clone = Arc::clone(&cache_path);
         let session_key_clone = Arc::clone(&session_key);
         let locally_dismissed_clone = Arc::clone(&locally_dismissed);
+        let dismissed_transfers_clone = Arc::clone(&dismissed_transfers);
         std::thread::spawn(move || {
             Self::run_dbus_worker(
                 notifications_clone,
@@ -228,6 +277,7 @@ impl NotificationMonitor {
                 &session_key_clone,
                 cosmic_history_connection,
                 dbus_command_receiver,
+                dismissed_transfers_clone,
             );
         });
 
@@ -236,6 +286,7 @@ impl NotificationMonitor {
             cache_path,
             session_key,
             locally_dismissed,
+            dismissed_transfers,
             dbus_commands,
         }
     }
@@ -247,6 +298,7 @@ impl NotificationMonitor {
         session_key: &str,
         mut connection: Option<zbus::blocking::Connection>,
         commands: Receiver<NotificationDbusCommand>,
+        dismissed_transfers: Arc<Mutex<HashSet<(u32, String)>>>,
     ) {
         let mut refresh_due = None;
         let mut next_reconciliation = Instant::now() + COSMIC_HISTORY_RECONCILE_INTERVAL;
@@ -284,6 +336,7 @@ impl NotificationMonitor {
                 continue;
             }
             let history_connection = connection.as_ref().expect("connection was ensured");
+            let existing = notifications.lock().unwrap().clone();
             let mut history = match load_cosmic_notification_history(history_connection) {
                 Ok(Some(history)) => history,
                 Ok(None) => {
@@ -299,19 +352,28 @@ impl NotificationMonitor {
                 }
             };
 
-            let mut dismissed = locally_dismissed.lock().unwrap();
-            apply_local_dismissal_suppression(&mut history, &mut dismissed);
-            drop(dismissed);
-
-            let existing = notifications.lock().unwrap().clone();
-            preserve_notification_targets(&existing, &mut history);
-            downloads::resolve_open_folders(&mut history);
+            reconcile_transfer_history(&existing, &mut history);
+            prune_disconnected_transfer_senders(history_connection, &mut history.notifications);
+            downloads::resolve_open_folders(&mut history.notifications);
 
             let mut current = notifications.lock().unwrap();
-            if *current == history {
+            // A Notify reply or dismissal may arrive while history is fetched.
+            // Retry instead of letting an older snapshot undo that live update.
+            if *current != existing {
+                refresh_due = Some(Instant::now() + COSMIC_HISTORY_EVENT_DEBOUNCE);
                 continue;
             }
-            *current = history;
+            let mut dismissed = locally_dismissed.lock().unwrap();
+            reconcile_transfer_dismissals(
+                &history,
+                &mut dismissed,
+                &mut dismissed_transfers.lock().unwrap(),
+            );
+            apply_local_dismissal_suppression(&mut history.notifications, &mut dismissed);
+            if *current == history.notifications {
+                continue;
+            }
+            *current = history.notifications;
             if let Err(error) = persist_cached_notifications(cache_path, session_key, &current) {
                 log::warn!("Failed to persist synchronized notifications: {error}");
             }
@@ -325,6 +387,8 @@ impl NotificationMonitor {
         cache_path: &Path,
         session_key: &str,
         dbus_commands: Sender<NotificationDbusCommand>,
+        dismissed_transfers: Arc<Mutex<HashSet<(u32, String)>>>,
+        locally_dismissed: Arc<Mutex<HashSet<(u32, String)>>>,
     ) {
         loop {
             if let Err(error) = Self::monitor_notification_connection(
@@ -333,6 +397,8 @@ impl NotificationMonitor {
                 cache_path,
                 session_key,
                 &dbus_commands,
+                &dismissed_transfers,
+                &locally_dismissed,
             ) {
                 log::warn!("Native notification monitor disconnected: {error}");
             }
@@ -346,6 +412,8 @@ impl NotificationMonitor {
         cache_path: &Path,
         session_key: &str,
         dbus_commands: &Sender<NotificationDbusCommand>,
+        dismissed_transfers: &Arc<Mutex<HashSet<(u32, String)>>>,
+        locally_dismissed: &Arc<Mutex<HashSet<(u32, String)>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use zbus::blocking::MessageIterator;
 
@@ -365,16 +433,51 @@ impl NotificationMonitor {
                 let mut notifs = notifications.lock().unwrap();
                 match event {
                     NotificationBusEvent::Upsert(mut notification) => {
-                        log::info!(
+                        if remote_notification_id(&notification).is_some_and(|id| {
+                            locally_dismissed.lock().unwrap().contains(&id)
+                                || dismissed_transfers.lock().unwrap().contains(&id)
+                        }) {
+                            let _ = dbus_commands.send(NotificationDbusCommand::RefreshHistory);
+                            continue;
+                        }
+                        log::debug!(
                             "Captured notification {}: {} - {}",
                             notification.id.unwrap_or_default(),
                             notification.app_name,
                             notification.summary
                         );
                         downloads::resolve_open_folders(std::slice::from_mut(&mut notification));
+                        let is_active = notification
+                            .file_transfer
+                            .as_ref()
+                            .is_some_and(FileTransfer::is_active);
                         upsert_notification(&mut notifs, notification, max_count);
+                        if is_active {
+                            // These rows are intentionally live-only. Avoid a
+                            // cache fsync and history query on every progress tick.
+                            continue;
+                        }
                     }
-                    NotificationBusEvent::Closed { id, server_owner } => {
+                    NotificationBusEvent::Closed {
+                        id,
+                        server_owner,
+                        reason,
+                    } => {
+                        if reason == 2
+                            && notifs.iter().any(|notification| {
+                                notification.id == Some(id)
+                                    && notification.server_owner.as_deref() == Some(&server_owner)
+                                    && notification
+                                        .file_transfer
+                                        .as_ref()
+                                        .is_some_and(FileTransfer::is_active)
+                            })
+                        {
+                            dismissed_transfers
+                                .lock()
+                                .unwrap()
+                                .insert((id, server_owner.clone()));
+                        }
                         let previous_len = notifs.len();
                         notifs.retain(|notification| {
                             notification.id != Some(id)
@@ -384,6 +487,13 @@ impl NotificationMonitor {
                             continue;
                         }
                         log::info!("COSMIC closed notification {id}");
+                    }
+                    NotificationBusEvent::SenderGone(sender) => {
+                        let previous_len = notifs.len();
+                        remove_abandoned_transfers(&mut notifs, &sender);
+                        if notifs.len() == previous_len {
+                            continue;
+                        }
                     }
                 }
                 if let Err(error) = persist_cached_notifications(cache_path, session_key, &notifs) {
@@ -410,8 +520,7 @@ impl NotificationMonitor {
     /// underlying D-Bus monitoring (new notifications will still appear).
     pub fn clear(&self) {
         let mut notifs = self.notifications.lock().unwrap();
-        let remote = remote_notification_ids(&notifs);
-        self.suppress_remote_notifications(&remote);
+        let remote = self.suppress_notifications(&notifs);
         self.close_remote_notifications(remote);
         notifs.clear();
         self.persist(&notifs);
@@ -425,55 +534,49 @@ impl NotificationMonitor {
     /// * `app_name` - Application name to filter (exact match)
     pub fn clear_app(&self, app_name: &str) {
         let mut notifs = self.notifications.lock().unwrap();
-        let remote = remote_notification_ids(
+        let remote = self.suppress_notifications(
             &notifs
                 .iter()
                 .filter(|notification| notification.app_name == app_name)
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        self.suppress_remote_notifications(&remote);
         self.close_remote_notifications(remote);
         notifs.retain(|n| n.app_name != app_name);
         self.persist(&notifs);
         log::info!("Cleared notifications for app: {}", app_name);
     }
 
-    /// Remove a specific notification by app name and timestamp.
+    /// Remove one notification using its daemon ID or cached local identity.
     ///
     /// Used when the user clicks the X button on a specific notification.
     ///
     /// # Arguments
     ///
-    /// * `app_name` - Application name of the notification
-    /// * `timestamp` - Unix timestamp when notification was captured
-    pub fn remove_notification(&self, app_name: &str, timestamp: u64) {
+    /// * `identity` - Stable identity of the notification to remove
+    pub fn remove_notification(&self, identity: &NotificationIdentity) {
         let mut notifs = self.notifications.lock().unwrap();
-        let remote: Vec<(u32, String)> = notifs
+        let selected: Vec<Notification> = notifs
             .iter()
-            .find(|notification| {
-                notification.app_name == app_name && notification.timestamp == timestamp
-            })
-            .and_then(remote_notification_id)
+            .find(|notification| identity.matches(notification))
+            .cloned()
             .into_iter()
             .collect();
-        self.suppress_remote_notifications(&remote);
+        let remote = self.suppress_notifications(&selected);
         self.close_remote_notifications(remote);
-        notifs.retain(|n| !(n.app_name == app_name && n.timestamp == timestamp));
+        notifs.retain(|notification| !identity.matches(notification));
         self.persist(&notifs);
-        log::info!("Removed notification: {} at {}", app_name, timestamp);
+        log::info!("Removed notification: {identity:?}");
     }
 
     /// Invoke the validated default action for a retained notification.
-    pub fn activate_notification(&self, app_name: &str, timestamp: u64) -> bool {
+    pub fn activate_notification(&self, identity: &NotificationIdentity) -> bool {
         let target = self
             .notifications
             .lock()
             .unwrap()
             .iter()
-            .find(|notification| {
-                notification.app_name == app_name && notification.timestamp == timestamp
-            })
+            .find(|notification| identity.matches(notification))
             .and_then(|notification| {
                 let (id, server_owner) = remote_notification_id(notification)?;
                 let action = notification.activation_action.clone()?;
@@ -499,11 +602,24 @@ impl NotificationMonitor {
         }
     }
 
-    fn suppress_remote_notifications(&self, notifications: &[(u32, String)]) {
+    fn suppress_notifications(&self, notifications: &[Notification]) -> Vec<(u32, String)> {
+        let remote = remote_notification_ids(notifications);
         self.locally_dismissed
             .lock()
             .unwrap()
-            .extend(notifications.iter().cloned());
+            .extend(remote.iter().cloned());
+        self.dismissed_transfers.lock().unwrap().extend(
+            notifications
+                .iter()
+                .filter(|notification| {
+                    notification
+                        .file_transfer
+                        .as_ref()
+                        .is_some_and(FileTransfer::is_active)
+                })
+                .filter_map(remote_notification_id),
+        );
+        remote
     }
 
     fn close_remote_notifications(&self, notifications: Vec<(u32, String)>) {
@@ -567,6 +683,12 @@ fn open_notification_monitor_connection()
             .interface(NOTIFICATIONS_INTERFACE)?
             .member("NotificationClosed")?
             .build(),
+        MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .sender("org.freedesktop.DBus")?
+            .interface("org.freedesktop.DBus")?
+            .member("NameOwnerChanged")?
+            .build(),
     ];
     zbus::blocking::fdo::MonitoringProxy::new(&connection)?.become_monitor(&rules, 0)?;
     Ok(connection)
@@ -575,7 +697,12 @@ fn open_notification_monitor_connection()
 #[derive(Debug)]
 enum NotificationBusEvent {
     Upsert(Notification),
-    Closed { id: u32, server_owner: String },
+    SenderGone(String),
+    Closed {
+        id: u32,
+        server_owner: String,
+        reason: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -585,6 +712,7 @@ struct PendingNotification {
     body: String,
     timestamp: u64,
     activation_action: Option<String>,
+    file_transfer: Option<FileTransfer>,
 }
 
 #[derive(Debug, Default)]
@@ -630,6 +758,7 @@ impl NotificationMessageParser {
                     .collect::<Vec<_>>();
                 let activation_action =
                     discord_activation_action(&app_name, desktop_entry.as_deref(), &action_keys);
+                let file_transfer = file_transfers::from_hints(&app_name, &hints);
                 self.pending.insert(
                     (sender, message.primary_header().serial_num().get()),
                     PendingNotification {
@@ -640,6 +769,7 @@ impl NotificationMessageParser {
                         body,
                         timestamp,
                         activation_action,
+                        file_transfer,
                     },
                 );
                 Ok(None)
@@ -657,12 +787,14 @@ impl NotificationMessageParser {
                 Ok(Some(NotificationBusEvent::Upsert(Notification {
                     id: Some(id),
                     server_owner: header.sender().map(ToString::to_string),
+                    sender_owner: Some(key.0),
                     app_name: pending.app_name,
                     summary: pending.summary,
                     body: pending.body,
                     timestamp: pending.timestamp,
                     open_folder: None,
                     activation_action: pending.activation_action,
+                    file_transfer: pending.file_transfer,
                 })))
             }
             MessageType::Error => {
@@ -676,13 +808,31 @@ impl NotificationMessageParser {
             MessageType::Signal
                 if header
                     .member()
+                    .is_some_and(|member| member == "NameOwnerChanged") =>
+            {
+                let (name, old_owner, new_owner): (String, String, String) =
+                    message.body().deserialize()?;
+                if name.starts_with(':') && old_owner == name && new_owner.is_empty() {
+                    self.pending.retain(|(sender, _), _| sender != &name);
+                    Ok(Some(NotificationBusEvent::SenderGone(name)))
+                } else {
+                    Ok(None)
+                }
+            }
+            MessageType::Signal
+                if header
+                    .member()
                     .is_some_and(|member| member == "NotificationClosed") =>
             {
                 let Some(server_owner) = header.sender().map(ToString::to_string) else {
                     return Ok(None);
                 };
-                let (id, _reason): (u32, u32) = message.body().deserialize()?;
-                Ok(Some(NotificationBusEvent::Closed { id, server_owner }))
+                let (id, reason): (u32, u32) = message.body().deserialize()?;
+                Ok(Some(NotificationBusEvent::Closed {
+                    id,
+                    server_owner,
+                    reason,
+                }))
             }
             _ => Ok(None),
         }
@@ -694,6 +844,50 @@ fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn remove_abandoned_transfers(notifications: &mut Vec<Notification>, sender: &str) {
+    notifications.retain(|notification| {
+        notification.sender_owner.as_deref() != Some(sender)
+            || !notification
+                .file_transfer
+                .as_ref()
+                .is_some_and(FileTransfer::is_active)
+    });
+}
+
+fn prune_disconnected_transfer_senders(
+    connection: &zbus::blocking::Connection,
+    notifications: &mut Vec<Notification>,
+) {
+    let senders: HashSet<_> = notifications
+        .iter()
+        .filter(|notification| {
+            notification
+                .file_transfer
+                .as_ref()
+                .is_some_and(FileTransfer::is_active)
+        })
+        .filter_map(|notification| notification.sender_owner.clone())
+        .collect();
+    if senders.is_empty() {
+        return;
+    }
+    let Ok(bus) = zbus::blocking::Proxy::new(
+        connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    ) else {
+        return;
+    };
+    for sender in senders {
+        // NameOwnerChanged can be missed during monitor reconnection. Only a
+        // confirmed disconnect retires progress; bus errors are inconclusive.
+        if matches!(bus.call::<_, _, bool>("NameHasOwner", &sender), Ok(false)) {
+            remove_abandoned_transfers(notifications, &sender);
+        }
+    }
 }
 
 fn upsert_notification(
@@ -749,7 +943,70 @@ fn preserve_notification_targets(existing: &[Notification], refreshed: &mut [Not
             notification.activation_action =
                 previous.and_then(|candidate| candidate.activation_action.clone());
         }
+        if let Some(previous) = previous.filter(|previous| previous.file_transfer.is_some()) {
+            notification.timestamp = previous.timestamp;
+            // Active transfers are transient and cannot occur in retained
+            // history. A matching history row is terminal; use its actual text,
+            // even if its final live Notify reply was missed.
+            notification.file_transfer = previous
+                .file_transfer
+                .clone()
+                .filter(|transfer| !transfer.is_active());
+        }
     }
+}
+
+fn reconcile_transfer_history(existing: &[Notification], history: &mut CosmicNotificationHistory) {
+    preserve_notification_targets(existing, &mut history.notifications);
+    for (index, notification) in existing.iter().enumerate().filter(|(_, notification)| {
+        notification.file_transfer.is_some()
+            && notification.server_owner.as_deref() == Some(history.server_owner.as_str())
+    }) {
+        let position = history.notifications.iter().position(|candidate| {
+            remote_notification_id(candidate) == remote_notification_id(notification)
+        });
+        let row = if let Some(position) = position {
+            history.notifications.remove(position)
+        } else if notification
+            .file_transfer
+            .as_ref()
+            .is_some_and(FileTransfer::is_active)
+        {
+            notification.clone()
+        } else {
+            continue;
+        };
+        history
+            .notifications
+            .insert(index.min(history.notifications.len()), row);
+    }
+    history
+        .notifications
+        .truncate(COSMIC_NOTIFICATION_HISTORY_LIMIT);
+}
+
+fn reconcile_transfer_dismissals(
+    history: &CosmicNotificationHistory,
+    dismissed: &mut HashSet<(u32, String)>,
+    dismissed_transfers: &mut HashSet<(u32, String)>,
+) {
+    let history_ids: HashSet<_> = history
+        .notifications
+        .iter()
+        .filter_map(remote_notification_id)
+        .collect();
+    dismissed_transfers.retain(|id| {
+        if id.1 != history.server_owner {
+            false
+        } else if history_ids.contains(id) {
+            // Once a terminal row reaches history, normal history dismissal
+            // tracking owns it. Until then, suppress every live replacement.
+            dismissed.insert(id.clone());
+            false
+        } else {
+            true
+        }
+    });
 }
 
 fn notification_string_hint(
@@ -864,7 +1121,7 @@ fn close_remote_notifications_inner(
     let current_owner: OwnedUniqueName = bus.call("GetNameOwner", &NOTIFICATIONS_SERVICE)?;
     let notifications_proxy = Proxy::new(
         connection,
-        NOTIFICATIONS_SERVICE,
+        current_owner.as_str(),
         NOTIFICATIONS_PATH,
         NOTIFICATIONS_INTERFACE,
     )?;
@@ -922,7 +1179,7 @@ fn activate_remote_notification_inner(
     }
     let notifications_proxy = Proxy::new(
         connection,
-        NOTIFICATIONS_SERVICE,
+        current_owner.as_str(),
         NOTIFICATIONS_PATH,
         NOTIFICATIONS_INTERFACE,
     )?;
@@ -933,9 +1190,14 @@ fn activate_remote_notification_inner(
 type CosmicNotificationHistoryEntry = (u32, String, String, String, u64);
 type CosmicNotificationHistoryEntryV2 = (u32, String, String, String, u64, Vec<String>, String);
 
+struct CosmicNotificationHistory {
+    server_owner: String,
+    notifications: Vec<Notification>,
+}
+
 fn load_cosmic_notification_history(
     connection: &zbus::blocking::Connection,
-) -> zbus::Result<Option<Vec<Notification>>> {
+) -> zbus::Result<Option<CosmicNotificationHistory>> {
     use zbus::blocking::Proxy;
     use zbus::names::OwnedUniqueName;
 
@@ -948,7 +1210,7 @@ fn load_cosmic_notification_history(
     let owner: OwnedUniqueName = bus.call("GetNameOwner", &NOTIFICATIONS_SERVICE)?;
     let proxy = Proxy::new(
         connection,
-        NOTIFICATIONS_SERVICE,
+        owner.as_str(),
         NOTIFICATIONS_PATH,
         NOTIFICATIONS_INTERFACE,
     )?;
@@ -964,8 +1226,9 @@ fn load_cosmic_notification_history(
         };
 
     if let Some(entries) = v2_entries {
-        return Ok(Some(
-            entries
+        return Ok(Some(CosmicNotificationHistory {
+            server_owner: owner.to_string(),
+            notifications: entries
                 .into_iter()
                 .map(
                     |(id, app_name, summary, body, timestamp, actions, desktop_entry)| {
@@ -974,17 +1237,19 @@ fn load_cosmic_notification_history(
                         Notification {
                             id: Some(id),
                             server_owner: Some(owner.to_string()),
+                            sender_owner: None,
                             app_name,
                             summary,
                             body,
                             timestamp,
                             open_folder: None,
                             activation_action,
+                            file_transfer: None,
                         }
                     },
                 )
                 .collect(),
-        ));
+        }));
     }
 
     let entries: Vec<CosmicNotificationHistoryEntry> =
@@ -1003,15 +1268,20 @@ fn load_cosmic_notification_history(
         .map(|(id, app_name, summary, body, timestamp)| Notification {
             id: Some(id),
             server_owner: Some(owner.to_string()),
+            sender_owner: None,
             app_name,
             summary,
             body,
             timestamp,
             open_folder: None,
             activation_action: None,
+            file_transfer: None,
         })
         .collect::<Vec<_>>();
-    Ok(Some(notifications))
+    Ok(Some(CosmicNotificationHistory {
+        server_owner: owner.to_string(),
+        notifications,
+    }))
 }
 
 fn notification_cache_path() -> PathBuf {
@@ -1050,6 +1320,12 @@ fn load_cached_notifications(
     if !from_current_boot {
         return Ok(Vec::new());
     }
+    cache.notifications.retain(|notification| {
+        !notification
+            .file_transfer
+            .as_ref()
+            .is_some_and(FileTransfer::is_active)
+    });
     cache.notifications.truncate(max_notifications);
     Ok(cache.notifications)
 }
@@ -1064,7 +1340,16 @@ fn persist_cached_notifications(
     }
     let cache = NotificationCache {
         session_key: session_key.to_string(),
-        notifications: notifications.to_vec(),
+        notifications: notifications
+            .iter()
+            .filter(|notification| {
+                !notification
+                    .file_transfer
+                    .as_ref()
+                    .is_some_and(FileTransfer::is_active)
+            })
+            .cloned()
+            .collect(),
     };
     let bytes = serde_json::to_vec(&cache)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1115,13 +1400,209 @@ mod tests {
         Notification {
             id: None,
             server_owner: None,
+            sender_owner: None,
             app_name: "Test".to_string(),
             summary: summary.to_string(),
             body: "Body".to_string(),
             timestamp,
             open_folder: None,
             activation_action: None,
+            file_transfer: None,
         }
+    }
+
+    fn transfer_notification(state: super::FileTransferState, progress: u8) -> Notification {
+        Notification {
+            id: Some(15),
+            server_owner: Some(":1.82".to_string()),
+            app_name: "COSMIC Files".to_string(),
+            file_transfer: Some(super::FileTransfer { state, progress }),
+            ..notification("Copying files", 42)
+        }
+    }
+
+    fn transfer_exchange(state: &str, progress: i32, replaces_id: u32) -> (Message, Message) {
+        let mut hints = super::file_transfers::tests::hints("copy", state, progress);
+        hints.insert(
+            "transient".to_string(),
+            matches!(state, "running" | "paused").into(),
+        );
+        let call = Message::method(NOTIFICATIONS_PATH, "Notify")
+            .unwrap()
+            .sender(":1.9001")
+            .unwrap()
+            .destination(NOTIFICATIONS_SERVICE)
+            .unwrap()
+            .interface(NOTIFICATIONS_INTERFACE)
+            .unwrap()
+            .build(&(
+                "COSMIC Files",
+                replaces_id,
+                "com.system76.CosmicFiles",
+                state,
+                "Transfer details",
+                Vec::<String>::new(),
+                hints,
+                0_i32,
+            ))
+            .unwrap();
+        let reply = Message::method_reply(&call)
+            .unwrap()
+            .sender(":1.82")
+            .unwrap()
+            .build(&15_u32)
+            .unwrap();
+        (call, reply)
+    }
+
+    #[test]
+    fn file_transfer_progress_and_completion_replace_one_row() {
+        let mut parser = NotificationMessageParser::default();
+        let mut notifications = Vec::new();
+        for (state, progress, timestamp) in [
+            ("running", 0, 42),
+            ("running", 50, 43),
+            ("completed", 100, 44),
+        ] {
+            let (call, reply) = transfer_exchange(
+                state,
+                progress,
+                if notifications.is_empty() { 0 } else { 15 },
+            );
+            assert!(parser.push_message(&call, timestamp).unwrap().is_none());
+            let Some(NotificationBusEvent::Upsert(item)) =
+                parser.push_message(&reply, timestamp).unwrap()
+            else {
+                panic!("expected transfer update");
+            };
+            upsert_notification(&mut notifications, item, 20);
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0].id, Some(15));
+            assert_eq!(notifications[0].timestamp, 42);
+            assert_eq!(
+                notifications[0].file_transfer.as_ref().unwrap().progress,
+                progress as u8
+            );
+        }
+        assert_eq!(notifications[0].summary, "completed");
+        assert!(!notifications[0].file_transfer.as_ref().unwrap().is_active());
+    }
+
+    #[test]
+    fn transient_transfer_survives_history_and_completes_in_place() {
+        let running = transfer_notification(super::FileTransferState::Running, 50);
+        let mut history = super::CosmicNotificationHistory {
+            server_owner: ":1.82".to_string(),
+            notifications: vec![notification("Other notification", 40)],
+        };
+        super::reconcile_transfer_history(std::slice::from_ref(&running), &mut history);
+        assert_eq!(history.notifications[0], running);
+        let completed = Notification {
+            summary: "Copy complete".to_string(),
+            timestamp: 55,
+            file_transfer: None,
+            ..running.clone()
+        };
+        history.notifications = vec![completed];
+        super::reconcile_transfer_history(&[running], &mut history);
+        assert_eq!(history.notifications.len(), 1);
+        assert_eq!(history.notifications[0].summary, "Copy complete");
+        assert_eq!(history.notifications[0].timestamp, 42);
+        assert!(history.notifications[0].file_transfer.is_none());
+    }
+
+    #[test]
+    fn history_does_not_keep_unrelated_transients_or_old_daemon_transfers() {
+        let running = transfer_notification(super::FileTransferState::Running, 50);
+        let mut history = super::CosmicNotificationHistory {
+            server_owner: ":1.99".to_string(),
+            notifications: Vec::new(),
+        };
+        super::reconcile_transfer_history(
+            &[running, notification("Unrelated transient", 42)],
+            &mut history,
+        );
+        assert!(history.notifications.is_empty());
+    }
+
+    #[test]
+    fn transfer_dismissal_survives_transient_history_gap() {
+        let key = (15, ":1.82".to_string());
+        let mut transfers = HashSet::from([key.clone()]);
+        let mut dismissed = HashSet::from([key.clone()]);
+        let mut history = super::CosmicNotificationHistory {
+            server_owner: ":1.82".to_string(),
+            notifications: Vec::new(),
+        };
+        super::reconcile_transfer_dismissals(&history, &mut dismissed, &mut transfers);
+        apply_local_dismissal_suppression(&mut history.notifications, &mut dismissed);
+        assert!(
+            transfers.contains(&key),
+            "later progress must remain suppressed"
+        );
+        history.notifications.push(transfer_notification(
+            super::FileTransferState::Completed,
+            100,
+        ));
+        super::reconcile_transfer_dismissals(&history, &mut dismissed, &mut transfers);
+        apply_local_dismissal_suppression(&mut history.notifications, &mut dismissed);
+        assert!(transfers.is_empty());
+        assert!(
+            history.notifications.is_empty(),
+            "completion must remain dismissed"
+        );
+        assert!(dismissed.contains(&key));
+    }
+
+    #[test]
+    fn cache_keeps_completed_transfers_but_never_restores_stale_progress() {
+        let path = cache_path("transfers");
+        let running = transfer_notification(super::FileTransferState::Running, 50);
+        let completed = transfer_notification(super::FileTransferState::Completed, 100);
+        persist_cached_notifications(&path, "current-boot", &[running, completed.clone()]).unwrap();
+        assert_eq!(
+            load_cached_notifications(&path, "current-boot", 20).unwrap(),
+            vec![completed]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sender_disconnect_removes_only_its_unfinished_transfers() {
+        let mut running = transfer_notification(super::FileTransferState::Running, 50);
+        running.sender_owner = Some(":1.9001".to_string());
+        let completed = Notification {
+            id: Some(16),
+            file_transfer: Some(super::FileTransfer {
+                state: super::FileTransferState::Completed,
+                progress: 100,
+            }),
+            ..running.clone()
+        };
+        let another_sender = Notification {
+            id: Some(17),
+            sender_owner: Some(":1.9002".to_string()),
+            ..running.clone()
+        };
+        let mut notifications = vec![running, completed.clone(), another_sender.clone()];
+        let signal = Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .unwrap()
+        .sender("org.freedesktop.DBus")
+        .unwrap()
+        .build(&(":1.9001", ":1.9001", ""))
+        .unwrap();
+        let mut parser = NotificationMessageParser::default();
+        let Some(NotificationBusEvent::SenderGone(sender)) =
+            parser.push_message(&signal, 43).unwrap()
+        else {
+            panic!("expected sender disconnect");
+        };
+        super::remove_abandoned_transfers(&mut notifications, &sender);
+        assert_eq!(notifications, vec![completed, another_sender]);
     }
 
     fn notify_exchange() -> (Message, Message) {
@@ -1314,7 +1795,7 @@ mod tests {
 
         assert!(matches!(
             event,
-            Some(NotificationBusEvent::Closed { id: 15, server_owner }) if server_owner == ":1.82"
+            Some(NotificationBusEvent::Closed { id: 15, server_owner, .. }) if server_owner == ":1.82"
         ));
     }
 
@@ -1404,6 +1885,149 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].summary, "Updated content");
         assert_eq!(notifications[0].timestamp, 10);
+    }
+
+    #[test]
+    #[ignore = "creates, updates, and closes a transfer notification through the live COSMIC daemon"]
+    fn live_cosmic_transfer_replaces_one_row_through_completion() {
+        struct CloseOnDrop {
+            connection: Connection,
+            owner: String,
+            id: u32,
+        }
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                if let Ok(proxy) = Proxy::new(
+                    &self.connection,
+                    self.owner.as_str(),
+                    NOTIFICATIONS_PATH,
+                    NOTIFICATIONS_INTERFACE,
+                ) {
+                    let _: zbus::Result<()> = proxy.call("CloseNotification", &self.id);
+                }
+            }
+        }
+
+        let marker = format!("COSMIC Widget transfer test {}", std::process::id());
+        let monitor = open_notification_monitor_connection().unwrap();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let expected_marker = marker.clone();
+        std::thread::spawn(move || {
+            let mut parser = NotificationMessageParser::default();
+            let mut captured = 0;
+            for message in MessageIterator::from(monitor) {
+                let Ok(message) = message else { return };
+                if let Ok(Some(NotificationBusEvent::Upsert(notification))) =
+                    parser.push_message(&message, 42 + captured)
+                    && notification.summary == expected_marker
+                {
+                    if event_sender.send(notification).is_err() {
+                        return;
+                    }
+                    captured += 1;
+                    if captured == 3 {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let connection = Connection::session().unwrap();
+        let initial_history = super::load_cosmic_notification_history(&connection)
+            .unwrap()
+            .expect("COSMIC daemon must expose notification history");
+        let mut cleanup = CloseOnDrop {
+            connection: connection.clone(),
+            owner: initial_history.server_owner.clone(),
+            id: 0,
+        };
+        let proxy = Proxy::new(
+            &connection,
+            initial_history.server_owner.as_str(),
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (state, progress) in [("running", 0), ("running", 50), ("completed", 100)] {
+            let active = state == "running";
+            let mut hints = super::file_transfers::tests::hints("copy", state, progress);
+            hints.insert("transient".to_string(), active.into());
+            hints.insert("suppress-sound".to_string(), true.into());
+            let id: u32 = proxy
+                .call(
+                    "Notify",
+                    &(
+                        "COSMIC Files",
+                        cleanup.id,
+                        "com.system76.CosmicFiles",
+                        marker.as_str(),
+                        "Integration test only; no files are copied.",
+                        Vec::<String>::new(),
+                        hints,
+                        if active { 0_i32 } else { 5_000_i32 },
+                    ),
+                )
+                .unwrap();
+            let previous_id = std::mem::replace(&mut cleanup.id, id);
+            if previous_id != 0 {
+                assert_eq!(id, previous_id, "progress must retain the notification ID");
+            }
+            let captured = event_receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(captured.id, Some(id));
+            assert_eq!(
+                captured.file_transfer.as_ref().unwrap().progress,
+                progress as u8
+            );
+            assert_eq!(captured.file_transfer.as_ref().unwrap().is_active(), active);
+            upsert_notification(&mut rows, captured, 200);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].timestamp, 42);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut history = loop {
+                let history = super::load_cosmic_notification_history(&connection)
+                    .unwrap()
+                    .unwrap();
+                let saved = history.notifications.iter().any(|row| row.id == Some(id));
+                if saved != active || std::time::Instant::now() >= deadline {
+                    assert_eq!(saved, !active, "only terminal updates belong in history");
+                    break history;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            super::reconcile_transfer_history(&rows, &mut history);
+            let matching = history
+                .notifications
+                .iter()
+                .filter(|row| row.id == Some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0].timestamp, 42);
+            assert_eq!(matching[0].file_transfer, rows[0].file_transfer);
+        }
+
+        let abandoned_sender = Connection::session().unwrap();
+        let mut abandoned = transfer_notification(super::FileTransferState::Running, 50);
+        abandoned.sender_owner = abandoned_sender.unique_name().map(ToString::to_string);
+        rows.push(abandoned);
+        super::prune_disconnected_transfer_senders(&connection, &mut rows);
+        assert_eq!(rows.len(), 2, "a connected sender must retain its progress");
+        drop(abandoned_sender);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while rows.len() > 1 && std::time::Instant::now() < deadline {
+            super::prune_disconnected_transfer_senders(&connection, &mut rows);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            rows.len(),
+            1,
+            "history refresh must recover a missed disconnect"
+        );
+        assert_eq!(
+            rows[0].file_transfer.as_ref().unwrap().state,
+            super::FileTransferState::Completed
+        );
     }
 
     #[test]

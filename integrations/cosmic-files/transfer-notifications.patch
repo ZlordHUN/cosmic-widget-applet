@@ -1,0 +1,931 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 757d1bf..6de92da 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1452,6 +1452,7 @@ dependencies = [
+  "xdg",
+  "xdg-mime",
+  "xdgen",
++ "zbus 5.19.0",
+  "zip",
+ ]
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index 363ed44..98f3797 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,7 @@ log = "0.4"
+ mime_guess = "2"
+ notify-debouncer-full = "0.7"
+ notify-rust = { version = "4", optional = true }
++zbus = { version = "5.19", optional = true }
+ open = "5.3.4"
+ paste = "1.0"
+ regex = "1"
+@@ -118,7 +119,7 @@ desktop-applet = []
+ gvfs = ["dep:gio", "dep:glib"]
+ io-uring = ["compio/io-uring"]
+ jemalloc = ["dep:tikv-jemallocator"]
+-notify = ["dep:notify-rust"]
++notify = ["dep:notify-rust", "dep:zbus"]
+ wayland = ["libcosmic/wayland", "dep:cctk", "dep:wayland-client"]
+ wgpu = ["libcosmic/wgpu"]
+ 
+diff --git a/src/app.rs b/src/app.rs
+index 48f70bb..1ae70cf 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1280,13 +1280,23 @@ impl App {
+         cosmic::Task::stream(cosmic::iced::stream::channel(4, move |msg_tx| async move {
+             let (tx, rx) = tokio::sync::oneshot::channel();
+ 
++            #[cfg(feature = "notify")]
++            let transfer_notification =
++                crate::operation::transfer_notification::TransferNotification::start(
++                    &operation,
++                    controller.clone(),
++                );
++            // Keep the primary controller alive until we have the result. Its
++            // Drop cancels the operation; a completed transfer is not cancelled.
++            let operation_controller = controller.clone();
++
+             let msg_tx = Arc::new(tokio::sync::Mutex::new(msg_tx));
+ 
+             let msg_tx_clone = msg_tx.clone();
+ 
+             _ = compio_tx
+                 .send(Box::pin(async move {
+-                    let msg = match operation.perform(&msg_tx_clone, controller).await {
++                    let msg = match operation.perform(&msg_tx_clone, operation_controller).await {
+                         Ok(result_paths) => Message::PendingComplete(id, result_paths),
+                         Err(err) => Message::PendingError(id, err),
+                     };
+@@ -1295,9 +1305,23 @@ impl App {
+                 }))
+                 .await;
+ 
+-            if let Ok(msg) = rx.await {
+-                let _ = msg_tx.lock().await.send(msg).await;
++            let msg = rx.await.unwrap_or_else(|err| {
++                Message::PendingError(
++                    id,
++                    OperationError::from_msg(format!("operation worker stopped: {err}")),
++                )
++            });
++            #[cfg(feature = "notify")]
++            if let Some(notification) = transfer_notification {
++                use crate::operation::transfer_notification::Outcome;
++                notification
++                    .finish(Outcome::from_result(
++                        matches!(msg, Message::PendingComplete(..)),
++                        &controller,
++                    ))
++                    .await;
+             }
++            let _ = msg_tx.lock().await.send(msg).await;
+         }))
+         .map(cosmic::Action::App)
+     }
+@@ -1449,6 +1473,7 @@ impl App {
+         {
+             self.progress_operations.clear();
+         }
++        tasks.push(self.update_notification());
+         // Manually rescan any trash tabs after any operation is completed
+         tasks.push(self.rescan_trash());
+         Task::batch(tasks)
+@@ -1865,9 +1890,14 @@ impl App {
+     }
+ 
+     fn update_notification(&mut self) -> Task<Message> {
+-        // Handle closing notification if there are no operations
+-        if self.pending_operations.is_empty() {
+-            #[cfg(feature = "notify")]
++        // Copy/move operations have their own notifications. Close the legacy
++        // background notification once the remaining operations do not need it.
++        #[cfg(feature = "notify")]
++        if !self
++            .pending_operations
++            .values()
++            .any(|(op, _)| !crate::operation::transfer_notification::supports(op))
++        {
+             if let Some(notification_arc) = self.notification_opt.take() {
+                 return Task::future(async move {
+                     tokio::task::spawn_blocking(move || {
+@@ -1883,6 +1913,10 @@ impl App {
+             }
+         }
+ 
++        if self.pending_operations.is_empty() {
++            return Task::done(cosmic::action::app(Message::MaybeExit));
++        }
++
+         Task::none()
+     }
+ 
+@@ -7128,6 +7162,10 @@ impl Application for App {
+             } else {
+                 // Handle notification when window is closed and operations are in progress
+                 #[cfg(feature = "notify")]
++                if self
++                    .pending_operations
++                    .values()
++                    .any(|(op, _)| !crate::operation::transfer_notification::supports(op))
+                 {
+                     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+                     struct NotificationSubscription;
+diff --git a/src/operation/mod.rs b/src/operation/mod.rs
+index 62dbba6..a985533 100644
+--- a/src/operation/mod.rs
++++ b/src/operation/mod.rs
+@@ -20,6 +20,9 @@ pub mod controller;
+ pub use notifiers::*;
+ mod notifiers;
+ 
++#[cfg(feature = "notify")]
++pub mod transfer_notification;
++
+ pub use self::reader::OpReader;
+ pub mod reader;
+ 
+diff --git a/src/operation/transfer_notification.rs b/src/operation/transfer_notification.rs
+new file mode 100644
+index 0000000..23fbf88
+--- /dev/null
++++ b/src/operation/transfer_notification.rs
+@@ -0,0 +1,775 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Desktop notifications for COSMIC Files copy/move operations.
++//!
++//! One worker owns the notification ID and all updates, including the final
++//! result. The operation task joins it before reporting completion to the UI.
++
++use super::{Controller, ControllerState, Operation};
++use std::collections::HashMap;
++use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
++use std::time::{Duration, Instant};
++use zbus::blocking::Connection;
++use zbus::names::OwnedUniqueName;
++use zbus::zvariant::Value;
++
++const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
++const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
++const FINAL_ATTEMPTS: usize = 3;
++const METHOD_TIMEOUT: Duration = Duration::from_secs(2);
++const DESKTOP_ENTRY: &str = "com.system76.CosmicFiles";
++const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
++const NOTIFICATION_PATH: &str = "/org/freedesktop/Notifications";
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Outcome {
++    Completed,
++    Cancelled,
++    Failed,
++}
++
++impl Outcome {
++    pub fn from_result(succeeded: bool, controller: &Controller) -> Self {
++        if succeeded {
++            Self::Completed
++        } else if controller.is_cancelled() {
++            Self::Cancelled
++        } else {
++            Self::Failed
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum Phase {
++    Running,
++    Paused,
++    Finished(Outcome),
++}
++
++impl Phase {
++    fn name(self) -> &'static str {
++        match self {
++            Self::Running => "running",
++            Self::Paused => "paused",
++            Self::Finished(Outcome::Completed) => "completed",
++            Self::Finished(Outcome::Cancelled) => "cancelled",
++            Self::Finished(Outcome::Failed) => "failed",
++        }
++    }
++
++    fn transient(self) -> bool {
++        !matches!(self, Self::Finished(_))
++    }
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct Update {
++    phase: Phase,
++    percent: i32,
++}
++
++impl Update {
++    fn current(controller: &Controller) -> Option<Self> {
++        let phase = match controller.state() {
++            ControllerState::Running => Phase::Running,
++            ControllerState::Paused => Phase::Paused,
++            // Cancellation/failure can precede cleanup. Only the operation's
++            // result is authoritative about when the transfer has finished.
++            ControllerState::Cancelled | ControllerState::Failed => return None,
++        };
++        let percent = percent(controller);
++        // perform() also writes 1.0 on errors. Only a successful result may
++        // publish 100%, even during the gap before that result reaches us.
++        if percent == 100 {
++            return None;
++        }
++        Some(Self { phase, percent })
++    }
++
++    fn finished(outcome: Outcome, last_percent: i32) -> Self {
++        Self {
++            phase: Phase::Finished(outcome),
++            percent: if outcome == Outcome::Completed {
++                100
++            } else {
++                last_percent
++            },
++        }
++    }
++}
++
++fn percent(controller: &Controller) -> i32 {
++    (controller.progress().clamp(0.0, 1.0) * 100.0) as i32
++}
++
++pub fn supports(operation: &Operation) -> bool {
++    kind(operation).is_some()
++}
++
++fn kind(operation: &Operation) -> Option<&'static str> {
++    match operation {
++        Operation::Copy { .. } => Some("copy"),
++        Operation::Move { .. } => Some("move"),
++        _ => None,
++    }
++}
++
++pub struct TransferNotification {
++    done: Sender<Outcome>,
++    worker: tokio::task::JoinHandle<()>,
++}
++
++impl TransferNotification {
++    pub fn start(operation: &Operation, controller: Controller) -> Option<Self> {
++        let kind = kind(operation)?;
++        let operation = operation.clone();
++        let (done, receiver) = mpsc::channel();
++        let worker = tokio::task::spawn_blocking(move || {
++            let mut transport = NotificationTransport::default();
++            let delivered = run(&controller, receiver, UPDATE_INTERVAL, |update, _| {
++                transport
++                    .send(&operation, kind, update)
++                    .map_err(|err| log::warn!("failed to update transfer notification: {err}"))
++            });
++            if !delivered {
++                log::warn!("could not deliver transfer result after {FINAL_ATTEMPTS} attempts");
++                if let Err(err) = transport.close() {
++                    log::warn!("failed to close transfer notification: {err}");
++                }
++            }
++        });
++        Some(Self { done, worker })
++    }
++
++    pub async fn finish(self, outcome: Outcome) {
++        let _ = self.done.send(outcome);
++        if let Err(err) = self.worker.await {
++            log::warn!("transfer notification worker failed: {err}");
++        }
++    }
++}
++
++fn summary(operation: &Operation, update: Update) -> String {
++    match update.phase {
++        Phase::Finished(Outcome::Completed) => operation.completed_text(),
++        phase => operation.pending_text(
++            // pending_text truncates its ratio to an integer percentage. Use
++            // the middle of that bucket to avoid e.g. 53% rounding back to 52%.
++            ((update.percent as f32 + 0.5) / 100.0).min(1.0),
++            match phase {
++                Phase::Running => ControllerState::Running,
++                Phase::Paused => ControllerState::Paused,
++                Phase::Finished(Outcome::Cancelled) => ControllerState::Cancelled,
++                Phase::Finished(Outcome::Failed) => ControllerState::Failed,
++                Phase::Finished(Outcome::Completed) => unreachable!(),
++            },
++        ),
++    }
++}
++
++#[derive(Default)]
++struct NotificationIdentity {
++    owner: Option<OwnedUniqueName>,
++    id: u32,
++}
++
++impl NotificationIdentity {
++    fn bind(&mut self, owner: OwnedUniqueName) -> u32 {
++        if self.owner.as_ref() != Some(&owner) {
++            self.owner = Some(owner);
++            self.id = 0;
++        }
++        self.id
++    }
++}
++
++#[derive(Default)]
++struct NotificationTransport {
++    connection: Option<Connection>,
++    identity: NotificationIdentity,
++}
++
++impl NotificationTransport {
++    fn send(
++        &mut self,
++        operation: &Operation,
++        kind: &'static str,
++        update: Update,
++    ) -> zbus::Result<u32> {
++        if self.connection.is_none() {
++            self.connection = Some(
++                zbus::blocking::connection::Builder::session()?
++                    .method_timeout(METHOD_TIMEOUT)
++                    .build()?,
++            );
++        }
++        let connection = self.connection.as_ref().unwrap();
++        let owner: OwnedUniqueName = connection
++            .call_method(
++                Some("org.freedesktop.DBus"),
++                "/org/freedesktop/DBus",
++                Some("org.freedesktop.DBus"),
++                "GetNameOwner",
++                &(NOTIFICATIONS,),
++            )?
++            .body()
++            .deserialize()?;
++        let replaces_id = self.identity.bind(owner.clone());
++        let hints: HashMap<&str, Value<'_>> = HashMap::from([
++            ("desktop-entry", DESKTOP_ENTRY.into()),
++            ("x-cosmic-files-operation", kind.into()),
++            ("x-cosmic-files-state", update.phase.name().into()),
++            ("value", update.percent.into()),
++            ("transient", update.phase.transient().into()),
++            ("suppress-sound", update.phase.transient().into()),
++        ]);
++        // Bind the call to this unique owner. If the daemon restarts between
++        // GetNameOwner and Notify, an old ID cannot target the new daemon.
++        self.identity.id = connection
++            .call_method(
++                Some(owner.as_str()),
++                NOTIFICATION_PATH,
++                Some(NOTIFICATIONS),
++                "Notify",
++                &(
++                    "COSMIC Files",
++                    replaces_id,
++                    DESKTOP_ENTRY,
++                    summary(operation, update),
++                    "",
++                    Vec::<String>::new(),
++                    hints,
++                    if update.phase.transient() {
++                        0_i32
++                    } else {
++                        -1_i32
++                    },
++                ),
++            )?
++            .body()
++            .deserialize()?;
++        Ok(self.identity.id)
++    }
++
++    fn close(&self) -> zbus::Result<()> {
++        if let Some(connection) = &self.connection
++            && let Some(owner) = &self.identity.owner
++            && self.identity.id != 0
++        {
++            // The same finite timeout and owner binding apply to cleanup.
++            connection.call_method(
++                Some(owner.as_str()),
++                NOTIFICATION_PATH,
++                Some(NOTIFICATIONS),
++                "CloseNotification",
++                &(self.identity.id,),
++            )?;
++        }
++        Ok(())
++    }
++}
++
++fn run(
++    controller: &Controller,
++    receiver: Receiver<Outcome>,
++    interval: Duration,
++    emit: impl FnMut(Update, u32) -> Result<u32, ()>,
++) -> bool {
++    run_with_heartbeat(controller, receiver, interval, HEARTBEAT_INTERVAL, emit)
++}
++
++fn run_with_heartbeat(
++    controller: &Controller,
++    receiver: Receiver<Outcome>,
++    interval: Duration,
++    heartbeat: Duration,
++    mut emit: impl FnMut(Update, u32) -> Result<u32, ()>,
++) -> bool {
++    let mut notification_id = 0;
++    let mut previous = None;
++    let mut last_percent = 0;
++    let mut last_sent: Option<Instant> = None;
++    loop {
++        if let Some(update) = Update::current(controller) {
++            // perform() currently sets controller progress to 1.0 even on Err.
++            // Only a successful result is evidence of 100% completion.
++            if update.percent < 100 {
++                last_percent = update.percent;
++            }
++            // A quiet heartbeat makes paused transfers discoverable again if
++            // the widget or notification daemon restarts between changes.
++            if (previous != Some(update)
++                || last_sent.is_none_or(|sent| sent.elapsed() >= heartbeat))
++                && let Ok(id) = emit(update, notification_id)
++            {
++                notification_id = id;
++                previous = Some(update);
++                last_sent = Some(Instant::now());
++            }
++        }
++        let outcome = match receiver.recv_timeout(interval) {
++            Ok(outcome) => outcome,
++            Err(RecvTimeoutError::Timeout) => continue,
++            // The task was abandoned: do not leave an everlasting active row.
++            Err(RecvTimeoutError::Disconnected) => Outcome::Cancelled,
++        };
++        let final_update = Update::finished(outcome, last_percent);
++        for attempt in 0..FINAL_ATTEMPTS {
++            if emit(final_update, notification_id).is_ok() {
++                return true;
++            }
++            if attempt + 1 < FINAL_ATTEMPTS {
++                std::thread::sleep(interval.min(Duration::from_millis(200)));
++            }
++        }
++        return false;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::path::PathBuf;
++    use std::sync::{Arc, Mutex};
++
++    fn copy() -> Operation {
++        Operation::Copy {
++            paths: vec![PathBuf::from("/source/file")],
++            to: PathBuf::from("/destination"),
++        }
++    }
++
++    #[test]
++    fn only_copy_and_move_have_transfer_notifications() {
++        assert_eq!(kind(&copy()), Some("copy"));
++        assert_eq!(
++            kind(&Operation::Move {
++                paths: vec![],
++                to: PathBuf::new(),
++                cross_device_copy: false,
++            }),
++            Some("move")
++        );
++        assert!(!supports(&Operation::Delete { paths: vec![] }));
++        assert!(!supports(&Operation::EmptyTrash));
++        assert!(!supports(&Operation::Rename {
++            from: PathBuf::new(),
++            to: PathBuf::new(),
++        }));
++    }
++
++    #[test]
++    fn completion_is_authoritative_and_failure_is_not_success() {
++        let controller = Controller::default();
++        controller.set_progress(0.42);
++        controller.cancel();
++        assert!(Update::current(&controller).is_none());
++        assert_eq!(Outcome::from_result(true, &controller), Outcome::Completed);
++        assert_eq!(Outcome::from_result(false, &controller), Outcome::Cancelled);
++        controller.set_state(ControllerState::Failed);
++        assert_eq!(Outcome::from_result(false, &controller), Outcome::Failed);
++        assert_eq!(Update::finished(Outcome::Completed, 42).percent, 100);
++        assert_eq!(Update::finished(Outcome::Failed, 42).percent, 42);
++    }
++
++    #[test]
++    fn progress_and_pauses_are_transient_but_results_are_retained() {
++        assert!(Phase::Running.transient());
++        assert!(Phase::Paused.transient());
++        for outcome in [Outcome::Completed, Outcome::Cancelled, Outcome::Failed] {
++            assert!(!Phase::Finished(outcome).transient());
++        }
++        let controller = Controller::default();
++        controller.pause();
++        assert_eq!(Update::current(&controller).unwrap().phase, Phase::Paused);
++        controller.unpause();
++        assert_eq!(Update::current(&controller).unwrap().phase, Phase::Running);
++    }
++
++    #[test]
++    fn completion_interrupts_throttle_and_reuses_the_server_id() {
++        let controller = Controller::default();
++        let (done, receiver) = mpsc::channel();
++        let mut updates = Vec::new();
++        run(
++            &controller,
++            receiver,
++            Duration::from_secs(60),
++            |update, id| {
++                updates.push((update, id));
++                // Completion arrives while the initial Notify call is outstanding.
++                // It must be sent after the reply using that reply's assigned ID.
++                if updates.len() == 1 {
++                    controller.set_progress(0.6);
++                    done.send(Outcome::Completed).unwrap();
++                }
++                Ok(37)
++            },
++        );
++        assert_eq!(updates.len(), 2);
++        assert_eq!(updates[0].1, 0);
++        assert_eq!(updates[1].1, 37);
++        assert_eq!(updates[1].0.phase, Phase::Finished(Outcome::Completed));
++        assert_eq!(updates[1].0.percent, 100);
++    }
++
++    #[test]
++    fn unchanged_progress_is_not_republished_and_changes_wait_for_tick() {
++        let controller = Controller::default();
++        let observed = Arc::new(Mutex::new(Vec::new()));
++        let (done, receiver) = mpsc::channel();
++        let (sent, updates) = mpsc::channel();
++        let worker_controller = controller.clone();
++        let worker_observed = observed.clone();
++        let worker = std::thread::spawn(move || {
++            run(
++                &worker_controller,
++                receiver,
++                Duration::from_millis(100),
++                |update, id| {
++                    worker_observed.lock().unwrap().push((update, id));
++                    sent.send(update).unwrap();
++                    Ok(91)
++                },
++            );
++        });
++        assert_eq!(updates.recv().unwrap().percent, 0);
++        assert!(updates.recv_timeout(Duration::from_millis(150)).is_err());
++        controller.set_progress(0.27);
++        controller.pause();
++        let paused = updates.recv_timeout(Duration::from_secs(2)).unwrap();
++        assert_eq!(paused.phase, Phase::Paused);
++        assert_eq!(paused.percent, 27);
++        done.send(Outcome::Cancelled).unwrap();
++        worker.join().unwrap();
++        let observed = observed.lock().unwrap();
++        assert_eq!(observed.len(), 3);
++        assert!(observed[1..].iter().all(|(_, id)| *id == 91));
++        assert_eq!(observed[2].0.phase, Phase::Finished(Outcome::Cancelled));
++    }
++
++    #[test]
++    fn failed_initial_delivery_retries_without_inventing_an_id() {
++        let controller = Controller::default();
++        let (done, receiver) = mpsc::channel();
++        let mut attempts = 0;
++        run(&controller, receiver, Duration::ZERO, |update, id| {
++            attempts += 1;
++            match attempts {
++                1 => {
++                    assert_eq!(id, 0);
++                    Err(())
++                }
++                2 => {
++                    assert_eq!(id, 0);
++                    done.send(Outcome::Failed).unwrap();
++                    Ok(11)
++                }
++                3 => {
++                    assert_eq!(id, 11);
++                    assert_eq!(update.phase, Phase::Finished(Outcome::Failed));
++                    Ok(11)
++                }
++                _ => panic!("unexpected notification update"),
++            }
++        });
++        assert_eq!(attempts, 3);
++    }
++
++    #[test]
++    fn terminal_delivery_retries_the_same_id_and_reports_exhaustion() {
++        let controller = Controller::default();
++        let (done, receiver) = mpsc::channel();
++        let mut final_attempts = 0;
++        let delivered = run(&controller, receiver, Duration::ZERO, |update, id| {
++            if update.phase == Phase::Running {
++                done.send(Outcome::Completed).unwrap();
++                Ok(52)
++            } else {
++                assert_eq!(id, 52);
++                assert_eq!(update.phase, Phase::Finished(Outcome::Completed));
++                final_attempts += 1;
++                Err(())
++            }
++        });
++        assert!(!delivered);
++        assert_eq!(final_attempts, FINAL_ATTEMPTS);
++    }
++
++    #[test]
++    fn daemon_restart_resets_the_id_even_if_first_delivery_to_new_owner_fails() {
++        let mut identity = NotificationIdentity::default();
++        let first: OwnedUniqueName = ":1.20".try_into().unwrap();
++        let second: OwnedUniqueName = ":1.21".try_into().unwrap();
++        assert_eq!(identity.bind(first.clone()), 0);
++        identity.id = 84;
++        assert_eq!(identity.bind(first), 84);
++        assert_eq!(identity.bind(second.clone()), 0);
++        // A failed initial call leaves this at zero for the next attempt.
++        assert_eq!(identity.bind(second.clone()), 0);
++        identity.id = 15;
++        assert_eq!(identity.bind(second), 15);
++    }
++
++    #[test]
++    fn unsuccessful_result_ignores_performs_unconditional_full_progress() {
++        for outcome in [Outcome::Cancelled, Outcome::Failed] {
++            let controller = Controller::default();
++            controller.set_progress(0.42);
++            let (done, receiver) = mpsc::channel();
++            let mut updates = Vec::new();
++            run(&controller, receiver, Duration::ZERO, |update, _| {
++                updates.push(update);
++                if updates.len() == 1 {
++                    controller.set_progress(1.0);
++                    controller.set_state(match outcome {
++                        Outcome::Cancelled => ControllerState::Cancelled,
++                        _ => ControllerState::Failed,
++                    });
++                    done.send(outcome).unwrap();
++                }
++                Ok(18)
++            });
++            assert_eq!(updates.last().unwrap().percent, 42);
++            assert_eq!(updates.last().unwrap().phase, Phase::Finished(outcome));
++        }
++    }
++
++    #[test]
++    fn full_controller_progress_is_not_emitted_while_waiting_for_result() {
++        let controller = Controller::default();
++        controller.set_progress(0.42);
++        let (done, receiver) = mpsc::channel();
++        let (started, initial) = mpsc::channel();
++        let finisher = std::thread::spawn(move || {
++            initial.recv().unwrap();
++            std::thread::sleep(Duration::from_millis(20));
++            done.send(Outcome::Failed).unwrap();
++        });
++        let mut updates = Vec::new();
++        run(
++            &controller,
++            receiver,
++            Duration::from_millis(1),
++            |update, _| {
++                assert!(update.percent < 100);
++                updates.push(update);
++                if update.phase == Phase::Running {
++                    controller.set_progress(1.0);
++                    started.send(()).unwrap();
++                }
++                Ok(19)
++            },
++        );
++        finisher.join().unwrap();
++        assert_eq!(updates.len(), 2);
++        assert_eq!(
++            updates.last().unwrap().phase,
++            Phase::Finished(Outcome::Failed)
++        );
++        assert_eq!(updates.last().unwrap().percent, 42);
++    }
++
++    #[test]
++    fn paused_transfers_send_periodic_heartbeats_with_the_same_id() {
++        let controller = Controller::default();
++        controller.set_progress(0.42);
++        controller.pause();
++        let (done, receiver) = mpsc::channel();
++        let mut calls = Vec::new();
++        run_with_heartbeat(
++            &controller,
++            receiver,
++            Duration::from_millis(1),
++            Duration::from_millis(10),
++            |update, id| {
++                calls.push((update, id, Instant::now()));
++                if calls.len() == 2 {
++                    done.send(Outcome::Cancelled).unwrap();
++                }
++                Ok(72)
++            },
++        );
++        assert_eq!(calls.len(), 3);
++        assert_eq!(calls[0].0, calls[1].0);
++        assert_eq!(calls[1].0.phase, Phase::Paused);
++        assert_eq!(calls[1].1, 72);
++        assert!(calls[1].2.duration_since(calls[0].2) >= Duration::from_millis(10));
++        assert_eq!(calls[2].0.phase, Phase::Finished(Outcome::Cancelled));
++    }
++
++    #[derive(Debug)]
++    struct WireNotification {
++        sender: String,
++        destination: String,
++        replaces_id: u32,
++        state: String,
++        percent: i32,
++        transient: bool,
++        timeout: i32,
++    }
++
++    struct TestNotificationService {
++        calls: Arc<Mutex<Vec<WireNotification>>>,
++        delay_ms: Arc<std::sync::atomic::AtomicU64>,
++        next_id: u32,
++    }
++
++    #[zbus::interface(name = "org.freedesktop.Notifications")]
++    impl TestNotificationService {
++        #[allow(clippy::too_many_arguments)]
++        async fn notify(
++            &self,
++            app_name: String,
++            replaces_id: u32,
++            _icon: String,
++            _summary: String,
++            _body: String,
++            _actions: Vec<String>,
++            hints: HashMap<String, zbus::zvariant::OwnedValue>,
++            timeout: i32,
++            #[zbus(header)] header: zbus::message::Header<'_>,
++        ) -> u32 {
++            assert_eq!(app_name, "COSMIC Files");
++            assert_eq!(
++                <&str>::try_from(&hints["desktop-entry"]).unwrap(),
++                DESKTOP_ENTRY
++            );
++            assert_eq!(
++                <&str>::try_from(&hints["x-cosmic-files-operation"]).unwrap(),
++                "copy"
++            );
++            self.calls.lock().unwrap().push(WireNotification {
++                sender: header.sender().unwrap().to_string(),
++                destination: header.destination().unwrap().to_string(),
++                replaces_id,
++                state: <&str>::try_from(&hints["x-cosmic-files-state"])
++                    .unwrap()
++                    .to_owned(),
++                percent: i32::try_from(&hints["value"]).unwrap(),
++                transient: bool::try_from(&hints["transient"]).unwrap(),
++                timeout,
++            });
++            let delay = self.delay_ms.load(std::sync::atomic::Ordering::Relaxed);
++            if delay != 0 {
++                tokio::time::sleep(Duration::from_millis(delay)).await;
++            }
++            if replaces_id == 0 {
++                self.next_id
++            } else {
++                replaces_id
++            }
++        }
++
++        fn close_notification(&self, _id: u32) {}
++    }
++
++    // This test creates fake notification services, so explicitly opt in on a
++    // private bus: dbus-run-session -- env COSMIC_FILES_TEST_BUS=1 cargo test
++    // --lib private_bus_transfer_lifecycle -- --ignored
++    #[test]
++    #[ignore = "requires an explicitly isolated D-Bus session"]
++    fn private_bus_transfer_lifecycle() {
++        assert!(std::env::var_os("COSMIC_FILES_TEST_BUS").is_some());
++        let calls = Arc::new(Mutex::new(Vec::new()));
++        let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
++        let server = |next_id| {
++            zbus::blocking::connection::Builder::session()
++                .unwrap()
++                .name(NOTIFICATIONS)
++                .unwrap()
++                .serve_at(
++                    NOTIFICATION_PATH,
++                    TestNotificationService {
++                        calls: calls.clone(),
++                        delay_ms: delay_ms.clone(),
++                        next_id,
++                    },
++                )
++                .unwrap()
++                .build()
++                .unwrap()
++        };
++        let first = server(64);
++        let mut transport = NotificationTransport {
++            connection: Some(
++                zbus::blocking::connection::Builder::session()
++                    .unwrap()
++                    .method_timeout(Duration::from_millis(50))
++                    .build()
++                    .unwrap(),
++            ),
++            identity: NotificationIdentity::default(),
++        };
++        let running = Update {
++            phase: Phase::Running,
++            percent: 42,
++        };
++        assert_eq!(transport.send(&copy(), "copy", running).unwrap(), 64);
++        assert_eq!(
++            transport
++                .send(
++                    &copy(),
++                    "copy",
++                    Update {
++                        phase: Phase::Paused,
++                        percent: 42,
++                    }
++                )
++                .unwrap(),
++            64
++        );
++        let first_owner = first.unique_name().unwrap().to_string();
++        first.close().unwrap();
++        let second = server(12);
++        assert_eq!(transport.send(&copy(), "copy", running).unwrap(), 12);
++        {
++            let calls = calls.lock().unwrap();
++            assert_eq!(calls.len(), 3);
++            assert!(calls.iter().all(|call| call.sender == calls[0].sender));
++            assert_eq!(calls[0].destination, first_owner);
++            assert_eq!(calls[1].replaces_id, 64);
++            assert_eq!(calls[1].state, "paused");
++            assert_eq!(calls[2].replaces_id, 0);
++            assert_eq!(calls[2].destination, second.unique_name().unwrap().as_str());
++            assert!(
++                calls
++                    .iter()
++                    .all(|call| call.transient && call.timeout == 0 && call.percent == 42)
++            );
++        }
++
++        let controller = Controller::default();
++        controller.set_progress(0.42);
++        let (done, receiver) = mpsc::channel();
++        let mut first_update = true;
++        let started = std::time::Instant::now();
++        let delivered = run(&controller, receiver, Duration::ZERO, |update, _| {
++            if first_update {
++                first_update = false;
++                done.send(Outcome::Completed).unwrap();
++                delay_ms.store(500, std::sync::atomic::Ordering::Relaxed);
++                Ok(12)
++            } else {
++                transport.send(&copy(), "copy", update).map_err(|_| ())
++            }
++        });
++        assert!(!delivered);
++        assert!(
++            started.elapsed() < Duration::from_secs(2),
++            "method timeout did not bound final delivery"
++        );
++        transport.close().unwrap();
++        let calls = calls.lock().unwrap();
++        let results: Vec<_> = calls
++            .iter()
++            .filter(|call| call.state == "completed")
++            .collect();
++        assert_eq!(results.len(), FINAL_ATTEMPTS);
++        assert!(results.iter().all(|call| call.replaces_id == 12
++            && call.percent == 100
++            && !call.transient
++            && call.timeout == -1));
++    }
++}

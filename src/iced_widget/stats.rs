@@ -161,14 +161,15 @@ impl StatsSampler {
         self.notification_monitor.clear();
     }
 
-    pub fn dismiss_notification(&self, app_name: &str, timestamp: u64) {
-        self.notification_monitor
-            .remove_notification(app_name, timestamp);
+    pub fn dismiss_notification(&self, identity: &crate::notifications::NotificationIdentity) {
+        self.notification_monitor.remove_notification(identity);
     }
 
-    pub fn activate_notification(&self, app_name: &str, timestamp: u64) -> bool {
-        self.notification_monitor
-            .activate_notification(app_name, timestamp)
+    pub fn activate_notification(
+        &self,
+        identity: &crate::notifications::NotificationIdentity,
+    ) -> bool {
+        self.notification_monitor.activate_notification(identity)
     }
 
     pub fn set_cider_token(&self, token: String) {

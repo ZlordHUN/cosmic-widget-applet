@@ -102,6 +102,11 @@ native readers, deduplication, and optional external fallbacks.
 
 - `battery/logitech.rs` discovers Logitech endpoints and delegates HID++
   protocol, receiver, transport, sysfs, and Centurion handling.
+- Logitech polling runs on an independent one-second worker. The UI merges its
+  latest snapshot when reading battery state, so slower headset/controller or
+  CLI queries cannot delay charging updates or overwrite them with older data.
+  Persistent HID++ listeners also retain battery notifications between polls,
+  allowing charging changes to update a sleeping device's last reading.
 - `battery/headsets.rs` contains the explicit native headset registry and
   dispatches to vendor protocol modules.
 - `battery/controllers/` contains model-specific controller readers.
@@ -127,6 +132,16 @@ text. When these extensions are unavailable, the overlay still captures live
 notifications and uses its session-scoped local cache. Dismissal uses the
 standard `CloseNotification` method and verifies the notification server owner
 before reusing an ID.
+
+COSMIC Files copy/move notifications carry explicit application identity and
+transfer-state hints. Active rows show progress and survive history reconciliation;
+terminal updates replace the same daemon owner/ID without changing row identity.
+Dismissals remain suppressed across transient progress updates, and sender
+disconnects remove abandoned active rows. Active transfers are never restored
+from the disk cache. The required Files-side patch and wire contract live under
+[`integrations/cosmic-files`](integrations/cosmic-files/README.md).
+The accompanying daemon patch renews replacement timers, allowing completion
+popups to expire normally while remaining in notification history.
 
 ### Media
 

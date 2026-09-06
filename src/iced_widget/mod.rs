@@ -23,6 +23,7 @@ use cosmic::iced::platform_specific::shell::commands::{blur, corner_radius};
 use cosmic::iced::{self, Color, Point, Rectangle, Size, Subscription, Task, window};
 use futures_util::SinkExt;
 use stats::{StatsSampler, SystemSnapshot};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,7 @@ const WEATHER_SECTION_HEIGHT: u32 = 154;
 const EMPTY_NOTIFICATIONS_HEIGHT: u32 = 83;
 const NOTIFICATIONS_SECTION_HEIGHT: u32 = 65;
 const NOTIFICATION_ITEM_HEIGHT: u32 = 47;
+const FILE_TRANSFER_PROGRESS_EXTRA_HEIGHT: u32 = 24;
 const MAX_VISIBLE_NOTIFICATION_ROWS: u32 = 4;
 const NOTIFICATION_LINE_HEIGHT: u32 = 17;
 const NOTIFICATION_CHARS_PER_LINE: usize = 32;
@@ -61,11 +63,7 @@ struct PendingPlayback {
     expires_at: Instant,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NotificationKey {
-    app_name: String,
-    timestamp: u64,
-}
+type NotificationKey = crate::notifications::NotificationIdentity;
 
 #[derive(Debug, Clone)]
 struct DismissingNotification {
@@ -79,10 +77,7 @@ impl DismissingNotification {
         let mut animation = ExpansionAnimation::default();
         animation.transition_to(1.0, now);
         Self {
-            key: NotificationKey {
-                app_name: notification.app_name.clone(),
-                timestamp: notification.timestamp,
-            },
+            key: notification.identity(),
             source: notification_source(notification).to_string(),
             animation,
         }
@@ -90,12 +85,6 @@ impl DismissingNotification {
 
     fn matches(&self, notification: &crate::notifications::Notification) -> bool {
         self.key.matches(notification)
-    }
-}
-
-impl NotificationKey {
-    fn matches(&self, notification: &crate::notifications::Notification) -> bool {
-        self.app_name == notification.app_name && self.timestamp == notification.timestamp
     }
 }
 
@@ -300,30 +289,12 @@ pub enum Message {
     Tick,
     AnimationTick,
     ClearNotifications,
-    ToggleNotificationGroup {
-        source: String,
-    },
-    ToggleNotification {
-        app_name: String,
-        timestamp: u64,
-    },
-    DismissNotification {
-        app_name: String,
-        timestamp: u64,
-    },
-    NotificationHoverChanged {
-        app_name: String,
-        timestamp: u64,
-        hovered: bool,
-    },
-    OpenNotificationFolder {
-        app_name: String,
-        timestamp: u64,
-    },
-    ActivateNotification {
-        app_name: String,
-        timestamp: u64,
-    },
+    ToggleNotificationGroup { source: String },
+    ToggleNotification { key: NotificationKey },
+    DismissNotification { key: NotificationKey },
+    NotificationHoverChanged { key: NotificationKey, hovered: bool },
+    OpenNotificationFolder { key: NotificationKey },
+    ActivateNotification { key: NotificationKey },
     NotificationFolderOpened(Result<(), String>),
     PreviousMedia,
     PlayPauseMedia,
@@ -592,8 +563,7 @@ impl App {
                     });
 
                     for (key, source) in completed_dismissals {
-                        self.sampler
-                            .dismiss_notification(&key.app_name, key.timestamp);
+                        self.sampler.dismiss_notification(&key);
                         self.snapshot
                             .notifications
                             .retain(|notification| !key.matches(notification));
@@ -681,14 +651,7 @@ impl App {
                     self.frosted,
                 ));
             }
-            Message::ToggleNotification {
-                app_name,
-                timestamp,
-            } => {
-                let selected = NotificationKey {
-                    app_name,
-                    timestamp,
-                };
+            Message::ToggleNotification { key: selected } => {
                 let now = Instant::now();
                 if self.expanded_notification.as_ref() == Some(&selected) {
                     let target = if self.notification_expansion.target > 0.0 {
@@ -708,17 +671,10 @@ impl App {
                     self.frosted,
                 ));
             }
-            Message::DismissNotification {
-                app_name,
-                timestamp,
-            } => {
+            Message::DismissNotification { key } => {
                 if self.clearing_notifications {
                     return Task::none();
                 }
-                let key = NotificationKey {
-                    app_name,
-                    timestamp,
-                };
                 if self
                     .dismissing_notifications
                     .iter()
@@ -737,32 +693,19 @@ impl App {
                 self.dismissing_notifications
                     .push(DismissingNotification::new(notification, Instant::now()));
             }
-            Message::NotificationHoverChanged {
-                app_name,
-                timestamp,
-                hovered,
-            } => {
-                let key = NotificationKey {
-                    app_name,
-                    timestamp,
-                };
+            Message::NotificationHoverChanged { key, hovered } => {
                 if hovered {
                     self.hovered_notification = Some(key);
                 } else if self.hovered_notification.as_ref() == Some(&key) {
                     self.hovered_notification = None;
                 }
             }
-            Message::OpenNotificationFolder {
-                app_name,
-                timestamp,
-            } => {
+            Message::OpenNotificationFolder { key } => {
                 if let Some(folder) = self
                     .snapshot
                     .notifications
                     .iter()
-                    .find(|notification| {
-                        notification.app_name == app_name && notification.timestamp == timestamp
-                    })
+                    .find(|notification| key.matches(notification))
                     .and_then(|notification| notification.open_folder.clone())
                 {
                     tasks.push(Task::perform(
@@ -771,11 +714,8 @@ impl App {
                     ));
                 }
             }
-            Message::ActivateNotification {
-                app_name,
-                timestamp,
-            } => {
-                if !self.sampler.activate_notification(&app_name, timestamp) {
+            Message::ActivateNotification { key } => {
+                if !self.sampler.activate_notification(&key) {
                     log::warn!("Notification no longer has an actionable target");
                 }
             }
@@ -1426,6 +1366,27 @@ fn notification_group_size(snapshot: &SystemSnapshot, source: &str) -> usize {
         .count()
 }
 
+fn notification_base_height(notification: &crate::notifications::Notification) -> u32 {
+    NOTIFICATION_ITEM_HEIGHT
+        + if notification
+            .file_transfer
+            .as_ref()
+            .is_some_and(crate::notifications::FileTransfer::is_active)
+        {
+            FILE_TRANSFER_PROGRESS_EXTRA_HEIGHT
+        } else {
+            0
+        }
+}
+
+fn notification_group_base_height(notifications: &[&crate::notifications::Notification]) -> u32 {
+    notifications
+        .iter()
+        .map(|notification| notification_base_height(notification))
+        .max()
+        .unwrap_or(NOTIFICATION_ITEM_HEIGHT)
+}
+
 fn notification_display_rows(snapshot: &SystemSnapshot, expanded_group: Option<&str>) -> u32 {
     let mut groups: Vec<(&str, u32)> = Vec::new();
 
@@ -1480,8 +1441,24 @@ fn notification_viewport_height_with_animation(
     group_progress: f32,
 ) -> f32 {
     let compact_rows = notification_display_rows(snapshot, None) as f32;
-    let group_rows = expanded_group
-        .map(|source| notification_group_size(snapshot, source) as f32)
+    let active_compact_groups = snapshot
+        .notifications
+        .iter()
+        .filter(|notification| notification_base_height(notification) > NOTIFICATION_ITEM_HEIGHT)
+        .map(notification_source)
+        .collect::<HashSet<_>>()
+        .len() as f32;
+    let compact_height = NOTIFICATION_ITEM_HEIGHT as f32 * compact_rows
+        + FILE_TRANSFER_PROGRESS_EXTRA_HEIGHT as f32 * active_compact_groups;
+    let group_height = expanded_group
+        .map(|source| {
+            snapshot
+                .notifications
+                .iter()
+                .filter(|notification| notification_source(notification) == source)
+                .map(notification_base_height)
+                .sum::<u32>() as f32
+        })
         .unwrap_or(0.0)
         * group_progress.clamp(0.0, 1.0);
     let selected_group_progress = expanded_notification
@@ -1504,8 +1481,7 @@ fn notification_viewport_height_with_animation(
         as f32
         * notification_progress.clamp(0.0, 1.0)
         * selected_group_progress;
-    let content_height =
-        NOTIFICATION_ITEM_HEIGHT as f32 * (compact_rows + group_rows) + expanded_height;
+    let content_height = compact_height + group_height + expanded_height;
 
     content_height.min((NOTIFICATION_ITEM_HEIGHT * MAX_VISIBLE_NOTIFICATION_ROWS) as f32)
 }
@@ -1559,7 +1535,7 @@ mod tests {
     use super::{
         BASE_SURFACE_HEIGHT, DISK_IO_SECTION_HEIGHT, EMPTY_MEDIA_HEIGHT, ExpansionAnimation,
         MEDIA_SECTION_HEIGHT, NETWORK_SECTION_HEIGHT, NOTIFICATION_EXPANSION_DURATION,
-        NotificationKey, PendingPlayback, SURFACE_WIDTH, ScrollAnimation, UI_TICK_SETTLE_DELAY,
+        PendingPlayback, SURFACE_WIDTH, ScrollAnimation, UI_TICK_SETTLE_DELAY,
         delay_until_next_tick, desired_surface_height, desired_surface_height_with_expansion,
         dragged_overlay_position, notification_viewport_height_with_animation,
         reconcile_media_state, rounded_surface_regions,
@@ -1568,7 +1544,7 @@ mod tests {
     use crate::battery::BatteryDevice;
     use crate::config::{Config, WidgetSection};
     use crate::media::{MediaInfo, PlaybackStatus, PlayerId};
-    use crate::notifications::Notification;
+    use crate::notifications::{FileTransfer, FileTransferState, Notification};
     use crate::storage::DiskInfo;
     use crate::weather::WeatherData;
     use cosmic::iced::platform_specific::runtime::wayland::CornerRadius;
@@ -1749,10 +1725,7 @@ mod tests {
         let mut snapshot = super::SystemSnapshot::default();
         let mut item = notification();
         item.body = "A complete notification body that wraps across several lines so all of its content remains readable when expanded.".to_string();
-        let selected = NotificationKey {
-            app_name: item.app_name.clone(),
-            timestamp: item.timestamp,
-        };
+        let selected = item.identity();
         snapshot.notifications = vec![item];
         let compact_height = desired_surface_height(&config, &snapshot);
 
@@ -1872,6 +1845,214 @@ mod tests {
 
         assert!(compact < halfway);
         assert!(halfway < expanded);
+    }
+
+    #[test]
+    fn active_file_transfer_is_visible_in_a_group_with_newer_notifications() {
+        let mut latest = notification();
+        latest.app_name = "COSMIC Files".to_string();
+        let mut transfer = notification();
+        transfer.app_name = latest.app_name.clone();
+        transfer.summary = "Copying files".to_string();
+        transfer.file_transfer = Some(FileTransfer {
+            progress: 35,
+            state: FileTransferState::Running,
+        });
+        let grouped = [&latest, &transfer];
+
+        let preview = super::view::notification_group_transfer(&grouped).unwrap();
+        assert_eq!(preview.summary, "Copying files");
+        assert_eq!(preview.file_transfer.as_ref().unwrap().progress, 35);
+
+        transfer.file_transfer.as_mut().unwrap().state = FileTransferState::Paused;
+        let grouped = [&latest, &transfer];
+        assert_eq!(
+            super::view::notification_group_transfer(&grouped)
+                .unwrap()
+                .summary,
+            "Copying files"
+        );
+    }
+
+    #[test]
+    fn file_transfer_completion_keeps_the_group_preview_and_restores_compact_height() {
+        let mut transfer = notification();
+        transfer.app_name = "COSMIC Files".to_string();
+        transfer.summary = "Moving files".to_string();
+        transfer.file_transfer = Some(FileTransfer {
+            progress: 80,
+            state: FileTransferState::Running,
+        });
+        let mut older = notification();
+        older.app_name = transfer.app_name.clone();
+        let mut snapshot = super::SystemSnapshot {
+            notifications: vec![transfer, older],
+            ..Default::default()
+        };
+        let active_height =
+            super::notification_viewport_height(&snapshot, None, Some("COSMIC Files"));
+        assert_eq!(
+            active_height,
+            super::NOTIFICATION_ITEM_HEIGHT * super::MAX_VISIBLE_NOTIFICATION_ROWS
+        );
+        assert_eq!(
+            super::notification_viewport_height(&snapshot, None, None),
+            super::NOTIFICATION_ITEM_HEIGHT + super::FILE_TRANSFER_PROGRESS_EXTRA_HEIGHT
+        );
+
+        let transfer = &mut snapshot.notifications[0];
+        transfer.summary = "Move complete".to_string();
+        transfer.file_transfer = Some(FileTransfer {
+            progress: 100,
+            state: FileTransferState::Completed,
+        });
+        let grouped = snapshot.notifications.iter().collect::<Vec<_>>();
+        let preview = super::view::notification_group_transfer(&grouped).unwrap();
+
+        assert_eq!(preview.summary, "Move complete");
+        assert!(!preview.file_transfer.as_ref().unwrap().is_active());
+        assert_eq!(
+            super::notification_viewport_height(&snapshot, None, Some("COSMIC Files")),
+            super::NOTIFICATION_ITEM_HEIGHT * 3
+        );
+        assert_eq!(
+            super::notification_viewport_height(&snapshot, None, None),
+            super::NOTIFICATION_ITEM_HEIGHT
+        );
+    }
+
+    #[test]
+    fn only_active_file_transfer_rows_reserve_progress_height() {
+        let mut item = notification();
+        assert_eq!(
+            super::notification_base_height(&item),
+            super::NOTIFICATION_ITEM_HEIGHT
+        );
+
+        for state in [
+            FileTransferState::Running,
+            FileTransferState::Paused,
+            FileTransferState::Completed,
+            FileTransferState::Cancelled,
+            FileTransferState::Failed,
+        ] {
+            item.file_transfer = Some(FileTransfer {
+                progress: 50,
+                state,
+            });
+            let expected = super::NOTIFICATION_ITEM_HEIGHT
+                + if matches!(
+                    state,
+                    FileTransferState::Running | FileTransferState::Paused
+                ) {
+                    super::FILE_TRANSFER_PROGRESS_EXTRA_HEIGHT
+                } else {
+                    0
+                };
+            let snapshot = super::SystemSnapshot {
+                notifications: vec![item.clone()],
+                ..Default::default()
+            };
+            assert_eq!(super::notification_base_height(&item), expected);
+            assert_eq!(
+                super::notification_viewport_height(&snapshot, None, None),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_group_progress_height_counts_preview_once_and_animates_children() {
+        let mut running = notification();
+        running.app_name = "COSMIC Files".to_string();
+        running.file_transfer = Some(FileTransfer {
+            progress: 50,
+            state: FileTransferState::Running,
+        });
+        let mut paused = running.clone();
+        paused.file_transfer.as_mut().unwrap().state = FileTransferState::Paused;
+        let mut completed = running.clone();
+        completed.file_transfer.as_mut().unwrap().state = FileTransferState::Completed;
+        let snapshot = super::SystemSnapshot {
+            notifications: vec![running, paused, completed],
+            ..Default::default()
+        };
+        let grouped = snapshot.notifications.iter().collect::<Vec<_>>();
+        let base = super::NOTIFICATION_ITEM_HEIGHT as f32;
+        let transfer_base = base + super::FILE_TRANSFER_PROGRESS_EXTRA_HEIGHT as f32;
+        assert_eq!(
+            super::notification_group_base_height(&grouped) as f32,
+            transfer_base
+        );
+        assert_eq!(
+            notification_viewport_height_with_animation(
+                &snapshot,
+                None,
+                Some("COSMIC Files"),
+                0.0,
+                0.0,
+            ),
+            transfer_base
+        );
+        assert_eq!(
+            notification_viewport_height_with_animation(
+                &snapshot,
+                None,
+                Some("COSMIC Files"),
+                0.0,
+                0.5,
+            ),
+            transfer_base + (2.0 * transfer_base + base) * 0.5
+        );
+        assert_eq!(
+            notification_viewport_height_with_animation(
+                &snapshot,
+                None,
+                Some("COSMIC Files"),
+                0.0,
+                1.0,
+            ),
+            (super::NOTIFICATION_ITEM_HEIGHT * super::MAX_VISIBLE_NOTIFICATION_ROWS) as f32
+        );
+    }
+
+    #[test]
+    fn same_second_file_transfers_expand_and_dismiss_independently() {
+        let mut first = notification();
+        first.app_name = "COSMIC Files".to_string();
+        first.id = Some(51);
+        first.server_owner = Some(":1.82".to_string());
+        first.file_transfer = Some(FileTransfer {
+            progress: 25,
+            state: FileTransferState::Running,
+        });
+        let mut second = first.clone();
+        second.id = Some(52);
+        second.body = "Another transfer with a long destination path that wraps across several lines when this notification is expanded.".to_string();
+        let selected = second.identity();
+        let dismissal = super::DismissingNotification::new(&second, Instant::now());
+        let mut snapshot = super::SystemSnapshot {
+            notifications: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+
+        assert_eq!(first.timestamp, second.timestamp);
+        assert!(!selected.matches(&first));
+        assert!(selected.matches(&second));
+        assert_eq!(
+            super::expanded_notification_extra_height(&snapshot, Some(&selected)),
+            super::notification_extra_height(&second)
+        );
+        assert!(
+            super::notification_extra_height(&second) > super::notification_extra_height(&first)
+        );
+        assert!(!dismissal.matches(&first));
+        assert!(dismissal.matches(&second));
+
+        snapshot
+            .notifications
+            .retain(|notification| !dismissal.matches(notification));
+        assert_eq!(snapshot.notifications, vec![first]);
     }
 
     #[test]
@@ -2018,12 +2199,14 @@ mod tests {
         Notification {
             id: None,
             server_owner: None,
+            sender_owner: None,
             app_name: "System".to_string(),
             summary: "Package manager updated".to_string(),
             body: "System is up to date.".to_string(),
             timestamp: 1_000,
             open_folder: None,
             activation_action: None,
+            file_transfer: None,
         }
     }
 

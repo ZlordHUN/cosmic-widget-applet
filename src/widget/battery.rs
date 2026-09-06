@@ -27,7 +27,8 @@
 //!
 //! ## Architecture
 //!
-//! The monitor uses a background thread for native and external device queries:
+//! The monitor uses separate background threads for Logitech polling and slower
+//! native/external device queries:
 //!
 //! 1. **Startup**: Load cached device names for instant display
 //! 2. **First update**: Immediately query tools in background thread
@@ -157,7 +158,7 @@ impl ExternalProbePlan {
 /// - `devices`: Shared state protected by Arc<Mutex>
 /// - `update_requested`: Flag to trigger background refresh
 /// - Background thread retries unresolved startup readings every second
-/// - Connected Logitech devices are queried every second after startup resolves
+/// - An independent worker queries Logitech devices every second
 /// - Other native devices return to a five-second interval after startup resolves
 /// - Main thread calls `update()` every 30 seconds to refresh active fallbacks
 ///
@@ -168,6 +169,12 @@ impl ExternalProbePlan {
 pub struct BatteryMonitor {
     /// Shared device list, updated by background thread
     devices: Arc<Mutex<Vec<BatteryDevice>>>,
+    /// Independent live snapshot, read even while the other backends are busy.
+    logitech_devices: Arc<Mutex<Vec<BatteryDevice>>>,
+    /// Names owned by dedicated headset readers, published with `devices`.
+    native_headset_coverage: Arc<Mutex<Vec<String>>>,
+    cached_devices: Vec<BatteryDevice>,
+    initial_probe_started: Instant,
     /// Last time `update()` was called (for rate limiting)
     last_update: Instant,
     /// Minimum interval between requesting external fallback updates
@@ -240,17 +247,55 @@ impl BatteryMonitor {
             .collect();
 
         let devices = Arc::new(Mutex::new(startup_devices));
+        let logitech_devices = Arc::new(Mutex::new(Vec::new()));
+        let native_headset_coverage = Arc::new(Mutex::new(Vec::new()));
+        let initial_probe_started = Instant::now();
         let update_requested = Arc::new(Mutex::new(true)); // Request initial update immediately
         let solaar_enabled = Arc::new(AtomicBool::new(enable_solaar));
+
+        // Keep the fast Logitech path independent of CLI discovery and slower
+        // headset/controller probes. Never hold the snapshot lock during HID I/O.
+        let logitech_snapshot = Arc::downgrade(&logitech_devices);
+        std::thread::spawn(move || {
+            let mut monitor = logitech::Monitor::new();
+            let mut announced = false;
+            while logitech_snapshot.strong_count() > 0 {
+                let started = Instant::now();
+                let readings = query_native_logitech(&mut monitor);
+                if !announced && !readings.is_empty() {
+                    log::info!(
+                        "Using native monitoring for {} Logitech device(s)",
+                        readings.len()
+                    );
+                    announced = true;
+                }
+                let Some(snapshot) = logitech_snapshot.upgrade() else {
+                    break;
+                };
+                {
+                    let mut snapshot = snapshot.lock().unwrap();
+                    if *snapshot != readings {
+                        log::debug!("Native Logitech battery update: {readings:?}");
+                        *snapshot = readings;
+                    }
+                }
+                drop(snapshot);
+                // Count query time toward the cadence instead of adding it to
+                // the one-second sleep on every poll.
+                std::thread::sleep(LOGITECH_POLL_INTERVAL.saturating_sub(started.elapsed()));
+            }
+        });
 
         // Spawn background thread for battery updates
         // This avoids blocking the main render loop on slow CLI tools
         let devices_clone = Arc::clone(&devices);
         let update_requested_clone = Arc::clone(&update_requested);
         let solaar_enabled_clone = Arc::clone(&solaar_enabled);
+        let logitech_devices_clone = Arc::clone(&logitech_devices);
+        let headset_coverage_clone = Arc::clone(&native_headset_coverage);
+        let startup_cache = cached_devices.clone();
 
         std::thread::spawn(move || {
-            let initial_probe_started = Instant::now();
             let mut last_cache_snapshot = None;
             let mut native_maxwell_authoritative = false;
             let mut native_maxwell = None;
@@ -280,8 +325,7 @@ impl BatteryMonitor {
                 }
             }
 
-            let mut logitech_monitor = logitech::Monitor::new();
-            let mut native_logitech = query_native_logitech(&mut logitech_monitor);
+            let mut native_logitech = logitech_devices_clone.lock().unwrap().clone();
             {
                 let mut devices = devices_clone.lock().unwrap();
                 merge_native_logitech(&mut devices, &native_logitech);
@@ -302,6 +346,7 @@ impl BatteryMonitor {
                     &native_headsets.states,
                     &native_headset_coverage,
                 );
+                *headset_coverage_clone.lock().unwrap() = native_headset_coverage.clone();
                 prepare_detected_devices(
                     &mut devices,
                     &cached_devices,
@@ -309,12 +354,6 @@ impl BatteryMonitor {
                 );
             }
 
-            if !native_logitech.is_empty() {
-                log::info!(
-                    "Using native monitoring for {} Logitech device(s)",
-                    native_logitech.len()
-                );
-            }
             if !native_headsets.states.is_empty() {
                 log::info!(
                     "Using native monitoring for {} additional headset device(s)",
@@ -360,6 +399,7 @@ impl BatteryMonitor {
                     headsetcontrol: true,
                 },
             );
+            native_logitech = logitech_devices_clone.lock().unwrap().clone();
             external_state.last_discovery = Some(Instant::now());
             reconcile_external_fallbacks(
                 &mut external_state,
@@ -444,8 +484,12 @@ impl BatteryMonitor {
                     }
                 }
 
-                native_logitech = query_native_logitech(&mut logitech_monitor);
-                merge_native_logitech(&mut devices_clone.lock().unwrap(), &native_logitech);
+                native_logitech = logitech_devices_clone.lock().unwrap().clone();
+                merge_uncovered_native_logitech(
+                    &mut devices_clone.lock().unwrap(),
+                    &native_logitech,
+                    &native_headset_coverage,
+                );
                 if standard_native_poll_due {
                     let previous_headset_coverage = native_headset_coverage.clone();
                     native_headsets = query_native_headsets(&mut headset_monitor);
@@ -459,11 +503,13 @@ impl BatteryMonitor {
                             headset_rows_to_replace.push(name.clone());
                         }
                     }
+                    let mut devices = devices_clone.lock().unwrap();
                     merge_native_headsets(
-                        &mut devices_clone.lock().unwrap(),
+                        &mut devices,
                         &native_headsets.states,
                         &headset_rows_to_replace,
                     );
+                    *headset_coverage_clone.lock().unwrap() = native_headset_coverage.clone();
                     last_standard_native_poll = Instant::now();
                 }
                 prepare_detected_devices(
@@ -505,6 +551,7 @@ impl BatteryMonitor {
                             external_state.last_discovery = Some(Instant::now());
                         }
                     }
+                    native_logitech = logitech_devices_clone.lock().unwrap().clone();
                     reconcile_external_fallbacks(
                         &mut external_state,
                         native_maxwell_authoritative,
@@ -539,6 +586,10 @@ impl BatteryMonitor {
 
         Self {
             devices,
+            logitech_devices,
+            native_headset_coverage,
+            cached_devices: startup_cache,
+            initial_probe_started,
             last_update,
             refresh_interval: EXTERNAL_FALLBACK_REFRESH_INTERVAL,
             update_requested,
@@ -551,7 +602,27 @@ impl BatteryMonitor {
     /// Returns a clone of the device list from the last successful update.
     /// Thread-safe via internal mutex.
     pub fn devices(&self) -> Vec<BatteryDevice> {
-        self.devices.lock().unwrap().clone()
+        let (mut devices, headset_coverage) = {
+            // Read the slow snapshot and its ownership together. Publishers use
+            // the same lock order so removed headset rows cannot be resurrected.
+            let devices = self.devices.lock().unwrap();
+            let coverage = self.native_headset_coverage.lock().unwrap();
+            (devices.clone(), coverage.clone())
+        };
+        // Merge at read time so a delayed fallback snapshot cannot hide or
+        // overwrite a newer charging transition from the independent worker.
+        merge_uncovered_native_logitech(
+            &mut devices,
+            &self.logitech_devices.lock().unwrap(),
+            &headset_coverage,
+        );
+        expire_initial_readings(&mut devices, self.initial_probe_started.elapsed());
+        prepare_detected_devices(
+            &mut devices,
+            &self.cached_devices,
+            self.initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
+        );
+        devices
     }
 
     /// Request a battery update if refresh interval has elapsed.
@@ -750,6 +821,23 @@ fn merge_native_logitech(devices: &mut Vec<BatteryDevice>, native_devices: &[Bat
         let insertion_index = first_match.unwrap_or(devices.len()).min(devices.len());
         devices.insert(insertion_index, replacement);
     }
+}
+
+fn merge_uncovered_native_logitech(
+    devices: &mut Vec<BatteryDevice>,
+    native_devices: &[BatteryDevice],
+    headset_coverage: &[String],
+) {
+    let uncovered: Vec<_> = native_devices
+        .iter()
+        .filter(|device| {
+            !headset_coverage
+                .iter()
+                .any(|name| same_native_headset_name(&device.name, name))
+        })
+        .cloned()
+        .collect();
+    merge_native_logitech(devices, &uncovered);
 }
 
 fn replace_device_in_place(devices: &mut Vec<BatteryDevice>, replacement: BatteryDevice) {
@@ -1417,14 +1505,16 @@ fn parse_battery_line(text: &str) -> (Option<u8>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatteryDevice, ExternalDeviceState, ExternalProbePlan, INITIAL_NATIVE_POLL_INTERVAL,
-        INITIAL_PROBE_TIMEOUT, LOGITECH_POLL_INTERVAL, NATIVE_POLL_INTERVAL, WOLVERINE_DEVICE_NAME,
-        expire_initial_readings, external_probe_plan, headsets, merge_native_headsets,
-        merge_native_logitech, merge_native_maxwell, merge_native_wolverine, native_poll_interval,
-        parse_headsetcontrol_json, parse_solaar_json, parse_solaar_text, prepare_detected_devices,
-        reconcile_external_fallbacks, reconcile_native_headset_fallbacks,
+        BatteryDevice, BatteryMonitor, ExternalDeviceState, ExternalProbePlan,
+        INITIAL_NATIVE_POLL_INTERVAL, INITIAL_PROBE_TIMEOUT, LOGITECH_POLL_INTERVAL,
+        NATIVE_POLL_INTERVAL, WOLVERINE_DEVICE_NAME, expire_initial_readings, external_probe_plan,
+        headsets, merge_native_headsets, merge_native_logitech, merge_native_maxwell,
+        merge_native_wolverine, native_poll_interval, parse_headsetcontrol_json, parse_solaar_json,
+        parse_solaar_text, prepare_detected_devices, reconcile_external_fallbacks,
+        reconcile_native_headset_fallbacks,
     };
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use std::time::{Duration, Instant};
 
     fn battery_device(name: &str, loading: bool) -> BatteryDevice {
         BatteryDevice {
@@ -1436,6 +1526,96 @@ mod tests {
             is_loading: loading,
             is_connected: false,
         }
+    }
+
+    fn monitor_with_snapshot(devices: Vec<BatteryDevice>) -> BatteryMonitor {
+        BatteryMonitor {
+            devices: Arc::new(Mutex::new(devices)),
+            logitech_devices: Arc::new(Mutex::new(Vec::new())),
+            native_headset_coverage: Arc::new(Mutex::new(Vec::new())),
+            cached_devices: Vec::new(),
+            initial_probe_started: Instant::now(),
+            last_update: Instant::now(),
+            refresh_interval: super::EXTERNAL_FALLBACK_REFRESH_INTERVAL,
+            update_requested: Arc::new(Mutex::new(false)),
+            solaar_enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[test]
+    fn charging_updates_do_not_wait_for_slow_backend_snapshots() {
+        let discharging = BatteryDevice {
+            level: Some(20),
+            status: Some("discharging".to_string()),
+            is_connected: true,
+            ..battery_device("MX Mechanical Mini", false)
+        };
+        let headset = BatteryDevice {
+            level: Some(80),
+            is_connected: true,
+            ..battery_device("Audeze Maxwell", false)
+        };
+        let slow_snapshot = vec![discharging.clone(), headset.clone()];
+        let monitor = monitor_with_snapshot(slow_snapshot.clone());
+
+        assert_eq!(monitor.devices(), slow_snapshot);
+        let charging = BatteryDevice {
+            status: Some("charging".to_string()),
+            ..discharging.clone()
+        };
+        // A native update arrives while the slower coordinator is still busy.
+        *monitor.logitech_devices.lock().unwrap() = vec![charging.clone()];
+        assert_eq!(monitor.devices(), vec![charging.clone(), headset.clone()]);
+
+        // The slow query finishes with an older value. It must not undo charging,
+        // even when the percentage has not changed.
+        *monitor.devices.lock().unwrap() = slow_snapshot;
+        assert_eq!(monitor.devices(), vec![charging, headset.clone()]);
+
+        *monitor.logitech_devices.lock().unwrap() = vec![discharging.clone()];
+        assert_eq!(
+            monitor.devices(),
+            vec![discharging.clone(), headset.clone()]
+        );
+
+        *monitor.logitech_devices.lock().unwrap() = vec![BatteryDevice {
+            is_connected: false,
+            ..discharging
+        }];
+        assert_eq!(monitor.devices(), vec![headset]);
+    }
+
+    #[test]
+    fn logitech_updates_preserve_dedicated_headset_ownership() {
+        let monitor = monitor_with_snapshot(Vec::new());
+        let generic_headset = BatteryDevice {
+            level: Some(70),
+            is_connected: true,
+            ..battery_device("Logitech G522", false)
+        };
+        let dedicated_headset = BatteryDevice {
+            level: Some(80),
+            ..generic_headset.clone()
+        };
+        *monitor.logitech_devices.lock().unwrap() = vec![generic_headset.clone()];
+        *monitor.native_headset_coverage.lock().unwrap() = vec!["G522".to_string()];
+        *monitor.devices.lock().unwrap() = vec![dedicated_headset.clone()];
+        super::merge_uncovered_native_logitech(
+            &mut monitor.devices.lock().unwrap(),
+            std::slice::from_ref(&generic_headset),
+            &["G522".to_string()],
+        );
+        assert_eq!(monitor.devices(), vec![dedicated_headset]);
+
+        // Dedicated headset readers also own disconnected states, represented
+        // by coverage without a visible row.
+        monitor.devices.lock().unwrap().clear();
+        super::merge_uncovered_native_logitech(
+            &mut monitor.devices.lock().unwrap(),
+            &[generic_headset],
+            &["G522".to_string()],
+        );
+        assert!(monitor.devices().is_empty());
     }
 
     fn headsetcontrol_output(status: &str, level: i64) -> String {

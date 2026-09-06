@@ -498,7 +498,17 @@ impl PointerHandler for MonitorWidget {
                                             click_x,
                                             click_y
                                         );
-                                        self.notifications.remove_notification(app_name, timestamp);
+                                        if let Some(notification) =
+                                            self.notifications.get_notifications().iter().find(
+                                                |notification| {
+                                                    notification.app_name == app_name
+                                                        && notification.timestamp == timestamp
+                                                },
+                                            )
+                                        {
+                                            self.notifications
+                                                .remove_notification(&notification.identity());
+                                        }
                                         self.force_redraw = true;
                                         handled = true;
                                         break;

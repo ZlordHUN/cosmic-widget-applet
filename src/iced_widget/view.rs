@@ -5,7 +5,7 @@ use super::stats::SystemSnapshot;
 use crate::battery::BatteryDevice;
 use crate::config::{Config, WidgetSection};
 use crate::media::{AlbumArt, MediaInfo, PlaybackStatus};
-use crate::notifications::Notification;
+use crate::notifications::{FileTransfer, Notification};
 use crate::storage::DiskInfo;
 use crate::weather::WeatherData;
 use chrono::{DateTime, Local};
@@ -528,7 +528,7 @@ fn notifications_view<'a>(
                         now_timestamp,
                         item_spacing,
                     ),
-                    super::NOTIFICATION_ITEM_HEIGHT as f32 + extra_height,
+                    super::notification_base_height(notification) as f32 + extra_height,
                     has_entries,
                     dismissal_progress,
                 ));
@@ -545,7 +545,7 @@ fn notifications_view<'a>(
                     group_mounted && notification_group_expanded,
                     item_spacing,
                 ),
-                super::NOTIFICATION_ITEM_HEIGHT as f32,
+                super::notification_group_base_height(&group.notifications) as f32,
                 has_entries,
                 dismissal_progress,
             ));
@@ -566,7 +566,8 @@ fn notifications_view<'a>(
                     } else {
                         0.0
                     };
-                    let item_height = super::NOTIFICATION_ITEM_HEIGHT as f32 + extra_height;
+                    let item_height =
+                        super::notification_base_height(notification) as f32 + extra_height;
                     group_height += item_height;
                     group_items = group_items.push(notification_list_entry(
                         notification_item(
@@ -736,6 +737,7 @@ fn notification_group_item<'a>(
     expanded: bool,
     spacing: u16,
 ) -> Element<'a, super::Message> {
+    let transfer_notification = notification_group_transfer(&group.notifications);
     let title = widget::text::caption_heading(compact_single_line(group.source, usize::MAX))
         .width(Length::Fill)
         .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -746,10 +748,17 @@ fn notification_group_item<'a>(
         .width(Length::Fill)
         .spacing(0)
         .push(title)
-        .push(widget::text::caption(format!(
-            "{} notifications",
-            group.notifications.len()
-        )));
+        .push(
+            widget::text::caption(match transfer_notification {
+                Some(notification) => compact_single_line(&notification.summary, usize::MAX),
+                None => format!("{} notifications", group.notifications.len()),
+            })
+            .width(Length::Fill)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            )),
+        );
     let chevron = widget::icon::from_name(if expanded {
         "go-down-symbolic"
     } else {
@@ -763,6 +772,11 @@ fn notification_group_item<'a>(
         .push(notification_dot(group.source))
         .push(text)
         .push(chevron);
+    let content = notification_with_transfer_progress(
+        content.into(),
+        transfer_notification.and_then(active_file_transfer),
+        spacing,
+    );
 
     widget::mouse_area(content)
         .on_press(super::Message::ToggleNotificationGroup {
@@ -820,8 +834,7 @@ fn notification_item<'a>(
         .padding(5)
         .on_press_maybe(
             (!dismissing).then_some(super::Message::DismissNotification {
-                app_name: notification.app_name.clone(),
-                timestamp: notification.timestamp,
+                key: notification.identity(),
             }),
         );
     let text = widget::column::with_capacity(2)
@@ -847,24 +860,21 @@ fn notification_item<'a>(
         .push(text);
     let content = widget::mouse_area(content)
         .on_press(super::Message::ToggleNotification {
-            app_name: notification.app_name.clone(),
-            timestamp: notification.timestamp,
+            key: notification.identity(),
         })
         .interaction(cosmic::iced::mouse::Interaction::Pointer);
     let open_message = notification
         .open_folder
         .as_ref()
         .map(|_| super::Message::OpenNotificationFolder {
-            app_name: notification.app_name.clone(),
-            timestamp: notification.timestamp,
+            key: notification.identity(),
         })
         .or_else(|| {
             notification
                 .activation_action
                 .as_ref()
                 .map(|_| super::Message::ActivateNotification {
-                    app_name: notification.app_name.clone(),
-                    timestamp: notification.timestamp,
+                    key: notification.identity(),
                 })
         });
     let actionable = allow_open_action && open_message.is_some();
@@ -903,23 +913,89 @@ fn notification_item<'a>(
         .push(content)
         .push(metadata)
         .into();
+    let row = notification_with_transfer_progress(row, active_file_transfer(notification), spacing);
 
     if actionable {
         widget::mouse_area(row)
             .on_enter(super::Message::NotificationHoverChanged {
-                app_name: notification.app_name.clone(),
-                timestamp: notification.timestamp,
+                key: notification.identity(),
                 hovered: true,
             })
             .on_exit(super::Message::NotificationHoverChanged {
-                app_name: notification.app_name.clone(),
-                timestamp: notification.timestamp,
+                key: notification.identity(),
                 hovered: false,
             })
             .into()
     } else {
         row
     }
+}
+
+fn active_file_transfer(notification: &Notification) -> Option<&FileTransfer> {
+    notification
+        .file_transfer
+        .as_ref()
+        .filter(|transfer| transfer.is_active())
+}
+
+pub(super) fn notification_group_transfer<'a>(
+    notifications: &[&'a Notification],
+) -> Option<&'a Notification> {
+    notifications
+        .iter()
+        .copied()
+        .find(|notification| active_file_transfer(notification).is_some())
+        .or_else(|| {
+            notifications
+                .first()
+                .copied()
+                .filter(|notification| notification.file_transfer.is_some())
+        })
+}
+
+fn file_transfer_progress(transfer: &FileTransfer) -> Element<'static, super::Message> {
+    let progress = transfer.progress.min(100);
+    widget::row::with_capacity(2)
+        .width(Length::Fill)
+        .height(Length::Fixed(18.0))
+        .align_y(Alignment::Center)
+        .spacing(8)
+        .push(
+            widget::progress_bar::linear::Linear::new()
+                .girth(3)
+                .progress(f32::from(progress) / 100.0)
+                .width(Length::Fill),
+        )
+        .push(
+            widget::container(widget::text::caption(format!("{progress}%")))
+                .width(Length::Fixed(36.0))
+                .align_x(cosmic::iced::alignment::Horizontal::Right),
+        )
+        .into()
+}
+
+fn notification_with_transfer_progress<'a>(
+    content: Element<'a, super::Message>,
+    transfer: Option<&FileTransfer>,
+    spacing: u16,
+) -> Element<'a, super::Message> {
+    let Some(transfer) = transfer else {
+        return content;
+    };
+    widget::column::with_capacity(2)
+        .width(Length::Fill)
+        .spacing(6)
+        .push(content)
+        .push(
+            widget::container(file_transfer_progress(transfer))
+                .width(Length::Fill)
+                // Align the bar with the caption after the notification dot.
+                .padding(cosmic::iced::Padding {
+                    left: 8.0 + f32::from(spacing),
+                    ..Default::default()
+                }),
+        )
+        .into()
 }
 
 fn filled_notification_icon() -> Element<'static, super::Message> {
