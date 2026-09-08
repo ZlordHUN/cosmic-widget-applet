@@ -22,6 +22,7 @@ and a frosted-glass desktop overlay.
 - Open-Meteo weather with no API key
 - Grouped, expandable COSMIC notifications with synchronized dismissal
 - Multi-source media controls for MPRIS players, Cider, Emby, and browser media
+- YouTube thumbnails and Bandcamp album covers for browser playback
 - Reorderable and individually configurable sections
 - COSMIC theming, accent colors, blur, rounded corners, and drag-to-position
 - Cached weather, notification, storage, and battery state for fast startup

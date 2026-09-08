@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "media/bandcamp.rs"]
+mod bandcamp;
 #[path = "media/cider.rs"]
 mod cider;
 #[path = "media/mpris.rs"]
@@ -55,6 +57,7 @@ const MAX_CACHED_ARTWORKS: usize = 20;
 const MAX_ARTWORK_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ARTWORK_CACHE_PIXELS: u64 = 32 * 1024 * 1024;
 const MEDIA_CONTROL_QUEUE_CAPACITY: usize = 32;
+const BANDCAMP_ARTWORK_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 // ============================================================================
 // Album Art Cache
@@ -640,7 +643,9 @@ impl From<&MediaInfo> for TrackSignature {
 struct TrackArtwork {
     track: TrackSignature,
     best: Option<AlbumArt>,
-    attempted_urls: HashSet<String>,
+    best_priority: u8,
+    attempted_sources: HashSet<ArtworkSource>,
+    retry_after: HashMap<ArtworkSource, Instant>,
 }
 
 impl TrackArtwork {
@@ -648,17 +653,52 @@ impl TrackArtwork {
         Self {
             track,
             best: None,
-            attempted_urls: HashSet::new(),
+            best_priority: 0,
+            attempted_sources: HashSet::new(),
+            retry_after: HashMap::new(),
         }
     }
 
-    fn accept(&mut self, candidate: AlbumArt) {
-        let is_better = self
-            .best
-            .as_ref()
-            .is_none_or(|current| candidate.source_pixel_count() > current.source_pixel_count());
+    fn accept(&mut self, source: &ArtworkSource, candidate: AlbumArt) {
+        let priority = source.priority();
+        let is_better = self.best.as_ref().is_none_or(|current| {
+            priority > self.best_priority
+                || (priority == self.best_priority
+                    && candidate.source_pixel_count() > current.source_pixel_count())
+        });
         if is_better {
             self.best = Some(candidate);
+            self.best_priority = priority;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ArtworkSource {
+    Image(String),
+    BandcampPage(String),
+}
+
+impl ArtworkSource {
+    fn url(&self) -> &str {
+        match self {
+            Self::Image(url) | Self::BandcampPage(url) => url,
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        // A verified album cover takes precedence over browser placeholder art.
+        u8::from(matches!(self, Self::BandcampPage(_)))
+    }
+
+    async fn load(&self, client: &reqwest::Client) -> Option<AlbumArt> {
+        match self {
+            Self::Image(url) => MediaMonitor::download_artwork(client, url).await,
+            Self::BandcampPage(url) => {
+                let page = bandcamp::page_url(url)?;
+                let image = bandcamp::resolve_artwork_url(client, &page).await?;
+                MediaMonitor::download_artwork(client, image.as_str()).await
+            }
         }
     }
 }
@@ -667,7 +707,7 @@ impl TrackArtwork {
 struct ArtworkRequest {
     player_id: PlayerId,
     track: TrackSignature,
-    url: String,
+    source: ArtworkSource,
 }
 
 struct ArtworkResult {
@@ -678,7 +718,7 @@ struct ArtworkResult {
 struct ArtworkLoader {
     requests: tokio::sync::mpsc::Sender<ArtworkRequest>,
     completed: std::sync::mpsc::Receiver<ArtworkResult>,
-    pending_urls: HashSet<String>,
+    pending_sources: HashSet<ArtworkSource>,
     available: bool,
 }
 
@@ -721,8 +761,7 @@ impl ArtworkLoader {
                         let completed_tx = completed_tx.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let artwork =
-                                MediaMonitor::download_artwork(&client, &request.url).await;
+                            let artwork = request.source.load(&client).await;
                             let _ = completed_tx.send(ArtworkResult { request, artwork });
                         });
                     }
@@ -735,23 +774,23 @@ impl ArtworkLoader {
         Self {
             requests: request_tx,
             completed: completed_rx,
-            pending_urls: HashSet::new(),
+            pending_sources: HashSet::new(),
             available: true,
         }
     }
 
     fn enqueue(&mut self, request: ArtworkRequest) -> bool {
-        if self.pending_urls.contains(&request.url) {
+        if self.pending_sources.contains(&request.source) {
             return true;
         }
         if !self.available {
             return false;
         }
 
-        let url = request.url.clone();
+        let source = request.source.clone();
         match self.requests.try_send(request) {
             Ok(()) => {
-                self.pending_urls.insert(url);
+                self.pending_sources.insert(source);
                 true
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => false,
@@ -766,7 +805,7 @@ impl ArtworkLoader {
     fn take_completed(&mut self) -> Vec<ArtworkResult> {
         let completed = self.completed.try_iter().collect::<Vec<_>>();
         for result in &completed {
-            self.pending_urls.remove(&result.request.url);
+            self.pending_sources.remove(&result.request.source);
         }
         completed
     }
@@ -1534,31 +1573,37 @@ impl MediaMonitor {
             .as_deref()
             .and_then(Self::extract_youtube_video_id)
             .is_some();
-        for url in Self::artwork_candidate_urls(info) {
-            let cached = { artwork_cache.lock().unwrap().get(&url) };
+        for source in Self::artwork_candidate_sources(info) {
+            let cached = { artwork_cache.lock().unwrap().get(source.url()) };
             if let Some(candidate) = cached {
-                selection.attempted_urls.insert(url.clone());
+                selection.attempted_sources.insert(source.clone());
                 let adequate_youtube_thumbnail = candidate.source_width
                     >= MIN_YOUTUBE_THUMBNAIL_WIDTH
                     && candidate.source_height >= MIN_YOUTUBE_THUMBNAIL_HEIGHT;
-                selection.accept(candidate);
+                selection.accept(&source, candidate);
                 if is_youtube && adequate_youtube_thumbnail {
                     break;
                 }
                 continue;
             }
 
-            if selection.attempted_urls.contains(&url) {
+            if selection.attempted_sources.contains(&source)
+                || selection
+                    .retry_after
+                    .get(&source)
+                    .is_some_and(|retry| Instant::now() < *retry)
+            {
                 continue;
             }
 
             let request = ArtworkRequest {
                 player_id: player_id.clone(),
                 track: track.clone(),
-                url: url.clone(),
+                source: source.clone(),
             };
             if artwork_loader.enqueue(request) {
-                selection.attempted_urls.insert(url);
+                selection.retry_after.remove(&source);
+                selection.attempted_sources.insert(source);
             }
         }
 
@@ -1573,7 +1618,12 @@ impl MediaMonitor {
         for result in artwork_loader.take_completed() {
             let ArtworkResult { request, artwork } = result;
             let Some(artwork) = artwork else {
-                log::debug!("Unable to load artwork from {}", request.url);
+                log::debug!("Unable to load artwork from {}", request.source.url());
+                Self::retry_failed_bandcamp_artwork(
+                    &request.source,
+                    artwork_by_player,
+                    Instant::now(),
+                );
                 continue;
             };
 
@@ -1586,6 +1636,25 @@ impl MediaMonitor {
         }
     }
 
+    fn retry_failed_bandcamp_artwork(
+        source: &ArtworkSource,
+        artwork_by_player: &mut HashMap<PlayerId, TrackArtwork>,
+        now: Instant,
+    ) {
+        if !matches!(source, ArtworkSource::BandcampPage(_)) {
+            return;
+        }
+        // Requests for the same album are shared across tracks and players.
+        // Every waiting selection must recover if that shared fetch fails.
+        for selection in artwork_by_player.values_mut() {
+            if selection.attempted_sources.remove(source) {
+                selection
+                    .retry_after
+                    .insert(source.clone(), now + BANDCAMP_ARTWORK_RETRY_DELAY);
+            }
+        }
+    }
+
     fn accept_completed_artwork(
         request: ArtworkRequest,
         artwork: AlbumArt,
@@ -1595,14 +1664,27 @@ impl MediaMonitor {
         let ArtworkRequest {
             player_id,
             track,
-            url,
+            source,
         } = request;
-        artwork_cache.insert(url, artwork.clone());
+        artwork_cache.insert(source.url().to_string(), artwork.clone());
         if let Some(selection) = artwork_by_player.get_mut(&player_id)
             && selection.track == track
         {
-            selection.accept(artwork);
+            selection.accept(&source, artwork);
         }
+    }
+
+    fn artwork_candidate_sources(info: &MediaInfo) -> Vec<ArtworkSource> {
+        let mut sources = Vec::new();
+        if let Some(page) = info.media_url.as_deref().and_then(bandcamp::page_url) {
+            sources.push(ArtworkSource::BandcampPage(page.to_string()));
+        }
+        sources.extend(
+            Self::artwork_candidate_urls(info)
+                .into_iter()
+                .map(ArtworkSource::Image),
+        );
+        sources
     }
 
     fn artwork_candidate_urls(info: &MediaInfo) -> Vec<String> {
@@ -2105,10 +2187,10 @@ impl MediaMonitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlbumArt, ArtworkCache, ArtworkRequest, EmbyCredentialDiscovery, HashMap, Instant,
-        MediaInfo, MediaMonitor, MultiPlayerState, PlaybackStatus, PlayerId, PositionTracker,
-        TrackArtwork, TrackSignature, merge_mpris_proxy_timeline, preferred_player_id,
-        update_tracked_position,
+        AlbumArt, ArtworkCache, ArtworkRequest, ArtworkSource, EmbyCredentialDiscovery, HashMap,
+        Instant, MediaInfo, MediaMonitor, MultiPlayerState, PlaybackStatus, PlayerId,
+        PositionTracker, TrackArtwork, TrackSignature, merge_mpris_proxy_timeline,
+        preferred_player_id, update_tracked_position,
     };
     use std::time::Duration;
 
@@ -2233,7 +2315,7 @@ mod tests {
             ArtworkRequest {
                 player_id: player_id.clone(),
                 track: old_track,
-                url: "https://example.test/old.jpg".to_string(),
+                source: ArtworkSource::Image("https://example.test/old.jpg".to_string()),
             },
             artwork(1280, 720),
             &mut cache,
@@ -2247,7 +2329,7 @@ mod tests {
             ArtworkRequest {
                 player_id: player_id.clone(),
                 track: current_track,
-                url: "https://example.test/current.jpg".to_string(),
+                source: ArtworkSource::Image("https://example.test/current.jpg".to_string()),
             },
             artwork(640, 360),
             &mut cache,
@@ -2444,11 +2526,135 @@ mod tests {
             media_url: Some("https://youtube.com/watch?v=testVideo_1".to_string()),
         };
         let mut selection = TrackArtwork::new(track);
-        selection.accept(artwork(1280, 720));
-        selection.accept(artwork(60, 60));
+        let source = ArtworkSource::Image("https://example.test/artwork.jpg".to_string());
+        selection.accept(&source, artwork(1280, 720));
+        selection.accept(&source, artwork(60, 60));
 
         let selected = selection.best.expect("artwork should be selected");
         assert_eq!((selected.source_width, selected.source_height), (1280, 720));
+    }
+
+    #[test]
+    fn bandcamp_cover_candidates_use_the_canonical_album_page() {
+        let info = MediaInfo {
+            media_url: Some(
+                "https://artist.bandcamp.com/album/example/?from=discover#track".into(),
+            ),
+            art_url: Some("file:///tmp/browser-placeholder.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            MediaMonitor::artwork_candidate_sources(&info),
+            vec![
+                ArtworkSource::BandcampPage("https://artist.bandcamp.com/album/example".into()),
+                ArtworkSource::Image("file:///tmp/browser-placeholder.png".into()),
+            ]
+        );
+        let unrelated = MediaInfo {
+            media_url: Some("https://example.test/album/example".into()),
+            ..Default::default()
+        };
+        assert!(MediaMonitor::artwork_candidate_sources(&unrelated).is_empty());
+    }
+
+    #[test]
+    fn bandcamp_album_cover_takes_precedence_over_browser_placeholder() {
+        let info = media(PlaybackStatus::Playing, 0, "Album");
+        let mut selection = TrackArtwork::new(TrackSignature::from(&info));
+        let placeholder = ArtworkSource::Image("file:///tmp/browser-placeholder.png".into());
+        let cover = ArtworkSource::BandcampPage("https://artist.bandcamp.com/album/example".into());
+        selection.accept(&placeholder, artwork(512, 512));
+        selection.accept(&cover, artwork(350, 350));
+        selection.accept(&placeholder, artwork(1024, 1024));
+        let best = selection.best.unwrap();
+        assert_eq!((best.source_width, best.source_height), (350, 350));
+    }
+
+    #[test]
+    fn failed_album_lookup_can_retry_for_every_track_waiting_on_the_shared_page() {
+        let source =
+            ArtworkSource::BandcampPage("https://artist.bandcamp.com/album/example".into());
+        let mut selections = HashMap::new();
+        for index in 0..2 {
+            let info = media(PlaybackStatus::Playing, 0, &format!("Track {index}"));
+            let mut selection = TrackArtwork::new(TrackSignature::from(&info));
+            selection.attempted_sources.insert(source.clone());
+            selections.insert(
+                PlayerId::Mpris(format!("org.mpris.MediaPlayer2.firefox.{index}")),
+                selection,
+            );
+        }
+        let now = Instant::now();
+        MediaMonitor::retry_failed_bandcamp_artwork(&source, &mut selections, now);
+        for selection in selections.values() {
+            assert!(!selection.attempted_sources.contains(&source));
+            assert_eq!(
+                selection.retry_after[&source],
+                now + super::BANDCAMP_ARTWORK_RETRY_DELAY
+            );
+        }
+    }
+
+    #[test]
+    fn cover_from_previous_album_cannot_replace_current_track_artwork() {
+        let player = PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".into());
+        let mut info = media(PlaybackStatus::Playing, 0, "Shared title");
+        info.media_url = Some("https://artist.bandcamp.com/album/previous".into());
+        let request = ArtworkRequest {
+            player_id: player.clone(),
+            track: TrackSignature::from(&info),
+            source: ArtworkSource::BandcampPage(info.media_url.clone().unwrap()),
+        };
+        info.media_url = Some("https://artist.bandcamp.com/album/current".into());
+        let mut selections = HashMap::from([(
+            player.clone(),
+            TrackArtwork::new(TrackSignature::from(&info)),
+        )]);
+        let mut cache = ArtworkCache::new(4);
+        MediaMonitor::accept_completed_artwork(
+            request,
+            artwork(350, 350),
+            &mut cache,
+            &mut selections,
+        );
+        assert!(selections[&player].best.is_none());
+        assert!(
+            cache
+                .get("https://artist.bandcamp.com/album/previous")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads artwork from the public album in BANDCAMP_TEST_URL"]
+    async fn live_bandcamp_page_loads_decoded_album_artwork() {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Info)
+            .try_init();
+        let raw = std::env::var("BANDCAMP_TEST_URL")
+            .expect("set BANDCAMP_TEST_URL to a public album or track");
+        let page = super::bandcamp::page_url(&raw).expect("valid Bandcamp page URL");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .user_agent("cosmic-widget-applet/0.1")
+            .build()
+            .unwrap();
+        let cover = ArtworkSource::BandcampPage(page.to_string())
+            .load(&client)
+            .await
+            .expect("album cover must download and decode");
+        assert!(cover.source_width > 0 && cover.source_height > 0);
+        if let Ok(path) = std::env::var("BANDCAMP_TEST_ARTWORK_PATH") {
+            let cosmic::iced::widget::image::Handle::Bytes(_, bytes) = &cover.iced_handle else {
+                panic!("artwork must retain encoded bytes");
+            };
+            std::fs::write(path, bytes).unwrap();
+        }
+        println!(
+            "Bandcamp cover decoded: {}x{}",
+            cover.source_width, cover.source_height
+        );
     }
 
     #[test]

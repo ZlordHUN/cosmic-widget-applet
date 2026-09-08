@@ -155,7 +155,10 @@ Controls are queued to an asynchronous command worker. Artwork is downloaded
 asynchronously through a persistent client and retained in a bounded LRU cache
 with entry, byte, and pixel limits. YouTube artwork candidates are keyed by
 video identity so lower-resolution updates cannot replace better artwork for
-the same track.
+the same track. Bandcamp album and track pages supply cover metadata when a
+browser omits artwork from MPRIS. These lookups share the asynchronous loader,
+cache covers by page URL, and retry temporary failures. Confirmed Bandcamp
+covers take precedence over browser placeholder images.
 
 ## Configuration
 
@@ -200,7 +203,7 @@ src/
 |  |- battery.rs             battery monitor coordinator
 |  |- battery/               native device protocol modules
 |  |- media.rs               multi-source media coordinator
-|  |- media/                 Cider and MPRIS backends
+|  |- media/                 Cider and MPRIS backends, Bandcamp artwork resolver
 |  |- notifications.rs       D-Bus capture/history/dismissal
 |  |- utilization.rs         CPU, memory, and GPU utilization
 |  |- temperature.rs         hardware temperatures
