@@ -17,21 +17,25 @@ struct SlideLeft<'a, Message> {
     progress: f32,
 }
 
+// Exit cards ignore input. A distinct subtree prevents interrupted drag/press
+// state from leaking into a live card when the transition ends or is cancelled.
+struct SlideState;
+
 impl<Message> Widget<Message, Theme, Renderer> for SlideLeft<'_, Message> {
     fn tag(&self) -> tree::Tag {
-        self.content.as_widget().tag()
+        tree::Tag::of::<SlideState>()
     }
 
     fn state(&self) -> tree::State {
-        self.content.as_widget().state()
+        tree::State::new(SlideState)
     }
 
     fn children(&self) -> Vec<Tree> {
-        self.content.as_widget().children()
+        vec![Tree::new(self.content.as_widget())]
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        self.content.as_widget_mut().diff(tree);
+        tree.diff_children(std::slice::from_mut(&mut self.content));
     }
 
     fn size(&self) -> Size<Length> {
@@ -44,7 +48,9 @@ impl<Message> Widget<Message, Theme, Renderer> for SlideLeft<'_, Message> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        self.content.as_widget_mut().layout(tree, renderer, limits)
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
     }
 
     fn draw(
@@ -68,7 +74,7 @@ impl<Message> Widget<Message, Theme, Renderer> for SlideLeft<'_, Message> {
         renderer.with_layer(clip, |renderer| {
             renderer.with_translation(translation, |renderer| {
                 self.content.as_widget().draw(
-                    tree,
+                    &tree.children[0],
                     renderer,
                     theme,
                     style,
@@ -87,12 +93,62 @@ fn left_offset(width: f32, progress: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::left_offset;
+    use super::*;
 
     #[test]
     fn slide_moves_from_rest_to_one_full_width_left() {
         assert_eq!(left_offset(320.0, 0.0), 0.0);
         assert_eq!(left_offset(320.0, 0.5), -160.0);
         assert_eq!(left_offset(320.0, 1.0), -320.0);
+    }
+
+    #[derive(Default)]
+    struct InputState {
+        dragging: bool,
+    }
+
+    struct StatefulInput;
+
+    impl Widget<(), Theme, Renderer> for StatefulInput {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<InputState>()
+        }
+        fn state(&self) -> tree::State {
+            tree::State::new(InputState::default())
+        }
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Shrink, Length::Shrink)
+        }
+        fn layout(&mut self, _: &mut Tree, _: &Renderer, _: &layout::Limits) -> layout::Node {
+            layout::Node::new(Size::new(100.0, 20.0))
+        }
+        fn draw(
+            &self,
+            _: &Tree,
+            _: &mut Renderer,
+            _: &Theme,
+            _: &renderer::Style,
+            _: Layout<'_>,
+            _: mouse::Cursor,
+            _: &Rectangle,
+        ) {
+        }
+    }
+
+    #[test]
+    fn interrupted_drag_is_reset_when_entering_and_leaving_slide() {
+        let mut input: Element<'_, ()> = Element::new(StatefulInput);
+        let mut tree = Tree::new(input.as_widget());
+        tree.state.downcast_mut::<InputState>().dragging = true;
+
+        let mut outgoing = left(Element::new(StatefulInput), 0.0);
+        tree.diff(outgoing.as_widget_mut());
+        assert!(!tree.children[0].state.downcast_ref::<InputState>().dragging);
+
+        // Even private input state inside the outgoing card must never be
+        // inherited by a replacement source with an identical control layout.
+        tree.children[0].state.downcast_mut::<InputState>().dragging = true;
+        tree.diff(input.as_widget_mut());
+        assert!(!tree.state.downcast_ref::<InputState>().dragging);
     }
 }

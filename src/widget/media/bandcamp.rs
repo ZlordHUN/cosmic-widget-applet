@@ -1,11 +1,30 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Resolve album artwork when Bandcamp's browser media session omits it.
+//! Resolve public album metadata when Bandcamp's browser media session omits it.
 
 use reqwest::{Url, header::CONTENT_TYPE};
 use scraper::{Html, Selector};
 
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TRACKS: usize = 512;
+const MAX_TEXT_CHARS: usize = 1024;
+const MAX_TRACK_DURATION_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+
+#[derive(Clone, Debug)]
+pub(super) struct PageMetadata {
+    pub(super) artwork_url: Option<Url>,
+    pub(super) album: String,
+    pub(super) artist: String,
+    pub(super) tracks: Vec<TrackMetadata>,
+    pub(super) tracks_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TrackMetadata {
+    pub(super) title: String,
+    pub(super) duration_ms: u64,
+    pub(super) url: Url,
+}
 
 /// Only individual album/track pages identify artwork for a media session.
 pub(super) fn page_url(raw: &str) -> Option<Url> {
@@ -31,7 +50,15 @@ pub(super) fn page_url(raw: &str) -> Option<Url> {
     Some(url)
 }
 
+#[cfg(test)]
 pub(super) async fn resolve_artwork_url(client: &reqwest::Client, page: &Url) -> Option<Url> {
+    fetch_page_metadata(client, page).await?.artwork_url
+}
+
+pub(super) async fn fetch_page_metadata(
+    client: &reqwest::Client,
+    page: &Url,
+) -> Option<PageMetadata> {
     let page = page_url(page.as_str())?;
     let mut response = client
         .get(page)
@@ -39,11 +66,11 @@ pub(super) async fn resolve_artwork_url(client: &reqwest::Client, page: &Url) ->
         .send()
         .await
         .map_err(|error| {
-            log::debug!("Unable to fetch Bandcamp artwork metadata: {error:?}");
+            log::debug!("Unable to fetch Bandcamp page metadata: {error:?}");
         })
         .ok()?;
     if !response.status().is_success() {
-        log::debug!("Bandcamp artwork metadata returned {}", response.status());
+        log::debug!("Bandcamp page metadata returned {}", response.status());
         return None;
     }
     // A redirect must still resolve to an album/track page on Bandcamp.
@@ -68,7 +95,7 @@ pub(super) async fn resolve_artwork_url(client: &reqwest::Client, page: &Url) ->
         }
         bytes.extend_from_slice(&chunk);
     }
-    artwork_url_from_html(&String::from_utf8_lossy(&bytes), &final_page)
+    page_metadata_from_html(&String::from_utf8_lossy(&bytes), &final_page)
 }
 
 fn is_public_http_url(url: &Url) -> bool {
@@ -88,8 +115,89 @@ fn trusted_image_url(raw: &str, page: &Url) -> Option<Url> {
     Some(url)
 }
 
-fn artwork_url_from_html(html: &str, page: &Url) -> Option<Url> {
+fn page_metadata_from_html(html: &str, page: &Url) -> Option<PageMetadata> {
     let document = Html::parse_document(html);
+    let mut metadata = PageMetadata {
+        artwork_url: artwork_url_from_document(&document, page),
+        album: String::new(),
+        artist: String::new(),
+        tracks: Vec::new(),
+        tracks_complete: false,
+    };
+    let selector = Selector::parse("[data-tralbum]").ok()?;
+    for element in document.select(&selector) {
+        let Some(data) = element
+            .value()
+            .attr("data-tralbum")
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .filter(serde_json::Value::is_object)
+        else {
+            continue;
+        };
+        metadata.album = bounded_text(&data["current"]["title"]);
+        metadata.artist = bounded_text(&data["artist"]);
+        if let Some(tracks) = data["trackinfo"].as_array() {
+            metadata.tracks = tracks
+                .iter()
+                .take(MAX_TRACKS)
+                .filter_map(|track| parse_track(track, page))
+                .collect();
+            metadata.tracks_complete = !tracks.is_empty() && metadata.tracks.len() == tracks.len();
+        }
+        if !metadata.album.is_empty() || !metadata.artist.is_empty() || !metadata.tracks.is_empty()
+        {
+            break;
+        }
+    }
+    if metadata.artwork_url.is_none()
+        && metadata.album.is_empty()
+        && metadata.artist.is_empty()
+        && metadata.tracks.is_empty()
+    {
+        return None;
+    }
+    Some(metadata)
+}
+
+fn bounded_text(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(MAX_TEXT_CHARS)
+        .collect()
+}
+
+fn parse_track(data: &serde_json::Value, page: &Url) -> Option<TrackMetadata> {
+    let title = bounded_text(&data["title"]);
+    if title.is_empty() {
+        return None;
+    }
+    let duration_seconds = data["duration"].as_f64()?;
+    if !duration_seconds.is_finite()
+        || duration_seconds <= 0.0
+        || duration_seconds > MAX_TRACK_DURATION_SECONDS
+    {
+        return None;
+    }
+    let duration_ms = (duration_seconds * 1000.0) as u64;
+    if duration_ms == 0 {
+        return None;
+    }
+    let url = page.join(data["title_link"].as_str()?.trim()).ok()?;
+    let url = page_url(url.as_str())?;
+    if url.origin() != page.origin() || !url.path().starts_with("/track/") {
+        return None;
+    }
+    Some(TrackMetadata {
+        title,
+        duration_ms,
+        url,
+    })
+}
+
+fn artwork_url_from_document(document: &Html, page: &Url) -> Option<Url> {
     let meta = Selector::parse("meta").ok()?;
     for property in ["og:image:secure_url", "og:image"] {
         for element in document.select(&meta) {
@@ -124,11 +232,170 @@ fn artwork_url_from_html(html: &str, page: &Url) -> Option<Url> {
 }
 
 #[cfg(test)]
+fn artwork_url_from_html(html: &str, page: &Url) -> Option<Url> {
+    artwork_url_from_document(&Html::parse_document(html), page)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn page() -> Url {
         page_url("https://artist.bandcamp.com/album/example").unwrap()
+    }
+
+    fn tralbum_html(data: serde_json::Value) -> String {
+        let encoded = data
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('"', "&quot;");
+        format!("<script data-tralbum=\"{encoded}\"></script>")
+    }
+
+    #[test]
+    fn parses_public_album_track_metadata_and_artwork_from_one_document() {
+        let html = format!(
+            r#"<meta property="og:image" content="https://f4.bcbits.com/img/cover.jpg">{}"#,
+            tralbum_html(serde_json::json!({
+                "artist": " Artist & Friends ",
+                "current": { "title": " Album \"Title\" ", "type": "album" },
+                "featured_track_id": 2,
+                "trackinfo": [
+                    {
+                        "track_id": 1,
+                        "title": " First & Second ",
+                        "duration": 183.125,
+                        "title_link": "/track/first-and-second?from=album#lyrics",
+                        "file": { "mp3-128": "https://example.invalid/audio" }
+                    },
+                    {
+                        "track_id": 2,
+                        "title": "Another Song",
+                        "duration": 201.9999,
+                        "title_link": "https://artist.bandcamp.com/track/another-song"
+                    }
+                ]
+            }))
+        );
+        let metadata = page_metadata_from_html(&html, &page()).unwrap();
+        assert_eq!(metadata.album, "Album \"Title\"");
+        assert_eq!(metadata.artist, "Artist & Friends");
+        assert_eq!(
+            metadata.artwork_url.unwrap().as_str(),
+            "https://f4.bcbits.com/img/cover.jpg"
+        );
+        assert_eq!(metadata.tracks.len(), 2);
+        assert_eq!(metadata.tracks[0].title, "First & Second");
+        assert_eq!(metadata.tracks[0].duration_ms, 183_125);
+        assert_eq!(
+            metadata.tracks[0].url.as_str(),
+            "https://artist.bandcamp.com/track/first-and-second"
+        );
+        assert_eq!(metadata.tracks[1].duration_ms, 201_999);
+        // A page's featured track is static metadata, never a playback signal.
+        assert_eq!(metadata.tracks[1].title, "Another Song");
+        assert!(metadata.tracks_complete);
+    }
+
+    #[test]
+    fn preserves_artwork_when_track_data_is_missing_or_malformed() {
+        for tralbum in [
+            "",
+            r#"<script data-tralbum="invalid JSON"></script>"#,
+            r#"<script data-tralbum="[]"></script>"#,
+            r#"<script data-tralbum='{"trackinfo": "invalid"}'></script>"#,
+        ] {
+            let html = format!(
+                r#"<meta property="og:image" content="https://f4.bcbits.com/img/cover.jpg">{tralbum}"#
+            );
+            let metadata = page_metadata_from_html(&html, &page()).unwrap();
+            assert!(metadata.artwork_url.is_some());
+            assert!(metadata.tracks.is_empty());
+            assert!(metadata.album.is_empty());
+            assert!(metadata.artist.is_empty());
+            assert!(!metadata.tracks_complete);
+        }
+        assert!(page_metadata_from_html("<html>Unavailable</html>", &page()).is_none());
+    }
+
+    #[test]
+    fn skips_malformed_tracks_and_untrusted_links_without_losing_valid_tracks() {
+        let valid_track = serde_json::json!({
+            "title": "Song", "duration": 90.0, "title_link": "/track/song"
+        });
+        let mut tracks = vec![serde_json::Value::Null, valid_track.clone()];
+        for invalid_url in [
+            "/album/example",
+            "/track/",
+            "/track/song/extra",
+            "https://other.bandcamp.com/track/song",
+            "http://artist.bandcamp.com/track/song",
+            "https://artist.bandcamp.com:8443/track/song",
+            "https://artist.bandcamp.com.example.org/track/song",
+            "https://user:password@artist.bandcamp.com/track/song",
+            "file:///track/song",
+        ] {
+            let mut track = valid_track.clone();
+            track["title_link"] = invalid_url.into();
+            tracks.push(track);
+        }
+        for invalid_duration in [
+            serde_json::Value::Null,
+            serde_json::json!("90"),
+            serde_json::json!(-1.0),
+            serde_json::json!(0.0),
+            serde_json::json!(0.0001),
+            serde_json::json!(MAX_TRACK_DURATION_SECONDS + 1.0),
+        ] {
+            let mut track = valid_track.clone();
+            track["duration"] = invalid_duration;
+            tracks.push(track);
+        }
+        let mut missing_title = valid_track;
+        missing_title["title"] = "  ".into();
+        tracks.push(missing_title);
+        let html = tralbum_html(serde_json::json!({"trackinfo": tracks}));
+        let metadata = page_metadata_from_html(&html, &page()).unwrap();
+        assert_eq!(metadata.tracks.len(), 1);
+        assert_eq!(metadata.tracks[0].title, "Song");
+        assert!(metadata.artwork_url.is_none());
+        assert!(!metadata.tracks_complete);
+    }
+
+    #[test]
+    fn skips_invalid_embedded_json_before_valid_metadata() {
+        let html = format!(
+            r#"<script data-tralbum="invalid"></script>{}"#,
+            tralbum_html(serde_json::json!({
+                "current": { "title": "Album" }, "artist": "Artist"
+            }))
+        );
+        let metadata = page_metadata_from_html(&html, &page()).unwrap();
+        assert_eq!(metadata.album, "Album");
+        assert_eq!(metadata.artist, "Artist");
+        assert!(metadata.tracks.is_empty());
+    }
+
+    #[test]
+    fn bounds_track_count_and_unicode_text_lengths() {
+        let long_title = "音".repeat(MAX_TEXT_CHARS + 10);
+        let tracks = vec![
+            serde_json::json!({
+                "title": long_title, "duration": 90, "title_link": "/track/song"
+            });
+            MAX_TRACKS + 1
+        ];
+        let html = tralbum_html(serde_json::json!({
+            "current": { "title": long_title },
+            "artist": long_title,
+            "trackinfo": tracks
+        }));
+        let metadata = page_metadata_from_html(&html, &page()).unwrap();
+        assert_eq!(metadata.album.chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(metadata.artist.chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(metadata.tracks.len(), MAX_TRACKS);
+        assert_eq!(metadata.tracks[0].title.chars().count(), MAX_TEXT_CHARS);
+        assert!(!metadata.tracks_complete);
     }
 
     #[test]

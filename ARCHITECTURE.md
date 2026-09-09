@@ -151,6 +151,11 @@ The media monitor merges several sources into a stable player list:
 - Cider through its local HTTP API;
 - Emby sessions found from the local client state and queried over HTTP.
 
+When the displayed source disappears or clears its track metadata, the overlay
+retains its card for the same 220 ms left slide used by notification dismissal.
+The heading and layout height stay fixed until the slide finishes. The outgoing
+card cannot send playback commands; the monitor continues tracking live sources.
+
 Controls are queued to an asynchronous command worker. Artwork is downloaded
 asynchronously through a persistent client and retained in a bounded LRU cache
 with entry, byte, and pixel limits. YouTube artwork candidates are keyed by
@@ -159,6 +164,12 @@ the same track. Bandcamp album and track pages supply cover metadata when a
 browser omits artwork from MPRIS. These lookups share the asynchronous loader,
 cache covers by page URL, and retry temporary failures. Confirmed Bandcamp
 covers take precedence over browser placeholder images.
+The same response supplies the public track list. For Zen/Firefox playback with
+only a page caption, an unambiguous whole-second duration match supplies the
+track title, artist, and album before timeline tracking. Explicit track URLs
+identify tracks directly. Incomplete track lists, duplicate durations, and
+unknown durations keep the original caption; browser-supplied track titles
+are preserved. No browser extension is required.
 
 ## Configuration
 

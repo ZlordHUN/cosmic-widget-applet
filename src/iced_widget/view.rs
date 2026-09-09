@@ -46,6 +46,7 @@ pub fn widget_view<'a>(
     clear_button_visibility: f32,
     notification_scroll_translation: f32,
     surface_height: u32,
+    dismissing_media: Option<&'a super::DismissingMedia>,
     media_seek_preview: Option<f64>,
     media_timeline_hovered: bool,
 ) -> Element<'a, super::Message> {
@@ -115,6 +116,7 @@ pub fn widget_view<'a>(
             )),
             WidgetSection::Media if config.show_media => Some(media_view(
                 stats,
+                dismissing_media,
                 media_seek_preview,
                 spacing.space_xs,
                 spacing.space_xs,
@@ -1007,27 +1009,30 @@ fn filled_notification_icon() -> Element<'static, super::Message> {
 
 fn media_view<'a>(
     stats: &'a SystemSnapshot,
+    dismissing: Option<&'a super::DismissingMedia>,
     seek_preview: Option<f64>,
     section_spacing: u16,
     content_spacing: u16,
     detail_spacing: u16,
     timeline_hovered: bool,
 ) -> Element<'a, super::Message> {
-    if let Some((_, info)) = stats
-        .media
-        .current_player()
-        .filter(|(_, info)| info.is_active())
-    {
+    let state = dismissing.map_or(&stats.media, |outgoing| &outgoing.state);
+    if let Some((_, info)) = state.current_player().filter(|(_, info)| info.is_active()) {
+        let content = media_content(
+            info,
+            state,
+            seek_preview,
+            content_spacing,
+            detail_spacing,
+            timeline_hovered,
+        );
+        let content = match dismissing {
+            Some(outgoing) => super::slide::left(content, outgoing.animation.progress),
+            None => content,
+        };
         return section("emblem-music-symbolic", "Now Playing", section_spacing)
             .height(Length::Fixed(MEDIA_ACTIVE_SECTION_HEIGHT))
-            .push(media_content(
-                info,
-                &stats.media,
-                seek_preview,
-                content_spacing,
-                detail_spacing,
-                timeline_hovered,
-            ))
+            .push(content)
             .into();
     }
 

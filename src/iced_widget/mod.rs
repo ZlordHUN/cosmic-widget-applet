@@ -63,6 +63,63 @@ struct PendingPlayback {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct DismissingMedia {
+    state: MultiPlayerState,
+    animation: ExpansionAnimation,
+}
+
+fn reconcile_media_dismissal(
+    dismissal: &mut Option<DismissingMedia>,
+    previous: &MultiPlayerState,
+    current: &MultiPlayerState,
+    now: Instant,
+) {
+    if let Some(outgoing) = dismissal.as_ref() {
+        // A source can recover while its old card is still sliding away.
+        if current.current_player().is_some_and(|(id, info)| {
+            info.is_active()
+                && outgoing
+                    .state
+                    .current_player()
+                    .is_some_and(|(old_id, _)| old_id == id)
+        }) {
+            *dismissal = None;
+        }
+        return;
+    }
+
+    let Some((previous_id, _)) = previous
+        .current_player()
+        .filter(|(_, info)| info.is_active())
+    else {
+        return;
+    };
+    if current
+        .players
+        .iter()
+        .any(|(id, info)| id == previous_id && info.is_active())
+    {
+        return;
+    }
+
+    let mut animation = ExpansionAnimation::default();
+    animation.transition_to(1.0, now);
+    *dismissal = Some(DismissingMedia {
+        state: previous.clone(),
+        animation,
+    });
+}
+
+fn advance_media_dismissal(dismissal: &mut Option<DismissingMedia>, now: Instant) {
+    if let Some(outgoing) = dismissal {
+        outgoing.animation.advance(now);
+        if !outgoing.animation.is_animating() {
+            *dismissal = None;
+        }
+    }
+}
+
 type NotificationKey = crate::notifications::NotificationIdentity;
 
 #[derive(Debug, Clone)]
@@ -276,6 +333,7 @@ struct App {
     clearing_notifications: bool,
     clear_button_animation: ExpansionAnimation,
     notification_scroll: ScrollAnimation,
+    dismissing_media: Option<DismissingMedia>,
     media_seek_preview: Option<f64>,
     media_timeline_hovered: bool,
     pending_playback: Option<PendingPlayback>,
@@ -363,6 +421,7 @@ impl App {
                 clearing_notifications: false,
                 clear_button_animation: ExpansionAnimation::default(),
                 notification_scroll: ScrollAnimation::default(),
+                dismissing_media: None,
                 media_seek_preview: None,
                 media_timeline_hovered: false,
                 pending_playback: None,
@@ -391,6 +450,22 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // The outgoing card is visual only. Ignore any control event queued
+        // just before its source disappeared rather than redirecting it.
+        if self.dismissing_media.is_some()
+            && matches!(
+                &message,
+                Message::PreviousMedia
+                    | Message::PlayPauseMedia
+                    | Message::NextMedia
+                    | Message::SelectMediaPlayer(_)
+                    | Message::MediaSeekChanged(_)
+                    | Message::CommitMediaSeek
+                    | Message::MediaTimelineHoverChanged(_)
+            )
+        {
+            return Task::none();
+        }
         let mut tasks = Vec::new();
 
         match message {
@@ -398,11 +473,7 @@ impl App {
                 self.now = Local::now();
                 let had_notifications = !self.snapshot.notifications.is_empty();
                 let mut snapshot = self.sampler.snapshot();
-                reconcile_media_state(
-                    &mut snapshot.media,
-                    &mut self.pending_playback,
-                    Instant::now(),
-                );
+                snapshot.media = self.prepare_media_state(snapshot.media, Instant::now());
                 self.snapshot = snapshot;
                 let has_notifications = !self.snapshot.notifications.is_empty();
                 transition_clear_button_for_notification_change(
@@ -499,6 +570,7 @@ impl App {
                     self.expanded_notification_group.as_deref(),
                     self.notification_expansion.progress,
                     self.notification_group_expansion.progress,
+                    self.dismissing_media.is_some(),
                 );
                 let size_changed = surface_height != self.surface_height;
                 let frosted_changed = frosted != self.frosted;
@@ -526,6 +598,7 @@ impl App {
                 self.notification_group_expansion.advance(now);
                 self.clear_button_animation.advance(now);
                 self.notification_scroll.advance(now);
+                advance_media_dismissal(&mut self.dismissing_media, now);
                 for dismissal in &mut self.dismissing_notifications {
                     dismissal.animation.advance(now);
                 }
@@ -601,6 +674,7 @@ impl App {
                     self.expanded_notification_group.as_deref(),
                     self.notification_expansion.progress,
                     self.notification_group_expansion.progress,
+                    self.dismissing_media.is_some(),
                 );
 
                 if was_animating && !self.animations_active() {
@@ -751,12 +825,8 @@ impl App {
                     }
                 });
                 self.sampler.play_pause_media();
-                self.snapshot.media = self.sampler.media_state();
-                reconcile_media_state(
-                    &mut self.snapshot.media,
-                    &mut self.pending_playback,
-                    Instant::now(),
-                );
+                self.snapshot.media =
+                    self.prepare_media_state(self.sampler.media_state(), Instant::now());
             }
             Message::NextMedia => {
                 self.media_seek_preview = None;
@@ -768,12 +838,8 @@ impl App {
                 self.media_timeline_hovered = false;
                 self.pending_playback = None;
                 self.sampler.select_media_player(&player_id);
-                self.snapshot.media = self.sampler.media_state();
-                reconcile_media_state(
-                    &mut self.snapshot.media,
-                    &mut self.pending_playback,
-                    Instant::now(),
-                );
+                self.snapshot.media =
+                    self.prepare_media_state(self.sampler.media_state(), Instant::now());
             }
             Message::MediaTimelineHoverChanged(hovered) => {
                 self.media_timeline_hovered = hovered;
@@ -784,7 +850,8 @@ impl App {
             Message::CommitMediaSeek => {
                 if let Some(progress) = self.media_seek_preview.take() {
                     self.sampler.seek_media(progress);
-                    self.snapshot.media = self.sampler.media_state();
+                    self.snapshot.media =
+                        self.prepare_media_state(self.sampler.media_state(), Instant::now());
                 }
             }
             Message::OverlayPointerMoved(position) => {
@@ -859,6 +926,7 @@ impl App {
             self.clear_button_animation.progress,
             self.notification_scroll.translation(),
             self.surface_height,
+            self.dismissing_media.as_ref(),
             self.media_seek_preview,
             self.media_timeline_hovered,
         )
@@ -912,6 +980,30 @@ impl App {
                 .any(|dismissal| dismissal.animation.is_animating())
             || self.clear_button_animation.is_animating()
             || self.notification_scroll.is_animating()
+            || self
+                .dismissing_media
+                .as_ref()
+                .is_some_and(|media| media.animation.is_animating())
+    }
+
+    fn prepare_media_state(
+        &mut self,
+        mut current: MultiPlayerState,
+        now: Instant,
+    ) -> MultiPlayerState {
+        reconcile_media_state(&mut current, &mut self.pending_playback, now);
+        reconcile_media_dismissal(
+            &mut self.dismissing_media,
+            &self.snapshot.media,
+            &current,
+            now,
+        );
+        if self.dismissing_media.is_some() {
+            self.media_seek_preview = None;
+            self.media_timeline_hovered = false;
+            self.pending_playback = None;
+        }
+        current
     }
 
     fn ui_tick_interval(&self) -> Duration {
@@ -926,6 +1018,7 @@ impl App {
             self.expanded_notification_group.as_deref(),
             self.notification_expansion.target,
             self.notification_group_expansion.target,
+            self.dismissing_media.is_some(),
         )
     }
 }
@@ -1211,6 +1304,7 @@ fn desired_surface_height_with_expansion(
         } else {
             0.0
         },
+        false,
     )
 }
 
@@ -1221,6 +1315,7 @@ fn desired_surface_height_with_animation(
     expanded_notification_group: Option<&str>,
     notification_progress: f32,
     group_progress: f32,
+    media_dismissing: bool,
 ) -> u32 {
     let mut height = BASE_SURFACE_HEIGHT as f32;
     let network_visible = config.show_network
@@ -1319,10 +1414,11 @@ fn desired_surface_height_with_animation(
             .any(|section| matches!(section, WidgetSection::Media));
 
     if media_visible {
-        let media_height = if snapshot
-            .media
-            .current_player()
-            .is_some_and(|(_, info)| info.is_active())
+        let media_height = if media_dismissing
+            || snapshot
+                .media
+                .current_player()
+                .is_some_and(|(_, info)| info.is_active())
         {
             MEDIA_SECTION_HEIGHT
         } else {
@@ -2111,6 +2207,144 @@ mod tests {
             desired_surface_height(&config, &snapshot),
             BASE_SURFACE_HEIGHT + MEDIA_SECTION_HEIGHT
         );
+    }
+
+    fn active_media_state() -> super::MultiPlayerState {
+        super::MultiPlayerState {
+            players: vec![(PlayerId::Cider, media())],
+            current_index: 0,
+        }
+    }
+
+    #[test]
+    fn disappearing_media_slides_for_the_notification_duration_before_releasing_height() {
+        let now = Instant::now();
+        let previous = active_media_state();
+        let snapshot = super::SystemSnapshot::default();
+        let config = Config {
+            show_media: true,
+            section_order: vec![WidgetSection::Media],
+            ..Default::default()
+        };
+        let mut dismissal = None;
+        super::reconcile_media_dismissal(&mut dismissal, &previous, &snapshot.media, now);
+        assert_eq!(
+            dismissal
+                .as_ref()
+                .unwrap()
+                .state
+                .current_player()
+                .unwrap()
+                .0,
+            PlayerId::Cider
+        );
+        assert_eq!(dismissal.as_ref().unwrap().animation.progress, 0.0);
+
+        super::advance_media_dismissal(&mut dismissal, now + NOTIFICATION_EXPANSION_DURATION / 2);
+        let outgoing = dismissal.as_ref().unwrap();
+        assert!((outgoing.animation.progress - 0.5).abs() < 0.001);
+        assert_eq!(
+            super::desired_surface_height_with_animation(
+                &config,
+                &snapshot,
+                None,
+                None,
+                0.0,
+                0.0,
+                dismissal.is_some()
+            ),
+            BASE_SURFACE_HEIGHT + MEDIA_SECTION_HEIGHT
+        );
+
+        super::advance_media_dismissal(&mut dismissal, now + NOTIFICATION_EXPANSION_DURATION);
+        assert!(dismissal.is_none());
+        assert_eq!(
+            super::desired_surface_height_with_animation(
+                &config,
+                &snapshot,
+                None,
+                None,
+                0.0,
+                0.0,
+                dismissal.is_some()
+            ),
+            BASE_SURFACE_HEIGHT + EMPTY_MEDIA_HEIGHT
+        );
+    }
+
+    #[test]
+    fn media_exit_does_not_restart_on_empty_samples_and_cancels_if_source_returns() {
+        let now = Instant::now();
+        let previous = active_media_state();
+        let empty = super::MultiPlayerState::default();
+        let mut dismissal = None;
+        super::reconcile_media_dismissal(&mut dismissal, &previous, &empty, now);
+        super::advance_media_dismissal(&mut dismissal, now + NOTIFICATION_EXPANSION_DURATION / 2);
+        super::reconcile_media_dismissal(
+            &mut dismissal,
+            &empty,
+            &empty,
+            now + NOTIFICATION_EXPANSION_DURATION / 2,
+        );
+        assert!((dismissal.as_ref().unwrap().animation.progress - 0.5).abs() < 0.001);
+        super::reconcile_media_dismissal(
+            &mut dismissal,
+            &empty,
+            &previous,
+            now + NOTIFICATION_EXPANSION_DURATION / 2,
+        );
+        assert!(dismissal.is_none());
+    }
+
+    #[test]
+    fn media_exit_preserves_outgoing_source_while_live_selection_falls_back() {
+        let now = Instant::now();
+        let mut previous = active_media_state();
+        let fallback_id = PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".into());
+        previous.players.push((fallback_id.clone(), media()));
+        let current = super::MultiPlayerState {
+            players: vec![previous.players[1].clone()],
+            current_index: 0,
+        };
+        let mut dismissal = None;
+        super::reconcile_media_dismissal(&mut dismissal, &previous, &current, now);
+        let outgoing = &dismissal.as_ref().unwrap().state;
+        assert_eq!(outgoing.current_player().unwrap().0, PlayerId::Cider);
+        assert_eq!(outgoing.player_count(), 2);
+        assert_eq!(current.current_player().unwrap().0, fallback_id);
+        super::advance_media_dismissal(&mut dismissal, now + NOTIFICATION_EXPANSION_DURATION);
+        assert!(dismissal.is_none());
+    }
+
+    #[test]
+    fn pausing_track_changes_and_manual_source_selection_do_not_dismiss_media() {
+        let previous = active_media_state();
+        let mut current = previous.clone();
+        current.players[0].1.status = PlaybackStatus::Paused;
+        let mut dismissal = None;
+        super::reconcile_media_dismissal(&mut dismissal, &previous, &current, Instant::now());
+        assert!(dismissal.is_none());
+        current.players[0].1.title = "Next track".into();
+        super::reconcile_media_dismissal(&mut dismissal, &previous, &current, Instant::now());
+        assert!(dismissal.is_none());
+        current.players.push((
+            PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".into()),
+            media(),
+        ));
+        current.current_index = 1;
+        super::reconcile_media_dismissal(&mut dismissal, &previous, &current, Instant::now());
+        assert!(dismissal.is_none());
+    }
+
+    #[test]
+    fn cleared_track_metadata_starts_media_exit_without_a_bus_disconnect() {
+        let previous = active_media_state();
+        let mut current = previous.clone();
+        current.players[0].1.title.clear();
+        current.players[0].1.status = PlaybackStatus::Stopped;
+        let mut dismissal = None;
+        super::reconcile_media_dismissal(&mut dismissal, &previous, &current, Instant::now());
+        assert!(dismissal.is_some());
     }
 
     #[test]

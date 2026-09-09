@@ -691,13 +691,24 @@ impl ArtworkSource {
         u8::from(matches!(self, Self::BandcampPage(_)))
     }
 
-    async fn load(&self, client: &reqwest::Client) -> Option<AlbumArt> {
+    async fn load(
+        &self,
+        client: &reqwest::Client,
+    ) -> (Option<AlbumArt>, Option<bandcamp::PageMetadata>) {
         match self {
-            Self::Image(url) => MediaMonitor::download_artwork(client, url).await,
+            Self::Image(url) => (MediaMonitor::download_artwork(client, url).await, None),
             Self::BandcampPage(url) => {
-                let page = bandcamp::page_url(url)?;
-                let image = bandcamp::resolve_artwork_url(client, &page).await?;
-                MediaMonitor::download_artwork(client, image.as_str()).await
+                let Some(page) = bandcamp::page_url(url) else {
+                    return (None, None);
+                };
+                let Some(metadata) = bandcamp::fetch_page_metadata(client, &page).await else {
+                    return (None, None);
+                };
+                let artwork = match metadata.artwork_url.as_ref() {
+                    Some(image) => MediaMonitor::download_artwork(client, image.as_str()).await,
+                    None => None,
+                };
+                (artwork, Some(metadata))
             }
         }
     }
@@ -713,12 +724,41 @@ struct ArtworkRequest {
 struct ArtworkResult {
     request: ArtworkRequest,
     artwork: Option<AlbumArt>,
+    bandcamp_metadata: Option<bandcamp::PageMetadata>,
+}
+
+#[derive(Default)]
+struct BandcampPageCache {
+    pages: HashMap<String, (bandcamp::PageMetadata, Instant)>,
+}
+
+impl BandcampPageCache {
+    fn get(&mut self, url: &str) -> Option<&bandcamp::PageMetadata> {
+        let (metadata, used_at) = self.pages.get_mut(url)?;
+        *used_at = Instant::now();
+        Some(metadata)
+    }
+
+    fn insert(&mut self, url: String, metadata: bandcamp::PageMetadata) {
+        if !self.pages.contains_key(&url) && self.pages.len() >= MAX_CACHED_ARTWORKS {
+            let oldest = self
+                .pages
+                .iter()
+                .min_by_key(|(_, (_, used_at))| *used_at)
+                .map(|(url, _)| url.clone());
+            if let Some(oldest) = oldest {
+                self.pages.remove(&oldest);
+            }
+        }
+        self.pages.insert(url, (metadata, Instant::now()));
+    }
 }
 
 struct ArtworkLoader {
     requests: tokio::sync::mpsc::Sender<ArtworkRequest>,
     completed: std::sync::mpsc::Receiver<ArtworkResult>,
     pending_sources: HashSet<ArtworkSource>,
+    bandcamp_pages: BandcampPageCache,
     available: bool,
 }
 
@@ -761,8 +801,12 @@ impl ArtworkLoader {
                         let completed_tx = completed_tx.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let artwork = request.source.load(&client).await;
-                            let _ = completed_tx.send(ArtworkResult { request, artwork });
+                            let (artwork, bandcamp_metadata) = request.source.load(&client).await;
+                            let _ = completed_tx.send(ArtworkResult {
+                                request,
+                                artwork,
+                                bandcamp_metadata,
+                            });
                         });
                     }
                 });
@@ -775,6 +819,7 @@ impl ArtworkLoader {
             requests: request_tx,
             completed: completed_rx,
             pending_sources: HashSet::new(),
+            bandcamp_pages: BandcampPageCache::default(),
             available: true,
         }
     }
@@ -907,6 +952,23 @@ fn merge_mpris_proxy_timeline(primary: &mut MediaInfo, proxy: &MediaInfo) {
         primary.duration = proxy.duration;
     }
     primary.can_seek |= proxy.can_seek;
+}
+
+fn merge_mpris_proxy_player(
+    players: &mut [(PlayerId, MediaInfo)],
+    raw_tracks: &HashMap<PlayerId, TrackSignature>,
+    proxy: &MediaInfo,
+    proxy_track: &TrackSignature,
+) -> bool {
+    if let Some((_, primary)) = players.iter_mut().find(|(id, _)| {
+        matches!(id, PlayerId::Mpris(bus) if !MediaMonitor::is_playerctld_mpris_player(bus))
+            && raw_tracks.get(id) == Some(proxy_track)
+    }) {
+        merge_mpris_proxy_timeline(primary, proxy);
+        true
+    } else {
+        false
+    }
 }
 
 // ============================================================================
@@ -1178,6 +1240,7 @@ impl MediaMonitor {
             // 3. Consume the signal-driven native MPRIS snapshot. Query the
             // playerctld proxy last so it can supplement the real player it mirrors.
             let mut mpris_players = mpris.players();
+            let mut raw_mpris_tracks = HashMap::new();
             mpris_players.sort_by_key(|(name, _)| Self::is_playerctld_mpris_player(name));
             for (bus_name, mut info) in mpris_players {
                 if has_cider_api_player && Self::is_cider_mpris_player(&bus_name) {
@@ -1229,6 +1292,14 @@ impl MediaMonitor {
                     }
                 }
 
+                let raw_track = TrackSignature::from(&info);
+                raw_mpris_tracks.insert(player_id.clone(), raw_track.clone());
+                Self::apply_bandcamp_metadata(
+                    &bus_name,
+                    &mut info,
+                    &mut artwork_loader.bandcamp_pages,
+                );
+
                 if update_tracked_position(
                     &mut position_trackers,
                     &player_id,
@@ -1268,13 +1339,8 @@ impl MediaMonitor {
                 }
 
                 if Self::is_playerctld_mpris_player(&bus_name)
-                    && let Some((_, primary)) = players.iter_mut().find(|(id, primary)| {
-                        matches!(id, PlayerId::Mpris(primary_bus)
-                            if !Self::is_playerctld_mpris_player(primary_bus))
-                            && TrackSignature::from(&*primary) == TrackSignature::from(&info)
-                    })
+                    && merge_mpris_proxy_player(&mut players, &raw_mpris_tracks, &info, &raw_track)
                 {
-                    merge_mpris_proxy_timeline(primary, &info);
                     continue;
                 }
 
@@ -1553,6 +1619,66 @@ impl MediaMonitor {
             .is_some_and(|identity| identity.eq_ignore_ascii_case("playerctld"))
     }
 
+    fn apply_bandcamp_metadata(
+        bus_name: &str,
+        info: &mut MediaInfo,
+        pages: &mut BandcampPageCache,
+    ) {
+        let Some(page) = info.media_url.as_deref().and_then(bandcamp::page_url) else {
+            return;
+        };
+        let Some(metadata) = pages.get(page.as_str()) else {
+            return;
+        };
+        let direct_track = metadata.tracks.iter().find(|track| track.url == page);
+        let caption = direct_track.map_or(metadata.album.as_str(), |track| track.title.as_str());
+        if !Self::is_bandcamp_page_caption(&info.title, caption, &metadata.artist) {
+            return;
+        }
+
+        let matched = direct_track.or_else(|| {
+            // Firefox (including Zen) truncates mDuration to whole seconds
+            // before exposing mpris:length. Do not use a nearest-duration guess:
+            // every track must be known, and exactly one must match that second.
+            // See widget/gtk/MPRISServiceHandler.cpp::GetMetadataAsGVariant.
+            if !Self::is_firefox_mpris_player(bus_name)
+                || !metadata.tracks_complete
+                || info.duration == 0
+                || info.duration % 1000 != 0
+            {
+                return None;
+            }
+            let mut matches = metadata
+                .tracks
+                .iter()
+                .filter(|track| track.duration_ms / 1000 == info.duration / 1000);
+            let candidate = matches.next()?;
+            matches.next().is_none().then_some(candidate)
+        });
+        if let Some(track) = matched {
+            info.title.clone_from(&track.title);
+            if info.artist.trim().is_empty() {
+                info.artist.clone_from(&metadata.artist);
+            }
+            if info.album.trim().is_empty() && page.path().starts_with("/album/") {
+                info.album.clone_from(&metadata.album);
+            }
+        }
+    }
+
+    fn is_bandcamp_page_caption(title: &str, page_title: &str, artist: &str) -> bool {
+        if page_title.is_empty() {
+            return false;
+        }
+        let title = title
+            .trim_start_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '▶' | '►' | '⏸' | '\u{fe0e}' | '\u{fe0f}')
+            })
+            .trim_end();
+        title == page_title || (!artist.is_empty() && title == format!("{page_title} | {artist}"))
+    }
+
     fn apply_best_artwork(
         player_id: &PlayerId,
         info: &mut MediaInfo,
@@ -1574,9 +1700,18 @@ impl MediaMonitor {
             .and_then(Self::extract_youtube_video_id)
             .is_some();
         for source in Self::artwork_candidate_sources(info) {
+            let needs_bandcamp_metadata = matches!(source, ArtworkSource::BandcampPage(_))
+                && !artwork_loader
+                    .bandcamp_pages
+                    .pages
+                    .contains_key(source.url());
+            if needs_bandcamp_metadata && !artwork_loader.pending_sources.contains(&source) {
+                // Either cache can evict a still-active page. Retain retry
+                // deadlines, but allow its track list to be fetched again.
+                selection.attempted_sources.remove(&source);
+            }
             let cached = { artwork_cache.lock().unwrap().get(source.url()) };
             if let Some(candidate) = cached {
-                selection.attempted_sources.insert(source.clone());
                 let adequate_youtube_thumbnail = candidate.source_width
                     >= MIN_YOUTUBE_THUMBNAIL_WIDTH
                     && candidate.source_height >= MIN_YOUTUBE_THUMBNAIL_HEIGHT;
@@ -1584,7 +1719,10 @@ impl MediaMonitor {
                 if is_youtube && adequate_youtube_thumbnail {
                     break;
                 }
-                continue;
+                if !needs_bandcamp_metadata {
+                    selection.attempted_sources.insert(source.clone());
+                    continue;
+                }
             }
 
             if selection.attempted_sources.contains(&source)
@@ -1616,7 +1754,16 @@ impl MediaMonitor {
         artwork_by_player: &mut HashMap<PlayerId, TrackArtwork>,
     ) {
         for result in artwork_loader.take_completed() {
-            let ArtworkResult { request, artwork } = result;
+            let ArtworkResult {
+                request,
+                artwork,
+                bandcamp_metadata,
+            } = result;
+            if let Some(metadata) = bandcamp_metadata {
+                artwork_loader
+                    .bandcamp_pages
+                    .insert(request.source.url().to_string(), metadata);
+            }
             let Some(artwork) = artwork else {
                 log::debug!("Unable to load artwork from {}", request.source.url());
                 Self::retry_failed_bandcamp_artwork(
@@ -2557,6 +2704,285 @@ mod tests {
         assert!(MediaMonitor::artwork_candidate_sources(&unrelated).is_empty());
     }
 
+    fn bandcamp_track_fixture(tracks: &[(&str, u64)]) -> (MediaInfo, super::BandcampPageCache) {
+        let page = "https://artist.bandcamp.com/album/example";
+        let info = MediaInfo {
+            player_name: "Zen".into(),
+            title: "▶︎ Example | Artist".into(),
+            media_url: Some(page.into()),
+            status: PlaybackStatus::Playing,
+            duration: 239_000,
+            position: 20_000,
+            ..Default::default()
+        };
+        let mut cache = super::BandcampPageCache::default();
+        cache.insert(
+            page.into(),
+            super::bandcamp::PageMetadata {
+                artwork_url: None,
+                album: "Example".into(),
+                artist: "Artist".into(),
+                tracks_complete: true,
+                tracks: tracks
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, (title, duration_ms))| super::bandcamp::TrackMetadata {
+                            title: (*title).into(),
+                            duration_ms: *duration_ms,
+                            url: reqwest::Url::parse(&format!(
+                                "https://artist.bandcamp.com/track/song-{index}"
+                            ))
+                            .unwrap(),
+                        },
+                    )
+                    .collect(),
+            },
+        );
+        (info, cache)
+    }
+
+    #[test]
+    fn bandcamp_track_title_uses_unique_firefox_whole_second_duration() {
+        let (mut info, mut cache) = bandcamp_track_fixture(&[
+            ("First Song", 239_920),
+            ("Second Song", 168_990),
+            ("Third Song", 169_000),
+        ]);
+        MediaMonitor::apply_bandcamp_metadata(
+            "org.mpris.MediaPlayer2.firefox.instance",
+            &mut info,
+            &mut cache,
+        );
+        assert_eq!(
+            (
+                info.title.as_str(),
+                info.artist.as_str(),
+                info.album.as_str()
+            ),
+            ("First Song", "Artist", "Example")
+        );
+        assert_eq!(
+            info.media_url.as_deref(),
+            Some("https://artist.bandcamp.com/album/example")
+        );
+        assert_eq!((info.position, info.duration), (20_000, 239_000));
+    }
+
+    #[test]
+    fn bandcamp_keeps_caption_when_duration_is_ambiguous_unknown_or_not_firefox() {
+        for (tracks, duration, browser) in [
+            (
+                vec![("First", 239_100), ("Second", 239_990)],
+                239_000,
+                "firefox",
+            ),
+            (vec![("First", 239_920)], 0, "firefox"),
+            (vec![("First", 239_920)], 240_000, "firefox"),
+            (vec![("First", 239_920)], 239_920, "firefox"),
+            (vec![("First", 239_920)], 239_000, "chromium"),
+        ] {
+            let (mut info, mut cache) = bandcamp_track_fixture(&tracks);
+            info.duration = duration;
+            let original = info.title.clone();
+            MediaMonitor::apply_bandcamp_metadata(
+                &format!("org.mpris.MediaPlayer2.{browser}"),
+                &mut info,
+                &mut cache,
+            );
+            assert_eq!(info.title, original);
+            assert!(info.artist.is_empty());
+        }
+        let (mut info, mut cache) = bandcamp_track_fixture(&[("First", 239_920)]);
+        cache.pages.values_mut().next().unwrap().0.tracks_complete = false;
+        MediaMonitor::apply_bandcamp_metadata(
+            "org.mpris.MediaPlayer2.firefox",
+            &mut info,
+            &mut cache,
+        );
+        assert_eq!(info.title, "▶︎ Example | Artist");
+    }
+
+    #[test]
+    fn bandcamp_preserves_supplied_titles_and_only_uses_the_current_page() {
+        let (mut info, mut cache) = bandcamp_track_fixture(&[("First", 239_920)]);
+        info.title = "Actual browser title".into();
+        MediaMonitor::apply_bandcamp_metadata(
+            "org.mpris.MediaPlayer2.firefox",
+            &mut info,
+            &mut cache,
+        );
+        assert_eq!(info.title, "Actual browser title");
+        info.title = "▶︎ Example | Artist".into();
+        info.media_url = Some("https://artist.bandcamp.com/album/different".into());
+        MediaMonitor::apply_bandcamp_metadata(
+            "org.mpris.MediaPlayer2.firefox",
+            &mut info,
+            &mut cache,
+        );
+        assert_eq!(info.title, "▶︎ Example | Artist");
+    }
+
+    #[test]
+    fn bandcamp_direct_track_url_does_not_require_duration_inference() {
+        let (mut info, mut cache) =
+            bandcamp_track_fixture(&[("First", 239_100), ("Second", 239_920)]);
+        let track_page = "https://artist.bandcamp.com/track/song-1";
+        let metadata = cache.pages.values().next().unwrap().0.clone();
+        cache.insert(track_page.into(), metadata);
+        info.media_url = Some(track_page.into());
+        info.title = "Second | Artist".into();
+        info.duration = 0;
+        MediaMonitor::apply_bandcamp_metadata(
+            "org.mpris.MediaPlayer2.chromium",
+            &mut info,
+            &mut cache,
+        );
+        assert_eq!(info.title, "Second");
+        assert_eq!(info.artist, "Artist");
+        assert!(info.album.is_empty());
+    }
+
+    #[test]
+    fn enriched_bandcamp_player_still_merges_its_raw_mpris_proxy() {
+        let (raw, mut cache) = bandcamp_track_fixture(&[("First", 239_920)]);
+        let bus = "org.mpris.MediaPlayer2.firefox";
+        let player_id = PlayerId::Mpris(bus.into());
+        let raw_track = TrackSignature::from(&raw);
+        let raw_tracks = HashMap::from([(player_id.clone(), raw_track.clone())]);
+        let mut enriched = raw.clone();
+        MediaMonitor::apply_bandcamp_metadata(bus, &mut enriched, &mut cache);
+        let mut players = vec![(player_id, enriched)];
+        let mut proxy = raw;
+        proxy.position = 50_000;
+        proxy.can_seek = true;
+        assert!(super::merge_mpris_proxy_player(
+            &mut players,
+            &raw_tracks,
+            &proxy,
+            &raw_track
+        ));
+        assert_eq!(players[0].1.title, "First");
+        assert_eq!(players[0].1.position, 50_000);
+        assert!(players[0].1.can_seek);
+    }
+
+    #[test]
+    fn evicted_bandcamp_metadata_can_reload_while_respecting_failure_backoff() {
+        for retry_pending in [false, true] {
+            let (mut info, _) = bandcamp_track_fixture(&[("First", 239_920)]);
+            let player = PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".into());
+            let source = ArtworkSource::BandcampPage(info.media_url.clone().unwrap());
+            let mut selection = TrackArtwork::new(TrackSignature::from(&info));
+            selection.attempted_sources.insert(source.clone());
+            if retry_pending {
+                selection
+                    .retry_after
+                    .insert(source.clone(), Instant::now() + Duration::from_secs(30));
+            }
+            let mut selections = HashMap::from([(player.clone(), selection)]);
+            let cache = std::sync::Arc::new(std::sync::Mutex::new(ArtworkCache::new(4)));
+            let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
+            let (_completed_tx, completed) = std::sync::mpsc::channel();
+            let mut loader = super::ArtworkLoader {
+                requests,
+                completed,
+                pending_sources: Default::default(),
+                bandcamp_pages: Default::default(),
+                available: true,
+            };
+            MediaMonitor::apply_best_artwork(
+                &player,
+                &mut info,
+                &cache,
+                &mut selections,
+                &mut loader,
+            );
+            assert_eq!(receiver.try_recv().is_ok(), !retry_pending);
+            assert_eq!(loader.pending_sources.contains(&source), !retry_pending);
+        }
+    }
+
+    #[test]
+    fn failed_cover_download_does_not_discard_successful_track_metadata() {
+        let (mut info, cache) = bandcamp_track_fixture(&[("First", 239_920)]);
+        let source = ArtworkSource::BandcampPage(info.media_url.clone().unwrap());
+        let player = PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".into());
+        let request = ArtworkRequest {
+            player_id: player.clone(),
+            track: TrackSignature::from(&info),
+            source: source.clone(),
+        };
+        let (requests, _requests_rx) = tokio::sync::mpsc::channel(4);
+        let (completed_tx, completed) = std::sync::mpsc::channel();
+        let mut loader = super::ArtworkLoader {
+            requests,
+            completed,
+            pending_sources: std::collections::HashSet::from([source]),
+            bandcamp_pages: Default::default(),
+            available: true,
+        };
+        completed_tx
+            .send(super::ArtworkResult {
+                request,
+                artwork: None,
+                bandcamp_metadata: Some(cache.pages.into_values().next().unwrap().0),
+            })
+            .unwrap();
+        let artwork_cache = std::sync::Arc::new(std::sync::Mutex::new(ArtworkCache::new(4)));
+        let mut selections =
+            HashMap::from([(player, TrackArtwork::new(TrackSignature::from(&info)))]);
+        MediaMonitor::collect_artwork_results(&mut loader, &artwork_cache, &mut selections);
+        MediaMonitor::apply_bandcamp_metadata(
+            "org.mpris.MediaPlayer2.firefox",
+            &mut info,
+            &mut loader.bandcamp_pages,
+        );
+        assert_eq!(info.title, "First");
+    }
+
+    #[test]
+    fn bandcamp_track_change_resets_timeline_even_when_album_url_is_unchanged() {
+        let (raw, mut cache) = bandcamp_track_fixture(&[("First", 239_920), ("Second", 169_000)]);
+        let bus_name = "org.mpris.MediaPlayer2.firefox";
+        let player = PlayerId::Mpris(bus_name.into());
+        let mut trackers = HashMap::new();
+        let now = Instant::now();
+        let mut first = raw.clone();
+        MediaMonitor::apply_bandcamp_metadata(bus_name, &mut first, &mut cache);
+        update_tracked_position(&mut trackers, &player, &mut first, now);
+        let mut second = raw;
+        second.duration = 169_000;
+        second.position = 0;
+        MediaMonitor::apply_bandcamp_metadata(bus_name, &mut second, &mut cache);
+        assert!(update_tracked_position(
+            &mut trackers,
+            &player,
+            &mut second,
+            now + Duration::from_secs(1)
+        ));
+        assert_eq!(second.title, "Second");
+        assert_eq!(second.position, 0);
+    }
+
+    #[test]
+    fn bandcamp_page_cache_is_bounded_and_retains_recently_used_metadata() {
+        let (_, mut cache) = bandcamp_track_fixture(&[("First", 239_920)]);
+        let original_url = "https://artist.bandcamp.com/album/example";
+        let metadata = cache.get(original_url).unwrap().clone();
+        for index in 1..super::MAX_CACHED_ARTWORKS {
+            cache.insert(
+                format!("https://artist.bandcamp.com/album/{index}"),
+                metadata.clone(),
+            );
+        }
+        cache.get(original_url).unwrap();
+        cache.insert("https://artist.bandcamp.com/album/new".into(), metadata);
+        assert_eq!(cache.pages.len(), super::MAX_CACHED_ARTWORKS);
+        assert!(cache.get(original_url).is_some());
+        assert!(cache.get("https://artist.bandcamp.com/album/1").is_none());
+    }
+
     #[test]
     fn bandcamp_album_cover_takes_precedence_over_browser_placeholder() {
         let info = media(PlaybackStatus::Playing, 0, "Album");
@@ -2640,10 +3066,31 @@ mod tests {
             .user_agent("cosmic-widget-applet/0.1")
             .build()
             .unwrap();
-        let cover = ArtworkSource::BandcampPage(page.to_string())
+        let (cover, metadata) = ArtworkSource::BandcampPage(page.to_string())
             .load(&client)
-            .await
-            .expect("album cover must download and decode");
+            .await;
+        let cover = cover.expect("album cover must download and decode");
+        if let Ok(expected_title) = std::env::var("BANDCAMP_TEST_EXPECTED_TITLE") {
+            let metadata = metadata.expect("album must provide track metadata");
+            let mut info = MediaInfo {
+                title: format!("{} | {}", metadata.album, metadata.artist),
+                media_url: Some(page.to_string()),
+                duration: std::env::var("BANDCAMP_TEST_DURATION_MS")
+                    .expect("set the captured MPRIS duration in milliseconds")
+                    .parse()
+                    .unwrap(),
+                ..Default::default()
+            };
+            let mut cache = super::BandcampPageCache::default();
+            cache.insert(page.to_string(), metadata);
+            MediaMonitor::apply_bandcamp_metadata(
+                "org.mpris.MediaPlayer2.firefox",
+                &mut info,
+                &mut cache,
+            );
+            assert_eq!(info.title, expected_title);
+            println!("Bandcamp track resolved: {} — {}", info.title, info.artist);
+        }
         assert!(cover.source_width > 0 && cover.source_height > 0);
         if let Ok(path) = std::env::var("BANDCAMP_TEST_ARTWORK_PATH") {
             let cosmic::iced::widget::image::Handle::Bytes(_, bytes) = &cover.iced_handle else {
