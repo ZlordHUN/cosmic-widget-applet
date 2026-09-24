@@ -14,13 +14,9 @@
 //!
 //! # Usage
 //!
-//! ```rust
-//! use cosmic::cosmic_config::{Config as CosmicConfig, CosmicConfigEntry};
-//! use crate::config::Config;
-//!
-//! let handler = CosmicConfig::new("com.github.zoliviragh.CosmicWidget", Config::VERSION)?;;
-//! let config = Config::get_entry(&handler).unwrap_or_default();
-//! ```
+//! Applications open a `cosmic_config::Config` handler using the application ID
+//! and [`Config::VERSION`], then load the shared entry through [`Config::get_entry`].
+//! Each application keeps its existing fallback behavior when reading fails.
 
 use cosmic::cosmic_config::{self, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
 use serde::{Deserialize, Serialize};
@@ -55,6 +51,8 @@ pub enum WidgetSection {
     Notifications,
     /// Now playing information from MPRIS, Cider, and Emby
     Media,
+    /// Remaining Codex and Claude allowances. Retains its saved identifier.
+    CodexUsage,
 }
 
 /// Visual style used by the Iced temperature gauges.
@@ -84,6 +82,7 @@ impl WidgetSection {
             WidgetSection::Weather => "Weather",
             WidgetSection::Notifications => "Notifications",
             WidgetSection::Media => "Now Playing",
+            WidgetSection::CodexUsage => "AI Usage",
         }
     }
 }
@@ -202,6 +201,13 @@ pub struct Config {
     pub cider_api_token: String,
 
     // ========================================================================
+    // AI Usage Section
+    // ========================================================================
+    /// Show remaining Codex and Claude usage; keep the original configuration
+    /// key so existing visibility preferences survive the section rename.
+    pub show_codex_usage: bool,
+
+    // ========================================================================
     // Clock & Date Display
     // ========================================================================
     /// Show digital clock at the top of the widget.
@@ -257,7 +263,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub const ALL_SECTIONS: [WidgetSection; 9] = [
+    pub const ALL_SECTIONS: [WidgetSection; 10] = [
         WidgetSection::Utilization,
         WidgetSection::Network,
         WidgetSection::DiskIo,
@@ -267,6 +273,7 @@ impl Config {
         WidgetSection::Weather,
         WidgetSection::Notifications,
         WidgetSection::Media,
+        WidgetSection::CodexUsage,
     ];
 
     /// Add every current overlay section while retaining the user's existing order.
@@ -362,6 +369,9 @@ impl Default for Config {
             show_media: false,
             cider_api_token: String::new(),
 
+            // AI Usage: Show Codex and Claude account allowances
+            show_codex_usage: true,
+
             // Clock: Show by default with 12-hour format
             show_clock: true,
             show_date: true,
@@ -390,6 +400,7 @@ impl Default for Config {
                 WidgetSection::Weather,
                 WidgetSection::Notifications,
                 WidgetSection::Media,
+                WidgetSection::CodexUsage,
             ],
 
             // Advanced: Logging off by default
@@ -474,5 +485,48 @@ mod tests {
                 .all(|section| config.section_order.contains(section))
         );
         assert!(!config.ensure_all_sections());
+    }
+
+    #[test]
+    fn adds_codex_usage_immediately_after_media_in_custom_order() {
+        let mut config = Config::default();
+        config.section_order = vec![
+            WidgetSection::Weather,
+            WidgetSection::Media,
+            WidgetSection::Storage,
+            WidgetSection::Notifications,
+            WidgetSection::Battery,
+            WidgetSection::Temperatures,
+            WidgetSection::DiskIo,
+            WidgetSection::Network,
+            WidgetSection::Utilization,
+        ];
+        let previous_order = config.section_order.clone();
+
+        assert!(config.ensure_all_sections());
+        assert_eq!(config.section_order[2], WidgetSection::CodexUsage);
+        assert_eq!(
+            config
+                .section_order
+                .iter()
+                .copied()
+                .filter(|section| *section != WidgetSection::CodexUsage)
+                .collect::<Vec<_>>(),
+            previous_order
+        );
+        assert!(!config.ensure_all_sections());
+    }
+
+    #[test]
+    fn preserves_a_user_reordered_codex_usage_section() {
+        let mut config = Config::default();
+        config
+            .section_order
+            .retain(|section| *section != WidgetSection::CodexUsage);
+        config.section_order.insert(0, WidgetSection::CodexUsage);
+        let previous_order = config.section_order.clone();
+
+        assert!(!config.ensure_all_sections());
+        assert_eq!(config.section_order, previous_order);
     }
 }

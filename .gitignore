@@ -13,3 +13,7 @@ debian/*
 !debian/rules
 !debian/sourcecosmic-monitor-applet-aftercrashfix/
 Solaar-master/
+
+# Keep editor/source backups out of active modules. Historical snapshots live in archive/.
+/src/**/*.rs.bak
+/src/**/*.rs.layer-shell-backup

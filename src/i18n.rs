@@ -20,13 +20,13 @@
 //! Use the `fl!()` macro to request localized strings:
 //!
 //! ```rust
-//! use crate::fl;
+//! use cosmic_widget_applet::fl;
 //!
 //! // Simple string lookup
 //! let title = fl!("app-title");
 //!
 //! // String with arguments
-//! let greeting = fl!("greeting", name = "User");
+//! let page = fl!("page-id", num = 2);
 //! ```
 //!
 //! # Adding New Translations
@@ -99,11 +99,13 @@ pub static LANGUAGE_LOADER: LazyLock<FluentLanguageLoader> = LazyLock::new(|| {
 /// # Examples
 ///
 /// ```rust
+/// use cosmic_widget_applet::fl;
+///
 /// // Simple string lookup
 /// let text = fl!("show-cpu");  // Returns "Show CPU" or translated equivalent
 ///
 /// // String with interpolation arguments
-/// let msg = fl!("disk-usage", name = "nvme0n1", percent = 75);
+/// let msg = fl!("page-id", num = 2);
 /// ```
 ///
 /// If the requested message ID is not found, the ID itself is returned

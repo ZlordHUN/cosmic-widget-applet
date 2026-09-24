@@ -53,17 +53,17 @@ check-json: (check '--message-format=json')
 
 # Run the application for testing purposes
 run *args:
-    env RUST_BACKTRACE=full cargo run --release {{args}}
+    env RUST_BACKTRACE=full cargo run --release --bin cosmic-widget-applet {{args}}
 
 # Run the widget for testing purposes
 run-widget *args:
-    env RUST_BACKTRACE=full cargo run --release --bin cosmic-monitor-widget {{args}}
+    env RUST_BACKTRACE=full cargo run --release --bin cosmic-widget-iced {{args}}
 
 # Run the settings app for testing purposes
 run-settings *args:
-    env RUST_BACKTRACE=full cargo run --release --bin cosmic-monitor-settings {{args}}
+    env RUST_BACKTRACE=full cargo run --release --bin cosmic-widget-settings {{args}}
 
-# Run the experimental libcosmic/Iced widget
+# Run the production libcosmic/Iced widget
 run-iced-widget *args:
     env RUST_BACKTRACE=full cargo run --release --bin cosmic-widget-iced {{args}}
 

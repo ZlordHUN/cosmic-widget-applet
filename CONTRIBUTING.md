@@ -29,6 +29,21 @@ cargo run --release --bin cosmic-widget-iced
 cargo run --release --bin cosmic-widget-settings
 ```
 
+## Source Organization
+
+- `src/bin/` contains launchers; application startup belongs in its application module.
+- `src/monitors/` contains data collection and provider integrations without UI drawing.
+- `src/overlay/sections/` contains the production widget's feature views.
+- `src/overlay/components/` contains reusable Iced controls and animation widgets.
+- `src/applet/`, `src/settings/`, and `src/legacy/` keep each application's UI together.
+- `src/runtime/` owns process locking and logging; `src/config.rs` is the shared schema.
+- `assets/` contains embedded icons and fonts; `resources/` contains installed desktop files and device rules.
+- `docs/` contains architecture, hardware support, and screenshots; `archive/` holds unbuilt historical snapshots.
+
+Keep a feature's helpers and tests beside that feature. Use ordinary Rust modules
+rather than importing source files through `#[path]`, and retain existing Cargo
+target names and installed commands when moving code.
+
 ## Testing
 
 Before submitting a pull request, run:
@@ -49,7 +64,7 @@ desktop environment you tested in the pull request.
 - Include reproduction and verification steps.
 - Add focused tests for bug fixes and new logic.
 - Include before-and-after screenshots for visible interface changes.
-- Update `README.md`, `ARCHITECTURE.md`, or `SUPPORTED_DEVICES.md` when the
+- Update `README.md`, `docs/architecture.md`, or `docs/supported-devices.md` when the
   public behavior, architecture, or hardware support changes.
 
 By submitting a contribution, you agree that it is licensed under the

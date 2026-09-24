@@ -2,25 +2,26 @@
 name = "cosmic-widget-applet"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 license = "MPL-2.0"
 description = "System resource monitor widget for COSMIC"
 repository = "https://github.com/zoliviragh/cosmic-widget-applet"
 
 [[bin]]
 name = "cosmic-widget-applet"
-path = "src/main.rs"
+path = "src/bin/applet.rs"
 
 [[bin]]
 name = "cosmic-widget"
-path = "src/widget_main.rs"
+path = "src/bin/legacy-overlay.rs"
 
 [[bin]]
 name = "cosmic-widget-settings"
-path = "src/settings_main.rs"
+path = "src/bin/settings.rs"
 
 [[bin]]
 name = "cosmic-widget-iced"
-path = "src/iced_widget_main.rs"
+path = "src/bin/overlay.rs"
 
 [dependencies]
 futures-util = "0.3.31"
