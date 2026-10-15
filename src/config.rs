@@ -73,7 +73,7 @@ impl WidgetSection {
     /// Used in the settings UI for the section reordering list.
     pub fn label(&self) -> &'static str {
         match self {
-            WidgetSection::Utilization => "Utilization",
+            WidgetSection::Utilization => "System Utilization",
             WidgetSection::Network => "Network",
             WidgetSection::DiskIo => "Disk I/O",
             WidgetSection::Temperatures => "Temperatures",

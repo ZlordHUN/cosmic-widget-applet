@@ -29,6 +29,7 @@ fn monitor_with_snapshot(devices: Vec<BatteryDevice>) -> BatteryMonitor {
         devices: Arc::new(Mutex::new(devices)),
         logitech_devices: Arc::new(Mutex::new(Vec::new())),
         native_headset_coverage: Arc::new(Mutex::new(Vec::new())),
+        maxwell_connection: Arc::new(Mutex::new(None)),
         cached_devices: Vec::new(),
         initial_probe_started: Instant::now(),
         last_update: Instant::now(),
@@ -112,6 +113,80 @@ fn logitech_updates_preserve_dedicated_headset_ownership() {
         &["G522".to_string()],
     );
     assert!(monitor.devices().is_empty());
+}
+
+#[test]
+fn logitech_patches_replace_stale_aliases_and_preserve_unrelated_devices() {
+    let mouse = BatteryDevice {
+        level: Some(0),
+        status: Some("discharging".to_string()),
+        is_connected: true,
+        ..battery_device("G309 LIGHTSPEED", false)
+    };
+    let keyboard = BatteryDevice {
+        level: Some(80),
+        is_connected: true,
+        ..battery_device("MX Mechanical Mini", false)
+    };
+    let alias = BatteryDevice {
+        name: "G309".to_string(),
+        level: Some(50),
+        ..mouse.clone()
+    };
+    let old_snapshot = vec![mouse, keyboard.clone(), alias.clone()];
+    let monitor = monitor_with_snapshot(old_snapshot.clone());
+    *monitor.logitech_devices.lock().unwrap() = old_snapshot;
+    let update = BatteryDevice {
+        level: Some(100),
+        status: Some("charging".to_string()),
+        ..alias
+    };
+    super::merge_logitech_updates(
+        &mut monitor.logitech_devices.lock().unwrap(),
+        std::slice::from_ref(&update),
+    );
+
+    let expected = vec![
+        BatteryDevice {
+            name: "G309 LIGHTSPEED".to_string(),
+            ..update
+        },
+        keyboard,
+    ];
+    assert_eq!(*monitor.logitech_devices.lock().unwrap(), expected);
+    assert_eq!(monitor.devices(), expected);
+}
+
+#[test]
+fn disconnected_logitech_patch_removes_every_visible_alias_immediately() {
+    let mouse = BatteryDevice {
+        level: Some(100),
+        is_connected: true,
+        ..battery_device("G309 LIGHTSPEED", false)
+    };
+    let keyboard = BatteryDevice {
+        level: Some(80),
+        is_connected: true,
+        ..battery_device("MX Mechanical Mini", false)
+    };
+    let alias = BatteryDevice {
+        name: "G309".to_string(),
+        ..mouse.clone()
+    };
+    let old_snapshot = vec![mouse, keyboard.clone(), alias];
+    let monitor = monitor_with_snapshot(old_snapshot.clone());
+    *monitor.logitech_devices.lock().unwrap() = old_snapshot;
+    super::merge_logitech_updates(
+        &mut monitor.logitech_devices.lock().unwrap(),
+        &[battery_device("G309", false)],
+    );
+
+    let native = monitor.logitech_devices.lock().unwrap().clone();
+    assert_eq!(native.len(), 2);
+    assert_eq!(native[0].name, "G309 LIGHTSPEED");
+    assert!(!native[0].is_connected);
+    assert_eq!(native[1], keyboard);
+    assert_eq!(monitor.devices(), vec![keyboard]);
 }
 
 fn headsetcontrol_output(status: &str, level: i64) -> String {
@@ -636,4 +711,115 @@ fn disabled_solaar_never_enters_the_probe_plan() {
         .insert("unsupported logitech device".to_string());
 
     assert!(!external_probe_plan(&external, true, true, false).solaar);
+}
+
+#[test]
+fn maxwell_usb_charging_updates_bypass_old_native_and_fallback_snapshots() {
+    let headset = BatteryDevice {
+        level: Some(96),
+        status: Some("discharging".into()),
+        is_connected: true,
+        ..battery_device(super::MAXWELL_DEVICE_NAME, false)
+    };
+    let monitor = monitor_with_snapshot(vec![headset.clone()]);
+    let before_plug = Instant::now();
+    let after_plug = before_plug + Duration::from_millis(10);
+    let charging = headsets::MaxwellConnection {
+        connected: true,
+        charging: true,
+    };
+    super::publish_maxwell_connection(&monitor.maxwell_connection, after_plug, Some(charging));
+    let current = monitor.devices();
+    assert_eq!(current[0].status.as_deref(), Some("charging"));
+    assert_eq!(current[0].level, Some(96));
+    assert!(!current[0].is_loading);
+
+    // The HID request started before the cable was attached and returns later.
+    super::publish_maxwell_connection(
+        &monitor.maxwell_connection,
+        before_plug,
+        Some(headsets::MaxwellConnection {
+            connected: true,
+            charging: false,
+        }),
+    );
+    *monitor.devices.lock().unwrap() = vec![headset];
+    assert_eq!(monitor.devices()[0].status.as_deref(), Some("charging"));
+
+    // Normal native polling also refreshes connection state if events are lost.
+    super::publish_maxwell_connection(
+        &monitor.maxwell_connection,
+        after_plug + Duration::from_secs(5),
+        Some(headsets::MaxwellConnection {
+            connected: true,
+            charging: false,
+        }),
+    );
+    assert_eq!(monitor.devices()[0].status.as_deref(), Some("discharging"));
+}
+
+#[test]
+fn maxwell_connection_events_preserve_provisional_levels_and_remove_disconnected_rows() {
+    let headset = BatteryDevice {
+        level: Some(96),
+        is_connected: true,
+        ..battery_device(super::MAXWELL_DEVICE_NAME, true)
+    };
+    let mut devices = vec![headset.clone()];
+    super::apply_maxwell_connection(
+        &mut devices,
+        Some(&super::MaxwellConnectionSnapshot {
+            observed_at: Instant::now(),
+            last_device: None,
+            state: Some(headsets::MaxwellConnection {
+                connected: true,
+                charging: true,
+            }),
+        }),
+    );
+    assert_eq!(devices[0].level, Some(96));
+    assert!(devices[0].is_loading);
+    for state in [
+        None,
+        Some(headsets::MaxwellConnection {
+            connected: false,
+            charging: false,
+        }),
+    ] {
+        let mut devices = vec![headset.clone()];
+        super::apply_maxwell_connection(
+            &mut devices,
+            Some(&super::MaxwellConnectionSnapshot {
+                observed_at: Instant::now(),
+                state,
+                last_device: None,
+            }),
+        );
+        assert!(devices.is_empty());
+    }
+}
+
+#[test]
+fn maxwell_connected_event_restores_reading_removed_by_an_older_native_probe() {
+    let headset = BatteryDevice {
+        level: Some(80),
+        is_connected: true,
+        ..battery_device(super::MAXWELL_DEVICE_NAME, false)
+    };
+    let mut devices = Vec::new();
+    super::apply_maxwell_connection(
+        &mut devices,
+        Some(&super::MaxwellConnectionSnapshot {
+            observed_at: Instant::now(),
+            state: Some(headsets::MaxwellConnection {
+                connected: true,
+                charging: true,
+            }),
+            last_device: Some(headset),
+        }),
+    );
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].level, Some(80));
+    assert_eq!(devices[0].status.as_deref(), Some("charging"));
+    assert!(devices[0].is_loading);
 }

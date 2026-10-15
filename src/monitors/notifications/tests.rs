@@ -26,6 +26,8 @@ fn notification(summary: &str, timestamp: u64) -> Notification {
         server_owner: None,
         sender_owner: None,
         app_name: "Test".to_string(),
+        app_icon: None,
+        desktop_entry: None,
         summary: summary.to_string(),
         body: "Body".to_string(),
         timestamp,
@@ -290,7 +292,7 @@ fn discord_notify_exchange() -> (Message, Message) {
         .build(&(
             "Friend (Direct Message)".to_string(),
             0_u32,
-            String::new(),
+            "com.discordapp.Discord".to_string(),
             "Friend".to_string(),
             "New message".to_string(),
             vec!["default".to_string(), "Open".to_string()],
@@ -379,6 +381,8 @@ fn correlates_notify_call_with_cosmic_assigned_id() {
     assert_eq!(notification.timestamp, 42);
     assert!(notification.open_folder.is_none());
     assert!(notification.activation_action.is_none());
+    assert!(notification.app_icon.is_none());
+    assert!(notification.desktop_entry.is_none());
 }
 
 #[test]
@@ -394,6 +398,14 @@ fn captures_discord_default_action_from_desktop_entry() {
     assert_eq!(notification.id, Some(16));
     assert_eq!(notification.app_name, "Friend (Direct Message)");
     assert_eq!(notification.activation_action.as_deref(), Some("default"));
+    assert_eq!(
+        notification.app_icon.as_deref(),
+        Some("com.discordapp.Discord")
+    );
+    assert_eq!(
+        notification.desktop_entry.as_deref(),
+        Some("com.discordapp.Discord")
+    );
 }
 
 #[test]
@@ -685,4 +697,104 @@ fn suppresses_local_dismissals_until_cosmic_removes_them() {
     let mut next_history = vec![second];
     apply_local_dismissal_suppression(&mut next_history, &mut dismissed);
     assert!(dismissed.is_empty());
+}
+
+#[test]
+fn restores_notification_icon_metadata_from_cache() {
+    let path = cache_path("icon-metadata");
+    let mut expected = notification("Message", 42);
+    expected.app_icon = Some("com.discordapp.Discord".to_string());
+    expected.desktop_entry = Some("com.discordapp.Discord.desktop".to_string());
+    persist_cached_notifications(&path, "boot-id", &[expected.clone()]).unwrap();
+
+    assert_eq!(
+        load_cached_notifications(&path, "boot-id", 5).unwrap(),
+        vec![expected]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn legacy_notification_cache_defaults_to_missing_icon_metadata() {
+    let mut legacy = serde_json::to_value(notification("Message", 42)).unwrap();
+    legacy.as_object_mut().unwrap().remove("app_icon");
+    legacy.as_object_mut().unwrap().remove("desktop_entry");
+
+    let restored: Notification = serde_json::from_value(legacy).unwrap();
+    assert!(restored.app_icon.is_none());
+    assert!(restored.desktop_entry.is_none());
+    assert_eq!(restored.app_name, "Test");
+}
+
+#[test]
+fn history_refresh_preserves_icon_metadata_but_accepts_new_identity() {
+    let mut existing = notification("Message", 42);
+    existing.id = Some(15);
+    existing.server_owner = Some(":1.82".to_string());
+    existing.app_icon = Some("discord".to_string());
+    existing.desktop_entry = Some("com.discordapp.Discord".to_string());
+    let mut refreshed = existing.clone();
+    refreshed.app_icon = None;
+    refreshed.desktop_entry = None;
+
+    preserve_notification_targets(&[existing.clone()], std::slice::from_mut(&mut refreshed));
+    assert_eq!(refreshed.app_icon, existing.app_icon);
+    assert_eq!(refreshed.desktop_entry, existing.desktop_entry);
+
+    refreshed.app_icon = Some("com.system76.CosmicFiles".to_string());
+    refreshed.desktop_entry = Some("com.system76.CosmicFiles".to_string());
+    preserve_notification_targets(&[existing], std::slice::from_mut(&mut refreshed));
+    assert_eq!(
+        refreshed.app_icon.as_deref(),
+        Some("com.system76.CosmicFiles")
+    );
+    assert_eq!(
+        refreshed.desktop_entry.as_deref(),
+        Some("com.system76.CosmicFiles")
+    );
+}
+
+#[test]
+fn replacement_preserves_icon_metadata_and_accepts_explicit_updates() {
+    let mut existing = notification("Message", 42);
+    existing.id = Some(15);
+    existing.server_owner = Some(":1.82".to_string());
+    existing.app_icon = Some("discord".to_string());
+    existing.desktop_entry = Some("com.discordapp.Discord".to_string());
+    let mut replacement = existing.clone();
+    replacement.app_icon = None;
+    replacement.desktop_entry = None;
+    let mut rows = vec![existing.clone()];
+
+    upsert_notification(&mut rows, replacement.clone(), 5);
+    assert_eq!(rows[0].app_icon, existing.app_icon);
+    assert_eq!(rows[0].desktop_entry, existing.desktop_entry);
+
+    replacement.app_icon = Some("com.system76.CosmicFiles".to_string());
+    replacement.desktop_entry = Some("com.system76.CosmicFiles".to_string());
+    upsert_notification(&mut rows, replacement, 5);
+    assert_eq!(
+        rows[0].app_icon.as_deref(),
+        Some("com.system76.CosmicFiles")
+    );
+    assert_eq!(
+        rows[0].desktop_entry.as_deref(),
+        Some("com.system76.CosmicFiles")
+    );
+}
+
+#[test]
+fn history_does_not_reuse_icon_metadata_across_daemon_restarts() {
+    let mut previous = notification("Message", 42);
+    previous.id = Some(15);
+    previous.server_owner = Some(":1.82".to_string());
+    previous.app_icon = Some("discord".to_string());
+    previous.desktop_entry = Some("com.discordapp.Discord".to_string());
+    let mut refreshed = notification("Message", 42);
+    refreshed.id = Some(15);
+    refreshed.server_owner = Some(":1.83".to_string());
+
+    preserve_notification_targets(&[previous], std::slice::from_mut(&mut refreshed));
+    assert!(refreshed.app_icon.is_none());
+    assert!(refreshed.desktop_entry.is_none());
 }

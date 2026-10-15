@@ -20,6 +20,135 @@ fn media(status: PlaybackStatus, position: u64, title: &str) -> MediaInfo {
     }
 }
 
+fn seek_monitor(
+    position: u64,
+    duration: u64,
+) -> (
+    MediaMonitor,
+    std::sync::mpsc::Receiver<super::MediaControlCommand>,
+) {
+    use std::sync::{Arc, Mutex};
+
+    let (commands, receiver) = std::sync::mpsc::sync_channel(4);
+    let monitor = MediaMonitor {
+        player_state: Arc::new(Mutex::new(MultiPlayerState {
+            players: vec![
+                (
+                    PlayerId::Cider,
+                    media(PlaybackStatus::Paused, 5_000, "Music"),
+                ),
+                (
+                    PlayerId::Mpris("org.mpris.MediaPlayer2.cosmic-player.pid123".into()),
+                    MediaInfo {
+                        position,
+                        duration,
+                        can_seek: true,
+                        ..media(PlaybackStatus::Paused, position, "Episode")
+                    },
+                ),
+            ],
+            current_index: 1,
+        })),
+        cider_token: Arc::new(Mutex::new(None)),
+        selected_player: Arc::new(Mutex::new(None)),
+        emby_control: Arc::new(Mutex::new(None)),
+        controls: super::MediaControlWorker { commands },
+    };
+    (monitor, receiver)
+}
+
+#[test]
+fn relative_seeks_accumulate_and_only_target_the_selected_player() {
+    let (monitor, receiver) = seek_monitor(20_000, 90_000);
+    for (offset, expected) in [(10_000, 30_000), (10_000, 40_000), (-10_000, 30_000)] {
+        assert!(monitor.seek_relative(offset));
+        match receiver.try_recv().unwrap() {
+            super::MediaControlCommand::Mpris {
+                bus_name,
+                action: super::MprisControlAction::Seek(position_us),
+            } => {
+                assert_eq!(bus_name, "org.mpris.MediaPlayer2.cosmic-player.pid123");
+                assert_eq!(position_us, expected * 1000);
+            }
+            _ => panic!("relative seek must target only the selected MPRIS player"),
+        }
+        let state = monitor.get_player_state();
+        assert_eq!(state.players[1].1.position, expected);
+        assert_eq!(state.players[1].1.status, PlaybackStatus::Paused);
+        assert_eq!(state.players[0].1.position, 5_000);
+    }
+}
+
+#[test]
+fn relative_seeks_clamp_to_timeline_boundaries() {
+    let (monitor, receiver) = seek_monitor(5_000, 25_000);
+    assert!(monitor.seek_relative(-10_000));
+    assert_eq!(monitor.get_media_info().position, 0);
+    receiver.try_recv().unwrap();
+    assert!(monitor.seek_relative(i64::MAX));
+    assert_eq!(monitor.get_media_info().position, 25_000);
+    receiver.try_recv().unwrap();
+    assert!(monitor.seek_relative(i64::MIN));
+    assert_eq!(monitor.get_media_info().position, 0);
+}
+
+#[test]
+fn unsupported_or_rejected_seeks_do_not_change_position() {
+    let (monitor, receiver) = seek_monitor(20_000, 90_000);
+    monitor.player_state.lock().unwrap().players[1].1.can_seek = false;
+    assert!(!monitor.seek_relative(10_000));
+    assert!(!monitor.seek_to_progress(0.5));
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(monitor.get_media_info().position, 20_000);
+    monitor.player_state.lock().unwrap().players[1].1.can_seek = true;
+    assert!(!monitor.seek_to_progress(f64::NAN));
+    drop(receiver);
+    assert!(!monitor.seek_relative(10_000));
+    assert_eq!(monitor.get_media_info().position, 20_000);
+}
+
+#[test]
+fn relative_seeks_work_without_a_known_duration() {
+    let (monitor, _receiver) = seek_monitor(20_000, 0);
+    assert!(!monitor.seek_to_progress(0.5));
+    assert!(monitor.seek_relative(10_000));
+    assert_eq!(monitor.get_media_info().position, 30_000);
+}
+
+#[test]
+fn local_video_frames_are_selected_and_cannot_replace_the_next_episode() {
+    let mut info = MediaInfo {
+        media_url: Some("file:///tmp/Episode%2001.mkv".into()),
+        art_url: Some("file:///tmp/player-placeholder.png".into()),
+        ..media(PlaybackStatus::Paused, 0, "Episode 01")
+    };
+    let source = super::ArtworkSource::VideoFrame(info.media_url.clone().unwrap());
+    assert_eq!(
+        MediaMonitor::artwork_candidate_sources(&info),
+        vec![
+            source.clone(),
+            super::ArtworkSource::Image(info.art_url.clone().unwrap())
+        ]
+    );
+    let id = PlayerId::Mpris("org.mpris.MediaPlayer2.cosmic-player".into());
+    let request = ArtworkRequest {
+        player_id: id.clone(),
+        track: TrackSignature::from(&info),
+        source,
+    };
+    info.media_url = Some("file:///tmp/Episode%2002.mkv".into());
+    info.title = "Episode 02".into();
+    let mut selections =
+        HashMap::from([(id.clone(), TrackArtwork::new(TrackSignature::from(&info)))]);
+    MediaMonitor::accept_completed_artwork(
+        request,
+        artwork(640, 360),
+        &mut ArtworkCache::new(4),
+        &mut selections,
+    );
+    assert!(selections[&id].best.is_none());
+}
+
 #[test]
 fn recognizes_playerctld_as_an_mpris_proxy() {
     assert!(MediaMonitor::is_playerctld_mpris_player(

@@ -3,6 +3,7 @@
 use crate::monitors::notifications::{FileTransfer, Notification};
 use crate::overlay::Message;
 use crate::overlay::components::{
+    notification_icon,
     section::{compact_single_line, embedded_symbolic_icon},
     shrink, slide, translate,
 };
@@ -11,10 +12,10 @@ use crate::overlay::notification_state::{
     DismissingNotification, NotificationKey, notification_source,
 };
 use crate::overlay::stats::SystemSnapshot;
-use cosmic::iced::{Alignment, Background, Border, Color, Length};
+use cosmic::iced::{Alignment, Background, Border, Color, Length, Radians, gradient};
 use cosmic::{Element, theme, widget};
 
-const CLEAR_ALL_BUTTON_WIDTH: f32 = 64.0;
+const CLEAR_ALL_BUTTON_WIDTH: f32 = 76.0;
 
 pub(in crate::overlay) fn notifications_view<'a>(
     stats: &'a SystemSnapshot,
@@ -43,14 +44,17 @@ pub(in crate::overlay) fn notifications_view<'a>(
         || clearing_notifications
         || clear_button_visibility > f32::EPSILON
     {
-        let clear_all: Element<'a, Message> = widget::button::standard("Clear all")
-            .width(Length::Fixed(CLEAR_ALL_BUTTON_WIDTH))
-            .height(Length::Fixed(28.0))
-            .padding([0, 8])
-            .font_size(12)
-            .line_height(17)
-            .on_press_maybe((!clearing_notifications).then_some(Message::ClearNotifications))
-            .into();
+        let clear_all: Element<'a, Message> = widget::button::custom(
+            widget::container(widget::text::caption("Clear all"))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .class(clear_all_button_class())
+        .width(Length::Fixed(CLEAR_ALL_BUTTON_WIDTH))
+        .height(Length::Fixed(28.0))
+        .padding(0)
+        .on_press_maybe((!clearing_notifications).then_some(Message::ClearNotifications))
+        .into();
         heading = heading.push(if clear_button_visibility < 1.0 {
             shrink::out(clear_all, 1.0 - clear_button_visibility)
         } else {
@@ -184,6 +188,48 @@ pub(in crate::overlay) fn notifications_view<'a>(
     }
 
     notifications.into()
+}
+
+fn clear_all_button_class() -> theme::Button {
+    theme::Button::Custom {
+        active: Box::new(|focused, theme| clear_all_button_style(theme, focused, 0.10, 0.82)),
+        hovered: Box::new(|focused, theme| clear_all_button_style(theme, focused, 0.16, 1.0)),
+        pressed: Box::new(|focused, theme| clear_all_button_style(theme, focused, 0.21, 1.0)),
+        disabled: Box::new(|theme| clear_all_button_style(theme, false, 0.05, 0.42)),
+    }
+}
+
+fn clear_all_button_style(
+    theme: &cosmic::Theme,
+    focused: bool,
+    tint_alpha: f32,
+    text_alpha: f32,
+) -> widget::button::Style {
+    let foreground: Color = theme.current_container().on.into();
+    let mut top_tint = foreground;
+    let mut bottom_tint = foreground;
+    let mut border = foreground;
+    let mut text = foreground;
+    top_tint.a = tint_alpha + 0.025;
+    bottom_tint.a = tint_alpha - 0.025;
+    border.a = tint_alpha + 0.025;
+    text.a = text_alpha;
+
+    // Keep the tint translucent so the widget's compositor blur shows through.
+    let glass = gradient::Linear::new(Radians(std::f32::consts::FRAC_PI_2))
+        .add_stop(0.0, top_tint)
+        .add_stop(1.0, bottom_tint);
+
+    widget::button::Style {
+        background: Some(Background::Gradient(glass.into())),
+        border_radius: 14.0.into(),
+        border_width: 1.0,
+        border_color: border,
+        outline_width: if focused { 1.0 } else { 0.0 },
+        outline_color: theme.cosmic().accent.base.into(),
+        text_color: Some(text),
+        ..Default::default()
+    }
 }
 
 fn notification_panel_class() -> theme::Container<'static> {
@@ -328,7 +374,7 @@ fn notification_group_item<'a>(
         .width(Length::Fill)
         .align_y(Alignment::Center)
         .spacing(spacing)
-        .push(notification_dot(group.source))
+        .push(notification_icon::view(group.notifications[0]))
         .push(text)
         .push(chevron);
     let content = notification_with_transfer_progress(
@@ -413,7 +459,7 @@ fn notification_item<'a>(
         .width(Length::Fill)
         .align_y(Alignment::Center)
         .spacing(spacing)
-        .push(notification_dot(&notification.app_name))
+        .push(notification_icon::view(notification))
         .push(text);
     let content = widget::mouse_area(content)
         .on_press(Message::ToggleNotification {
@@ -546,9 +592,9 @@ fn notification_with_transfer_progress<'a>(
         .push(
             widget::container(file_transfer_progress(transfer))
                 .width(Length::Fill)
-                // Align the bar with the caption after the notification dot.
+                // Align the bar with the caption after the notification icon.
                 .padding(cosmic::iced::Padding {
-                    left: 8.0 + f32::from(spacing),
+                    left: f32::from(notification_icon::SIZE) + f32::from(spacing),
                     ..Default::default()
                 }),
         )
@@ -563,56 +609,6 @@ fn filled_notification_icon() -> Element<'static, Message> {
         )),
         18,
     )
-}
-
-fn notification_dot(app_name: &str) -> Element<'static, Message> {
-    let band = notification_band(app_name);
-
-    widget::container(
-        widget::space()
-            .width(Length::Fixed(8.0))
-            .height(Length::Fixed(8.0)),
-    )
-    .class(theme::Container::custom(move |theme| {
-        let cosmic = theme.cosmic();
-        let color = match band {
-            NotificationBand::Accent => cosmic.accent_color(),
-            NotificationBand::Success => cosmic.success_color(),
-            NotificationBand::Warning => cosmic.warning_color(),
-            NotificationBand::Destructive => cosmic.destructive_color(),
-        };
-
-        cosmic::iced::widget::container::Style {
-            background: Some(Background::Color(color.into())),
-            border: Border {
-                radius: [4.0; 4].into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }))
-    .into()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NotificationBand {
-    Accent,
-    Success,
-    Warning,
-    Destructive,
-}
-
-fn notification_band(app_name: &str) -> NotificationBand {
-    match app_name
-        .bytes()
-        .fold(0_u8, |hash, byte| hash.wrapping_add(byte))
-        % 4
-    {
-        0 => NotificationBand::Accent,
-        1 => NotificationBand::Success,
-        2 => NotificationBand::Warning,
-        _ => NotificationBand::Destructive,
-    }
 }
 
 fn relative_notification_time(now: u64, timestamp: u64) -> String {
@@ -641,13 +637,5 @@ mod tests {
             "Backup finished now"
         );
         assert_eq!(compact_single_line("abcdefghij", 6), "abcde\u{2026}");
-        assert_eq!(notification_band("System"), notification_band("System"));
-        assert!(matches!(
-            notification_band("System"),
-            NotificationBand::Accent
-                | NotificationBand::Success
-                | NotificationBand::Warning
-                | NotificationBand::Destructive
-        ));
     }
 }

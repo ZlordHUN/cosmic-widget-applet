@@ -848,7 +848,7 @@ fn render_utilization(
     // Draw section header
     let header_font = pango::FontDescription::from_string("Ubuntu Bold 14");
     layout.set_font_description(Some(&header_font));
-    layout.set_text("Utilization");
+    layout.set_text("System Utilization");
     cr.move_to(10.0, y);
     pangocairo::functions::layout_path(cr, layout);
     cr.set_source_rgb(0.0, 0.0, 0.0);

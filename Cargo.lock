@@ -1179,6 +1179,7 @@ dependencies = [
  "serde",
  "serde_bencode",
  "serde_json",
+ "sha2",
  "smithay-client-toolkit",
  "sysinfo",
  "tokio",

@@ -3,9 +3,10 @@
 //! Shared presentation data for account quota reports from AI applications.
 
 pub mod claude;
+mod claude_cache;
 pub mod codex;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UsageStatus {
     Loading,
     Available,
@@ -15,7 +16,7 @@ pub enum UsageStatus {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UsageWindow {
     /// Separate quota buckets must retain their identity.
     pub limit_id: String,
@@ -28,7 +29,7 @@ pub struct UsageWindow {
     pub is_stale: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSnapshot {
     pub windows: Vec<UsageWindow>,
     /// Latest report represented here; individual windows retain their own age.

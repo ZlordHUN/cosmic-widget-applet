@@ -1,0 +1,358 @@
+diff --git a/src/main.rs b/src/main.rs
+index 02303e8..9d9d454 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -93,11 +93,65 @@ fn positive_framerate(framerate: gst::Fraction) -> Option<f64> {
+     fps.is_finite().then_some(fps)
+ }
+ 
++fn mpris_is_paused(current: gst::State, pending: gst::State) -> bool {
++    // A flushing seek briefly prerolls in Paused before returning to Playing.
++    // Publish the target state so that MPRIS clients do not see a false pause.
++    match pending {
++        gst::State::Playing => false,
++        gst::State::Paused => true,
++        _ => current == gst::State::Paused,
++    }
++}
++
++fn mpris_seek_target(
++    current: f64,
++    duration: f64,
++    amount_micros: i64,
++    relative: bool,
++) -> Option<f64> {
++    if !current.is_finite() || !duration.is_finite() || duration <= 0.0 {
++        return None;
++    }
++    let amount = amount_micros as f64 / 1_000_000.0;
++    if relative {
++        Some((current + amount).clamp(0.0, duration))
++    } else {
++        (0.0..=duration).contains(&amount).then_some(amount)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+-    use super::positive_framerate;
++    use super::{mpris_is_paused, mpris_seek_target, positive_framerate};
+     use iced_video_player::gst;
+ 
++    #[test]
++    fn mpris_reports_target_playback_state_during_preroll() {
++        assert!(!mpris_is_paused(gst::State::Paused, gst::State::Playing));
++        assert!(mpris_is_paused(gst::State::Playing, gst::State::Paused));
++        assert!(!mpris_is_paused(
++            gst::State::Playing,
++            gst::State::VoidPending
++        ));
++        assert!(mpris_is_paused(gst::State::Paused, gst::State::VoidPending));
++    }
++
++    #[test]
++    fn mpris_relative_seeks_clamp_and_accumulate() {
++        assert_eq!(mpris_seek_target(5.0, 60.0, -10_000_000, true), Some(0.0));
++        assert_eq!(mpris_seek_target(55.0, 60.0, 10_000_000, true), Some(60.0));
++        let first = mpris_seek_target(20.0, 60.0, 10_000_000, true).unwrap();
++        assert_eq!(mpris_seek_target(first, 60.0, 10_000_000, true), Some(40.0));
++    }
++
++    #[test]
++    fn mpris_absolute_seeks_reject_invalid_positions() {
++        assert_eq!(mpris_seek_target(20.0, 60.0, -1, false), None);
++        assert_eq!(mpris_seek_target(20.0, 60.0, 60_000_001, false), None);
++        assert_eq!(mpris_seek_target(20.0, 60.0, 500_000, false), Some(0.5));
++        assert_eq!(mpris_seek_target(0.0, 0.0, 0, false), None);
++    }
++
+     #[test]
+     fn variable_framerate_uses_fallback() {
+         assert_eq!(positive_framerate(gst::Fraction::new(0, 1)), None);
+@@ -270,6 +324,7 @@ pub struct MprisMeta {
+     disc_number: i32,
+     track_number: i32,
+     duration_micros: i64,
++    seekable: bool,
+ }
+ 
+ #[derive(Clone, Debug, Default, PartialEq)]
+@@ -331,6 +386,11 @@ pub enum Message {
+     Seek(f64),
+     SeekRelative(f64),
+     SeekRelease,
++    MprisSeek {
++        url: url::Url,
++        amount_micros: i64,
++        relative: bool,
++    },
+     PlayPrev,
+     PlayNext,
+     NextFrame,
+@@ -709,9 +769,16 @@ impl App {
+ 
+     fn update_mpris_meta(&mut self) {
+         let mut new = MprisMeta {
+-            //TODO: clear url_opt when file is closed
+-            url_opt: self.flags.url_opt.clone(),
++            url_opt: self
++                .flags
++                .url_opt
++                .clone()
++                .filter(|_| self.video_opt.is_some()),
+             duration_micros: (self.duration * 1_000_000.0) as i64,
++            seekable: self.video_opt.as_ref().is_some_and(|video| {
++                let mut query = gst::query::Seeking::new(gst::Format::Time);
++                video.pipeline().query(&mut query) && query.result().0
++            }),
+             ..Default::default()
+         };
+         //TODO: use any other stream tags?
+@@ -807,7 +874,8 @@ impl App {
+                 repeat_state: RepeatState::Disabled,
+             };
+             if let Some(video) = &self.video_opt {
+-                new.paused = video.paused();
++                let (_, current, pending) = video.pipeline().state(gst::ClockTime::ZERO);
++                new.paused = mpris_is_paused(current, pending);
+                 new.volume = video.volume();
+                 new.repeat_state = self.flags.config_state.player_state.repeat;
+             }
+@@ -1374,6 +1442,30 @@ impl Application for App {
+                     video.seek(target, true).expect("seek");
+                 }
+             }
++            Message::MprisSeek {
++                url,
++                amount_micros,
++                relative,
++            } => {
++                // Revalidate queued commands after a file change. Seeking uses
++                // the pipeline directly, so paused playback stays paused.
++                if self.flags.url_opt.as_ref() == Some(&url)
++                    && self.mpris_meta.url_opt.as_ref() == Some(&url)
++                    && self.mpris_meta.seekable
++                    && !self.dragging
++                    && let Some(target) =
++                        mpris_seek_target(self.position, self.duration, amount_micros, relative)
++                    && let Some(video) = &mut self.video_opt
++                {
++                    match video.seek(Duration::from_secs_f64(target), true) {
++                        Ok(()) => {
++                            self.position = target;
++                            self.update_controls(true);
++                        }
++                        Err(error) => log::warn!("MPRIS seek failed: {error}"),
++                    }
++                }
++            }
+             Message::SeekRelease => {
+                 //TODO: cleanest way to close dropdowns
+                 self.dropdown_opt = None;
+diff --git a/src/mpris.rs b/src/mpris.rs
+index 8c87244..35b9f44 100644
+--- a/src/mpris.rs
++++ b/src/mpris.rs
+@@ -13,16 +13,26 @@ use crate::config::RepeatState;
+ use crate::{Message, MprisEvent, MprisMeta, MprisState};
+ 
+ impl MprisMeta {
++    fn track_id(&self) -> TrackId {
++        let Some(url) = &self.url_opt else {
++            return TrackId::NO_TRACK;
++        };
++        // Hex encoding keeps every URL distinct and valid as an object path.
++        let key: String = url
++            .as_str()
++            .bytes()
++            .map(|byte| format!("{byte:02x}"))
++            .collect();
++        TrackId::try_from(format!(
++            "/com/system76/CosmicPlayer/pid{}/TrackList/{key}",
++            process::id()
++        ))
++        .unwrap()
++    }
++
+     fn metadata(&self) -> Metadata {
+         let mut meta = Metadata::builder()
+-            //TODO: better track id
+-            .trackid(
+-                mpris_server::TrackId::try_from(format!(
+-                    "/com/system76/CosmicPlayer/pid{}/TrackList/0",
+-                    process::id()
+-                ))
+-                .unwrap(),
+-            )
++            .trackid(self.track_id())
+             .length(Time::from_micros(self.duration_micros));
+         if let Some(url) = &self.url_opt {
+             meta = meta.url(url.clone());
+@@ -180,12 +190,38 @@ impl PlayerInterface for Player {
+ 
+     async fn seek(&self, offset: Time) -> fdo::Result<()> {
+         log::info!("Seek({:?})", offset);
+-        Ok(())
++        let meta = self.meta.lock().await;
++        let Some(url) = meta.url_opt.clone().filter(|_| meta.seekable) else {
++            return Ok(());
++        };
++        drop(meta);
++        self.message(Message::MprisSeek {
++            url,
++            amount_micros: offset.as_micros(),
++            relative: true,
++        })
++        .await
+     }
+ 
+     async fn set_position(&self, track_id: TrackId, position: Time) -> fdo::Result<()> {
+         log::info!("SetPosition({}, {:?})", track_id, position);
+-        Ok(())
++        let meta = self.meta.lock().await;
++        if !meta.seekable
++            || track_id != meta.track_id()
++            || !(0..=meta.duration_micros).contains(&position.as_micros())
++        {
++            return Ok(());
++        }
++        let Some(url) = meta.url_opt.clone() else {
++            return Ok(());
++        };
++        drop(meta);
++        self.message(Message::MprisSeek {
++            url,
++            amount_micros: position.as_micros(),
++            relative: false,
++        })
++        .await
+     }
+ 
+     async fn open_uri(&self, uri: String) -> fdo::Result<()> {
+@@ -291,7 +327,7 @@ impl PlayerInterface for Player {
+ 
+     async fn can_seek(&self) -> fdo::Result<bool> {
+         log::info!("CanSeek");
+-        Ok(false)
++        Ok(self.meta.lock().await.seekable)
+     }
+ 
+     async fn can_control(&self) -> fdo::Result<bool> {
+@@ -406,6 +442,9 @@ fn watcher_stream() -> impl Stream<Item = Message> {
+                         match event {
+                             MprisEvent::Meta(new) => {
+                                 let mut old = server.imp().meta.lock().await;
++                                if new.seekable != old.seekable {
++                                    props.push(Property::CanSeek(new.seekable));
++                                }
+                                 let new_metadata = new.metadata();
+                                 if new_metadata != old.metadata() {
+                                     props.push(Property::Metadata(new_metadata));
+@@ -459,3 +498,107 @@ pub fn subscription() -> Subscription<Message> {
+     struct MprisSubscription;
+     Subscription::run_with(TypeId::of::<MprisSubscription>(), |_| watcher_stream())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use futures::StreamExt;
++
++    fn player() -> (Player, futures::channel::mpsc::Receiver<Message>) {
++        let (tx, rx) = futures::channel::mpsc::channel(8);
++        (
++            Player {
++                msg_tx: Mutex::new(tx),
++                meta: Mutex::new(MprisMeta {
++                    url_opt: Some(url::Url::parse("file:///tmp/episode-one.mkv").unwrap()),
++                    duration_micros: 60_000_000,
++                    seekable: true,
++                    ..Default::default()
++                }),
++                state: Mutex::new(MprisState::default()),
++            },
++            rx,
++        )
++    }
++
++    #[test]
++    fn relative_seek_forwards_signed_microseconds_without_playback_messages() {
++        futures::executor::block_on(async {
++            let (player, mut rx) = player();
++            player.seek(Time::from_micros(-10_000_000)).await.unwrap();
++            assert!(matches!(
++                rx.next().await,
++                Some(Message::MprisSeek {
++                    amount_micros: -10_000_000,
++                    relative: true,
++                    ..
++                })
++            ));
++            assert!(rx.try_recv().is_err());
++        });
++    }
++
++    #[test]
++    fn absolute_seek_validates_track_and_position() {
++        futures::executor::block_on(async {
++            let (player, mut rx) = player();
++            let track_id = player.meta.lock().await.track_id();
++            let stale_id = TrackId::try_from("/old/track").unwrap();
++            player
++                .set_position(stale_id, Time::from_secs(20))
++                .await
++                .unwrap();
++            player
++                .set_position(track_id.clone(), Time::from_micros(-1))
++                .await
++                .unwrap();
++            player
++                .set_position(track_id.clone(), Time::from_secs(61))
++                .await
++                .unwrap();
++            assert!(rx.try_recv().is_err());
++            player
++                .set_position(track_id, Time::from_secs(20))
++                .await
++                .unwrap();
++            assert!(matches!(
++                rx.next().await,
++                Some(Message::MprisSeek {
++                    amount_micros: 20_000_000,
++                    relative: false,
++                    ..
++                })
++            ));
++            assert!(rx.try_recv().is_err());
++        });
++    }
++
++    #[test]
++    fn unseekable_media_ignores_seek_commands() {
++        futures::executor::block_on(async {
++            let (player, mut rx) = player();
++            let track_id = {
++                let mut meta = player.meta.lock().await;
++                meta.seekable = false;
++                meta.track_id()
++            };
++            assert!(!player.can_seek().await.unwrap());
++            player.seek(Time::from_secs(10)).await.unwrap();
++            player
++                .set_position(track_id, Time::from_secs(20))
++                .await
++                .unwrap();
++            assert!(rx.try_recv().is_err());
++        });
++    }
++
++    #[test]
++    fn track_identity_changes_with_media_and_clears_when_closed() {
++        let mut meta = MprisMeta::default();
++        assert_eq!(meta.track_id(), TrackId::NO_TRACK);
++        meta.url_opt = Some(url::Url::parse("file:///tmp/episode-one.mkv").unwrap());
++        let first = meta.track_id();
++        meta.url_opt = Some(url::Url::parse("file:///tmp/episode-two.mkv").unwrap());
++        assert_ne!(meta.track_id(), first);
++    }
++}

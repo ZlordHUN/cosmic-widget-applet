@@ -18,6 +18,7 @@ mod misc;
 mod steelseries;
 mod transport;
 
+pub(super) use audeze::ConnectionState as MaxwellConnection;
 use transport::Reading;
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
@@ -60,6 +61,10 @@ impl Monitor {
             transient_failures: HashMap::new(),
             last_discovery: None,
         }
+    }
+
+    pub(super) fn invalidate_discovery(&mut self) {
+        self.last_discovery = None;
     }
 
     pub(super) fn query(&mut self) -> Snapshot {
@@ -182,6 +187,10 @@ fn profiles() -> impl Iterator<Item = &'static Profile> {
 
 pub(super) fn query_audeze_maxwell() -> Result<Option<audeze::BatteryState>, String> {
     audeze::query()
+}
+
+pub(super) fn query_audeze_maxwell_connection() -> Result<Option<MaxwellConnection>, String> {
+    audeze::connection_state()
 }
 
 #[cfg(test)]

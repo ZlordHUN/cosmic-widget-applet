@@ -93,6 +93,12 @@ pub struct Notification {
     pub sender_owner: Option<String>,
     /// Application that sent the notification (e.g., "Firefox", "System")
     pub app_name: String,
+    /// Icon name or local path supplied by the application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_icon: Option<String>,
+    /// Stable application identity supplied by the desktop-entry hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_entry: Option<String>,
     /// Notification title/headline
     pub summary: String,
     /// Notification body text (may be empty)
@@ -728,6 +734,8 @@ enum NotificationBusEvent {
 #[derive(Debug)]
 struct PendingNotification {
     app_name: String,
+    app_icon: Option<String>,
+    desktop_entry: Option<String>,
     summary: String,
     body: String,
     timestamp: u64,
@@ -766,12 +774,13 @@ impl NotificationMessageParser {
                 let Some(sender) = header.sender().map(ToString::to_string) else {
                     return Ok(None);
                 };
-                let (app_name, _, _, summary, body, actions, hints, _): NotifyArguments =
+                let (app_name, _, app_icon, summary, body, actions, hints, _): NotifyArguments =
                     message.body().deserialize()?;
                 if summary.is_empty() {
                     return Ok(None);
                 }
-                let desktop_entry = notification_string_hint(&hints, "desktop-entry");
+                let desktop_entry = notification_string_hint(&hints, "desktop-entry")
+                    .filter(|entry| !entry.trim().is_empty());
                 let action_keys = actions
                     .chunks_exact(2)
                     .map(|pair| pair[0].clone())
@@ -785,6 +794,8 @@ impl NotificationMessageParser {
                         app_name: (!app_name.is_empty())
                             .then_some(app_name)
                             .unwrap_or_else(|| "System".to_string()),
+                        app_icon: (!app_icon.trim().is_empty()).then_some(app_icon),
+                        desktop_entry,
                         summary,
                         body,
                         timestamp,
@@ -809,6 +820,8 @@ impl NotificationMessageParser {
                     server_owner: header.sender().map(ToString::to_string),
                     sender_owner: Some(key.0),
                     app_name: pending.app_name,
+                    app_icon: pending.app_icon,
+                    desktop_entry: pending.desktop_entry,
                     summary: pending.summary,
                     body: pending.body,
                     timestamp: pending.timestamp,
@@ -930,10 +943,20 @@ fn upsert_notification(
             .activation_action
             .clone()
             .or_else(|| notifications[index].activation_action.clone());
+        let app_icon = notification
+            .app_icon
+            .clone()
+            .or_else(|| notifications[index].app_icon.clone());
+        let desktop_entry = notification
+            .desktop_entry
+            .clone()
+            .or_else(|| notifications[index].desktop_entry.clone());
         notifications[index] = Notification {
             timestamp,
             open_folder,
             activation_action,
+            app_icon,
+            desktop_entry,
             ..notification
         };
     } else {
@@ -967,6 +990,13 @@ fn preserve_notification_targets(existing: &[Notification], refreshed: &mut [Not
                 }
             }
         });
+        if notification.app_icon.is_none() {
+            notification.app_icon = previous.and_then(|candidate| candidate.app_icon.clone());
+        }
+        if notification.desktop_entry.is_none() {
+            notification.desktop_entry =
+                previous.and_then(|candidate| candidate.desktop_entry.clone());
+        }
         if notification.open_folder.is_none() {
             notification.open_folder = previous.and_then(|candidate| candidate.open_folder.clone());
         }
@@ -1270,6 +1300,9 @@ fn load_cosmic_notification_history(
                             server_owner: Some(owner.to_string()),
                             sender_owner: None,
                             app_name,
+                            app_icon: None,
+                            desktop_entry: (!desktop_entry.trim().is_empty())
+                                .then_some(desktop_entry),
                             summary,
                             body,
                             timestamp,
@@ -1301,6 +1334,8 @@ fn load_cosmic_notification_history(
             server_owner: Some(owner.to_string()),
             sender_owner: None,
             app_name,
+            app_icon: None,
+            desktop_entry: None,
             summary,
             body,
             timestamp,

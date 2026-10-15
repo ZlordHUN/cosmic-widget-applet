@@ -19,10 +19,12 @@ and a frosted-glass desktop overlay.
 - Local and mounted storage usage, including network filesystems
 - Native battery monitoring for Logitech peripherals, gaming headsets, and the
   Razer Wolverine V3 Pro 8K PC
-- Open-Meteo weather with no API key
+- Open-Meteo weather with animated Meteocons icons and no API key
 - Grouped, expandable COSMIC notifications with synchronized dismissal
 - Multi-source media controls for MPRIS players, Cider, Emby, and browser media
 - YouTube thumbnails and Bandcamp album covers for browser playback
+- Local video thumbnails and readable COSMIC Player episode titles
+- Ten-second backward/forward controls for seekable media
 - Bandcamp track titles in Zen/Firefox when the playing duration uniquely
   identifies a track, without a browser extension
 - AI Usage below Now Playing, with Codex and Claude remaining allowances,
@@ -50,7 +52,11 @@ sudo udevadm trigger
 Reconnect newly supported USB receivers after the first installation so the
 udev permissions take effect. The install recipe places the applet, overlay,
 settings application, desktop entries, icon, metadata, and headset udev rules
-under `/usr/local`.
+under `/usr/local`. If a required release binary is missing, `sudo just install`
+builds all three installed binaries as your normal user before copying any files.
+To rebuild existing binaries after source changes, keep using `just build-release`
+first. For a custom Cargo output directory, pass it explicitly through sudo:
+`sudo just cargo-target-dir=/path/to/target install`.
 
 Add **COSMIC Widget** to the COSMIC panel. Its popup can show or hide the
 overlay and open the settings application.
@@ -67,6 +73,11 @@ Only one overlay instance can run at a time.
 
 ## Optional Integrations
 
+- FFmpeg enables thumbnails extracted from local videos. Install `ffmpeg` with
+  your distribution's package manager; title formatting and controls work without it.
+- [COSMIC Player seeking](integrations/cosmic-player/README.md) enables the
+  10-second buttons and timeline for Player versions with unimplemented MPRIS
+  seek commands. Other players use their existing seek support.
 - [Solaar](https://github.com/pwr-Solaar/Solaar) can be enabled as a fallback
   for Logitech hardware that the native HID++ reader cannot access.
 - [HeadsetControl](https://github.com/Sapd/HeadsetControl) can provide fallback
@@ -85,7 +96,9 @@ Only one overlay instance can run at a time.
   wait for a new report.
 - Claude usage reads your five-hour and weekly plan allowances using your existing
   Claude Code sign-in. It checks the same usage endpoint as the Claude Code client
-  every five minutes, and backs off on request failures. Sign in through Claude
+  every five minutes, and backs off on request failures. Saved readings reappear
+  immediately after widget restarts; temporary failures start retrying after
+  30 seconds, while server rate limits retain their required delay. Sign in through Claude
   Code if the widget asks; the widget does not refresh or modify your credentials.
   Older readings are labeled as last known after a failed refresh, and expired
   windows wait for a fresh report.
@@ -133,6 +146,14 @@ layout.
 
 MPL-2.0
 
-Weather icons are from
+The ten-second media controls use Google's rounded Material Design Icons under
+the Apache License 2.0. Sources and attribution are in
+[assets/icons/material-design](assets/icons/material-design/README.md).
+
+The production overlay uses animated [Meteocons](https://github.com/basmilius/meteocons)
+by Bas Milius under the MIT license. Vendored sources, attribution, and frame
+generation instructions are in [assets/weather/meteocons](assets/weather/meteocons/README.md).
+
+The legacy overlay uses
 [Weather Icons](https://github.com/erikflowers/weather-icons) under the SIL OFL
 1.1.

@@ -6,7 +6,7 @@ use super::animation::{
     ExpansionAnimation, NOTIFICATION_GROUP_EXPANSION_DURATION, ScrollAnimation,
 };
 use super::layout::{
-    desired_surface_height, desired_surface_height_with_animation, notification_group_size,
+    desired_surface_height, notification_group_size, notification_group_visible_fraction,
 };
 use super::media_state::{
     DismissingMedia, MEDIA_CONTROL_GRACE, PendingPlayback, advance_media_dismissal,
@@ -103,7 +103,9 @@ pub(super) enum Message {
     MediaTimelineHoverChanged(bool),
     MediaSeekChanged(f64),
     CommitMediaSeek,
+    SeekMediaRelative(i64),
     NotificationScrolled(f32),
+    OverlayMeasured(u32),
     OverlayPointerMoved(Point),
     BeginOverlayDrag,
     EndOverlayDrag,
@@ -204,6 +206,7 @@ impl App {
                     | Message::SelectMediaPlayer(_)
                     | Message::MediaSeekChanged(_)
                     | Message::CommitMediaSeek
+                    | Message::SeekMediaRelative(_)
                     | Message::MediaTimelineHoverChanged(_)
             )
         {
@@ -307,37 +310,17 @@ impl App {
                 }
 
                 let frosted = frosted_enabled();
-                let surface_height = desired_surface_height_with_animation(
-                    &self.config,
-                    &self.snapshot,
-                    self.expanded_notification.as_ref(),
-                    self.expanded_notification_group.as_deref(),
-                    self.notification_expansion.progress,
-                    self.notification_group_expansion.progress,
-                    self.dismissing_media.is_some(),
-                );
-                let size_changed = surface_height != self.surface_height;
-                let frosted_changed = frosted != self.frosted;
-                let animations_active = self.animations_active();
-
-                self.frosted = frosted;
-                if size_changed {
-                    self.surface_height = surface_height;
-                    if !animations_active {
-                        tasks.push(set_surface_regions(
-                            self.surface_id,
-                            surface_height,
-                            frosted,
-                        ));
-                    }
-                }
-                if frosted_changed && !size_changed {
-                    tasks.push(set_surface_blur(self.surface_id, frosted, surface_height));
+                if frosted != self.frosted {
+                    self.frosted = frosted;
+                    tasks.push(set_surface_blur(
+                        self.surface_id,
+                        frosted,
+                        self.surface_height,
+                    ));
                 }
             }
             Message::AnimationTick => {
                 let now = Instant::now();
-                let was_animating = self.animations_active();
                 self.notification_expansion.advance(now);
                 self.notification_group_expansion.advance(now);
                 self.clear_button_animation.advance(now);
@@ -410,24 +393,6 @@ impl App {
                 if self.notification_group_expansion.is_collapsed() {
                     self.expanded_notification_group = None;
                 }
-
-                self.surface_height = desired_surface_height_with_animation(
-                    &self.config,
-                    &self.snapshot,
-                    self.expanded_notification.as_ref(),
-                    self.expanded_notification_group.as_deref(),
-                    self.notification_expansion.progress,
-                    self.notification_group_expansion.progress,
-                    self.dismissing_media.is_some(),
-                );
-
-                if was_animating && !self.animations_active() {
-                    tasks.push(set_surface_regions(
-                        self.surface_id,
-                        self.surface_height,
-                        self.frosted,
-                    ));
-                }
             }
             Message::ClearNotifications => {
                 if self.snapshot.notifications.is_empty() || self.clearing_notifications {
@@ -450,12 +415,22 @@ impl App {
                 let current_scroll_offset = self.notification_scroll.target;
                 self.notification_scroll.snap_to(current_scroll_offset);
                 if self.expanded_notification_group.as_deref() == Some(&source) {
-                    let target = if self.notification_group_expansion.target > 0.0 {
-                        0.0
+                    if self.notification_group_expansion.target > 0.0 {
+                        self.notification_group_expansion.advance(now);
+                        let visible_fraction = notification_group_visible_fraction(
+                            &self.snapshot,
+                            &source,
+                            self.notification_group_expansion.progress,
+                            current_scroll_offset,
+                        );
+                        self.notification_group_expansion
+                            .collapse_visible(visible_fraction, now);
+                        if self.notification_group_expansion.is_collapsed() {
+                            self.expanded_notification_group = None;
+                        }
                     } else {
-                        1.0
-                    };
-                    self.notification_group_expansion.transition_to(target, now);
+                        self.notification_group_expansion.transition_to(1.0, now);
+                    }
                 } else {
                     self.expanded_notification_group = Some(source);
                     self.notification_group_expansion.reset();
@@ -463,11 +438,6 @@ impl App {
                 }
                 self.expanded_notification = None;
                 self.notification_expansion.reset();
-                tasks.push(set_surface_regions(
-                    self.surface_id,
-                    self.surface_height.max(self.target_surface_height()),
-                    self.frosted,
-                ));
             }
             Message::ToggleNotification { key: selected } => {
                 let now = Instant::now();
@@ -483,11 +453,6 @@ impl App {
                     self.notification_expansion.reset();
                     self.notification_expansion.transition_to(1.0, now);
                 }
-                tasks.push(set_surface_regions(
-                    self.surface_id,
-                    self.surface_height.max(self.target_surface_height()),
-                    self.frosted,
-                ));
             }
             Message::DismissNotification { key } => {
                 if self.clearing_notifications {
@@ -598,6 +563,20 @@ impl App {
                         self.prepare_media_state(self.sampler.media_state(), Instant::now());
                 }
             }
+            Message::SeekMediaRelative(offset_ms) => {
+                self.media_seek_preview = None;
+                self.sampler.media_seek_relative(offset_ms);
+                self.snapshot.media =
+                    self.prepare_media_state(self.sampler.media_state(), Instant::now());
+            }
+            Message::OverlayMeasured(height) => {
+                if height != self.surface_height {
+                    self.surface_height = height;
+                    // The sensor emits only when rendered bounds change, not
+                    // on every frame or monitoring tick.
+                    tasks.push(set_surface_regions(self.surface_id, height, self.frosted));
+                }
+            }
             Message::OverlayPointerMoved(position) => {
                 self.overlay_cursor = position;
                 if self.config.widget_movable
@@ -669,7 +648,6 @@ impl App {
             self.clearing_notifications,
             self.clear_button_animation.progress,
             self.notification_scroll.translation(),
-            self.surface_height,
             self.dismissing_media.as_ref(),
             self.media_seek_preview,
             self.media_timeline_hovered,
@@ -752,17 +730,5 @@ impl App {
 
     fn ui_tick_interval(&self) -> Duration {
         Duration::from_millis(UPDATE_INTERVAL_MS)
-    }
-
-    fn target_surface_height(&self) -> u32 {
-        desired_surface_height_with_animation(
-            &self.config,
-            &self.snapshot,
-            self.expanded_notification.as_ref(),
-            self.expanded_notification_group.as_deref(),
-            self.notification_expansion.target,
-            self.notification_group_expansion.target,
-            self.dismissing_media.is_some(),
-        )
     }
 }

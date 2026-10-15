@@ -79,8 +79,24 @@ impl Monitor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn query(&mut self) -> Vec<BatteryState> {
+        self.query_with_updates(|_| {})
+    }
+
+    /// Publish available rows without waiting for every HID request to finish.
+    /// Updates are patches; only the returned snapshot can remove devices.
+    pub(super) fn query_with_updates(
+        &mut self,
+        mut publish: impl FnMut(&[BatteryState]),
+    ) -> Vec<BatteryState> {
         let mut states = query_power_supplies_at(Path::new(POWER_SUPPLY_ROOT));
+        if !states.is_empty() {
+            publish(&states);
+        }
+        // A known device may have sent its charging event before going back to
+        // sleep. Publish that event before discovery or another device's I/O.
+        self.publish_battery_events(&mut states, &mut publish);
 
         let discovery_due = self
             .last_discovery
@@ -111,9 +127,9 @@ impl Monitor {
                 .retain(|name, _| active_names.iter().any(|active| active == name));
             self.pending_event_readings
                 .retain(|name, _| active_names.iter().any(|active| active == name));
+            self.publish_battery_events(&mut states, &mut publish);
         }
 
-        self.read_battery_events(&mut states);
         for endpoint in &mut self.endpoints {
             let Ok(mut handle) = open_hidraw(&endpoint.endpoint.path) else {
                 continue;
@@ -130,13 +146,42 @@ impl Monitor {
                     self.pending_event_readings.remove(&identity);
                 }
                 if let Some(state) = state_from_reading(device, reading, &mut self.last_readings) {
+                    let name = state.name.clone();
                     upsert_state(&mut states, state, reading_is_live);
+                    // Publish the winning row: a remembered HID reading must
+                    // not replace a newer sysfs reading through the callback.
+                    if let Some(state) = states
+                        .iter()
+                        .find(|state| same_device_name(&state.name, &name))
+                    {
+                        publish(std::slice::from_ref(state));
+                    }
                 }
             }
         }
-        self.read_battery_events(&mut states);
+        self.publish_battery_events(&mut states, &mut publish);
 
         states
+    }
+
+    /// Schedule discovery for the next normal poll after a kernel hotplug event.
+    pub(super) fn invalidate_discovery(&mut self) {
+        self.last_discovery = None;
+    }
+
+    fn publish_battery_events(
+        &mut self,
+        states: &mut Vec<BatteryState>,
+        publish: &mut impl FnMut(&[BatteryState]),
+    ) {
+        let mut patches = Vec::new();
+        self.read_battery_events(&mut patches);
+        for state in &patches {
+            upsert_state(states, state.clone(), true);
+        }
+        if !patches.is_empty() {
+            publish(&patches);
+        }
     }
 
     fn reconcile_event_endpoints(&mut self, present_endpoints: &[HidrawEndpoint]) {
@@ -316,16 +361,41 @@ fn query_confirmed_device_battery(
     device: &mut HidppDevice,
     previous: Option<&BatteryReading>,
 ) -> Result<BatteryReading, String> {
-    let first = query_device_battery(handle, device)?;
-    let Some(previous) = previous else {
-        return Ok(first);
-    };
-    if !needs_confirmation(previous, &first) {
+    let mut first = query_device_battery(handle, device)?;
+    let suspicious = first.level == Some(0)
+        || previous.is_some_and(|previous| needs_confirmation(previous, &first));
+    if !suspicious {
         return Ok(first);
     }
 
+    // Repeating a reply does not prove it came from a battery feature. A bad
+    // cached index can point at an unrelated feature that always returns zero.
+    let previous_protocol = device.battery_protocol;
+    if matches!(previous_protocol, BatteryProtocol::Hidpp20 { .. }) {
+        refresh_battery_protocol(&mut device.battery_protocol, &mut |request, params| {
+            hidpp20_request(handle, device.slot, request, params)
+        })?;
+        if device.battery_protocol != previous_protocol {
+            log::warn!(
+                "Corrected battery feature for {}: {:?} -> {:?}",
+                device.name,
+                previous_protocol,
+                device.battery_protocol
+            );
+            first = query_device_battery(handle, device)?;
+            if first.level != Some(0)
+                && previous.is_none_or(|previous| !needs_confirmation(previous, &first))
+            {
+                return Ok(first);
+            }
+        }
+    }
+
     let second = query_device_battery(handle, device)?;
-    confirm_repeated_reading(previous, first, second)
+    match previous {
+        Some(previous) => confirm_repeated_reading(previous, first, second),
+        None => Ok(second),
+    }
 }
 
 fn confirm_repeated_reading(
@@ -615,7 +685,7 @@ fn prefer_discovered_device(current: Option<HidppDevice>, candidate: HidppDevice
     let Some(mut current) = current else {
         return candidate;
     };
-    if current.battery_protocol == BatteryProtocol::Unknown {
+    if candidate.battery_protocol != BatteryProtocol::Unknown {
         current.battery_protocol = candidate.battery_protocol;
     }
     if device_name_quality(&candidate.name) > device_name_quality(&current.name) {
@@ -742,11 +812,68 @@ fn query_device_kind(handle: &mut File, slot: u8, feature: u8) -> Result<String,
 }
 
 fn discover_hidpp20_battery_protocol(handle: &mut File, slot: u8) -> Option<BatteryProtocol> {
-    BatteryFeature::ALL.into_iter().find_map(|feature| {
-        feature_index(handle, slot, feature.id())
-            .ok()
-            .map(|index| BatteryProtocol::Hidpp20 { feature, index })
+    discover_verified_battery_protocol(&mut |request, params| {
+        hidpp20_request(handle, slot, request, params)
     })
+}
+
+type FeatureRequest<'a> = dyn FnMut(u16, &[u8]) -> Result<Vec<u8>, String> + 'a;
+
+fn discover_verified_battery_protocol(request: &mut FeatureRequest<'_>) -> Option<BatteryProtocol> {
+    BatteryFeature::ALL.into_iter().find_map(|feature| {
+        let response = request(HIDPP_SOFTWARE_ID, &feature.id().to_be_bytes()).ok()?;
+        let [index, _, _, ..] = response.as_slice() else {
+            return None;
+        };
+        verify_battery_feature(feature, *index, request)
+            .ok()?
+            .then_some(BatteryProtocol::Hidpp20 {
+                feature,
+                index: *index,
+            })
+    })
+}
+
+fn verify_battery_feature(
+    feature: BatteryFeature,
+    index: u8,
+    request: &mut FeatureRequest<'_>,
+) -> Result<bool, String> {
+    if index == 0 {
+        return Ok(false);
+    }
+    // ROOT.GetFeature replies do not echo the requested feature ID. Confirm
+    // the reverse mapping with FEATURE_SET.GetFeatureID before trusting it.
+    let response = request(HIDPP_SOFTWARE_ID, &0x0001_u16.to_be_bytes())?;
+    let [feature_set, _, _, ..] = response.as_slice() else {
+        return Err("HID++ feature-set response was too short".to_string());
+    };
+    if *feature_set == 0 {
+        return Err("HID++ feature set is unavailable".to_string());
+    }
+    let response = request((u16::from(*feature_set) << 8) | 0x10, &[index])?;
+    let [high, low, ..] = response.as_slice() else {
+        return Err("HID++ feature-identity response was too short".to_string());
+    };
+    Ok(u16::from_be_bytes([*high, *low]) == feature.id())
+}
+
+fn refresh_battery_protocol(
+    protocol: &mut BatteryProtocol,
+    request: &mut FeatureRequest<'_>,
+) -> Result<(), String> {
+    if let BatteryProtocol::Hidpp20 { feature, index } = *protocol
+        && verify_battery_feature(feature, index, request)?
+    {
+        return Ok(());
+    }
+    // A timeout leaves the mapping intact; a proven mismatch invalidates it so
+    // neither the next poll nor unsolicited events can reuse the wrong feature.
+    *protocol = BatteryProtocol::Unknown;
+    let verified = discover_verified_battery_protocol(request)
+        .ok_or_else(|| "could not verify a Logitech battery feature".to_string())?;
+    *protocol = verified;
+    Ok(())
 }
 
 fn query_device_battery(
@@ -876,6 +1003,217 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    fn g309_feature_reply(request: u16, params: &[u8]) -> Result<Vec<u8>, String> {
+        match (request, params) {
+            (0, [0, 1]) => Ok(vec![1, 0, 2]),
+            (0, [0x10, 4]) => Ok(vec![8, 0, 5]),
+            (0, _) => Ok(vec![0, 0, 0]),
+            (0x0110, [8]) => Ok(vec![0x10, 4, 0, 5]),
+            (0x0110, [11]) => Ok(vec![0x80, 0x61, 0, 0]),
+            _ => Err("unexpected request".to_string()),
+        }
+    }
+
+    #[test]
+    fn rejects_an_unrelated_feature_misidentified_as_a_battery() {
+        let mut request = |request, params: &[u8]| {
+            if request == 0 && params == [0x10, 1] {
+                // An unrelated ROOT reply was mistaken for Voltage/index 11.
+                Ok(vec![11, 0, 0])
+            } else {
+                g309_feature_reply(request, params)
+            }
+        };
+        assert_eq!(
+            super::discover_verified_battery_protocol(&mut request),
+            Some(BatteryProtocol::Hidpp20 {
+                feature: super::BatteryFeature::Unified,
+                index: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn recovers_the_g309_battery_mapping_from_an_unrelated_zero_reply() {
+        let mut protocol = BatteryProtocol::Hidpp20 {
+            feature: super::BatteryFeature::Voltage,
+            index: 11,
+        };
+        super::refresh_battery_protocol(&mut protocol, &mut g309_feature_reply).unwrap();
+        assert_eq!(
+            protocol,
+            BatteryProtocol::Hidpp20 {
+                feature: super::BatteryFeature::Unified,
+                index: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn polling_recovers_a_false_zero_at_startup_and_after_a_good_reading() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixDatagram;
+        use std::time::Duration;
+
+        for previous in [
+            None,
+            Some(BatteryReading {
+                level: Some(100),
+                status: Some("discharging".to_string()),
+            }),
+        ] {
+            let (client, receiver) = UnixDatagram::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let server = std::thread::spawn(move || {
+                let mut invalid_queries = 0;
+                loop {
+                    let mut packet = [0; 20];
+                    let size = receiver.recv(&mut packet).unwrap();
+                    assert_eq!(size, 20);
+                    let request = u16::from_be_bytes([packet[2], packet[3]]) & 0xfff0;
+                    let payload = match request {
+                        0x0b00 => {
+                            invalid_queries += 1;
+                            vec![0; 16]
+                        }
+                        0x0810 => vec![100, 8, 0, 0],
+                        0 => g309_feature_reply(request, &packet[4..6]).unwrap(),
+                        0x0110 => g309_feature_reply(request, &packet[4..5]).unwrap(),
+                        _ => panic!("unexpected HID++ request: {request:#06x}"),
+                    };
+                    packet[4..].fill(0);
+                    packet[4..4 + payload.len()].copy_from_slice(&payload);
+                    receiver.send(&packet).unwrap();
+                    if request == 0x0810 {
+                        assert_eq!(invalid_queries, 1);
+                        break;
+                    }
+                }
+            });
+            // The test owns this descriptor exactly once; the transport uses
+            // the same read/write/poll calls as a real nonblocking hidraw fd.
+            let mut handle = unsafe { std::fs::File::from_raw_fd(client.into_raw_fd()) };
+            let mut device = resolved_keyboard();
+            device.name = "G309 LIGHTSPEED".to_string();
+            device.battery_protocol = BatteryProtocol::Hidpp20 {
+                feature: super::BatteryFeature::Voltage,
+                index: 11,
+            };
+            let reading =
+                super::query_confirmed_device_battery(&mut handle, &mut device, previous.as_ref())
+                    .unwrap();
+            server.join().unwrap();
+            assert_eq!(reading.level, Some(100));
+            assert_eq!(
+                device.battery_protocol,
+                BatteryProtocol::Hidpp20 {
+                    feature: super::BatteryFeature::Unified,
+                    index: 8,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_sleeping_device_keeps_its_mapping_when_verification_times_out() {
+        let original = BatteryProtocol::Hidpp20 {
+            feature: super::BatteryFeature::Unified,
+            index: 8,
+        };
+        let mut protocol = original;
+        assert!(
+            super::refresh_battery_protocol(&mut protocol, &mut |_, _| {
+                Err("timed out".to_string())
+            })
+            .is_err()
+        );
+        assert_eq!(protocol, original);
+    }
+
+    #[test]
+    fn invalidates_a_wrong_mapping_even_when_rediscovery_fails() {
+        let mut protocol = BatteryProtocol::Hidpp20 {
+            feature: super::BatteryFeature::Voltage,
+            index: 11,
+        };
+        assert!(
+            super::refresh_battery_protocol(&mut protocol, &mut |request, params| {
+                if request == 0 && params != [0, 1] {
+                    Err("timed out".to_string())
+                } else {
+                    g309_feature_reply(request, params)
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(protocol, BatteryProtocol::Unknown);
+    }
+
+    #[test]
+    fn accepts_a_verified_voltage_feature_reporting_a_genuinely_empty_battery() {
+        let original = BatteryProtocol::Hidpp20 {
+            feature: super::BatteryFeature::Voltage,
+            index: 9,
+        };
+        let mut protocol = original;
+        super::refresh_battery_protocol(&mut protocol, &mut |request, params| match (
+            request, params,
+        ) {
+            (0, [0, 1]) => Ok(vec![1, 0, 1]),
+            (0x0110, [9]) => Ok(vec![0x10, 1, 0, 0]),
+            _ => Err("unexpected request".to_string()),
+        })
+        .unwrap();
+        assert_eq!(protocol, original);
+        assert_eq!(
+            super::BatteryFeature::Voltage
+                .parse(&[0x0d, 0xac, 0])
+                .unwrap()
+                .level,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unavailable_feature_identities() {
+        for response in [vec![], vec![1], vec![0, 0, 0]] {
+            assert!(
+                super::verify_battery_feature(super::BatteryFeature::Unified, 8, &mut |_, _| Ok(
+                    response.clone()
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            super::verify_battery_feature(super::BatteryFeature::Unified, 8, &mut |request, _| Ok(
+                if request == 0 {
+                    vec![1, 0, 0]
+                } else {
+                    vec![0x10]
+                }
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_fresh_verified_protocol_replaces_a_stale_cached_protocol() {
+        let fresh = resolved_keyboard();
+        let mut stale = fresh.clone();
+        stale.battery_protocol = BatteryProtocol::Hidpp10;
+        let merged = super::prefer_discovered_device(Some(stale), fresh.clone());
+        assert_eq!(merged.battery_protocol, fresh.battery_protocol);
+        let mut sleeping = fresh.clone();
+        sleeping.battery_protocol = BatteryProtocol::Unknown;
+        assert_eq!(
+            super::prefer_discovered_device(Some(fresh.clone()), sleeping).battery_protocol,
+            fresh.battery_protocol
+        );
+    }
 
     #[test]
     fn infers_current_logitech_device_kinds() {
@@ -1150,6 +1488,65 @@ mod tests {
             assert_eq!(sleeping.level, Some(20));
             assert_eq!(sleeping.status.as_deref(), Some(expected));
         }
+    }
+
+    #[test]
+    fn publishes_only_event_rows_without_queries_or_removing_other_devices() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixDatagram;
+
+        let keyboard = resolved_keyboard();
+        let endpoint = bolt_endpoint();
+        let (listener, sender) = UnixDatagram::pair().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let mut monitor = super::Monitor::new();
+        monitor.endpoints.push(MonitoredEndpoint {
+            endpoint: endpoint.clone(),
+            devices: vec![keyboard.clone()],
+        });
+        monitor.event_endpoints.push(super::EventEndpoint {
+            endpoint,
+            // Transfer ownership once, using the same nonblocking read calls
+            // that the passive hidraw listener uses in production.
+            handle: unsafe { std::fs::File::from_raw_fd(listener.into_raw_fd()) },
+        });
+        let keyboard_state = state_from_reading(
+            &keyboard,
+            Ok(BatteryReading {
+                level: Some(20),
+                status: Some("discharging".to_string()),
+            }),
+            &mut monitor.last_readings,
+        )
+        .unwrap();
+        let mouse_state = BatteryState {
+            name: "G309 LIGHTSPEED".to_string(),
+            level: Some(100),
+            status: Some("discharging".to_string()),
+            kind: Some("mouse".to_string()),
+            connected: true,
+        };
+        let mut states = vec![mouse_state.clone(), keyboard_state];
+        sender.send(&keyboard_battery_event(20, 1)).unwrap();
+
+        let mut updates = Vec::new();
+        monitor.publish_battery_events(&mut states, &mut |patch| updates.push(patch.to_vec()));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].len(), 1);
+        assert_eq!(updates[0][0].name, keyboard.name);
+        assert_eq!(updates[0][0].status.as_deref(), Some("charging"));
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0], mouse_state);
+        assert_eq!(states[1], updates[0][0]);
+
+        // An idle drain has nothing to publish and neither pass sends a request.
+        monitor.publish_battery_events(&mut states, &mut |patch| updates.push(patch.to_vec()));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            sender.recv(&mut [0; 64]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

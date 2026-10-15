@@ -2,10 +2,11 @@
 
 use crate::monitors::battery::BatteryDevice;
 use crate::overlay::Message;
+use crate::overlay::components::battery_icon;
 use crate::overlay::components::section::{METRIC_ICON_SIZE, section};
 use crate::overlay::stats::SystemSnapshot;
-use cosmic::iced::{Alignment, Length};
-use cosmic::{Element, theme, widget};
+use cosmic::iced::{Alignment, Color, Length};
+use cosmic::{Element, Theme, theme, widget};
 
 pub(in crate::overlay) fn devices_view<'a>(
     stats: &'a SystemSnapshot,
@@ -59,29 +60,39 @@ fn device_icon(kind: Option<&str>) -> Element<'static, Message> {
 fn battery_status(device: &BatteryDevice, spacing: u16) -> Element<'static, Message> {
     let (icon, label, band, opacity) = battery_visuals(device);
 
-    let battery_icon = widget::icon::from_name(icon)
-        .icon()
-        .size(METRIC_ICON_SIZE)
-        .opacity(opacity)
-        .class(theme::Svg::custom(move |theme| {
-            let cosmic = theme.cosmic();
-            let color = match band {
-                BatteryBand::Success => cosmic.success_color(),
-                BatteryBand::Warning => cosmic.warning_color(),
-                BatteryBand::Destructive => cosmic.destructive_color(),
-                BatteryBand::Cached => cosmic.accent_color(),
-                BatteryBand::Unavailable => cosmic.on_bg_color(),
-            };
-
-            cosmic::iced::widget::svg::Style {
-                color: Some(color.into()),
-            }
-        }));
+    let battery_icon = if let Some(level) = device
+        .level
+        .filter(|_| device.is_connected || device.is_loading)
+    {
+        let mode = if live_charging_level(device).is_some() {
+            battery_icon::Mode::Charging
+        } else if is_charging(device.status.as_deref()) {
+            battery_icon::Mode::CachedCharging
+        } else {
+            battery_icon::Mode::Level
+        };
+        battery_icon::battery(level, mode, METRIC_ICON_SIZE, move |theme| {
+            let mut color = band_color(theme, band);
+            color.a *= opacity;
+            color
+        })
+    } else {
+        widget::icon::from_name(icon)
+            .icon()
+            .size(METRIC_ICON_SIZE)
+            .opacity(opacity)
+            .class(theme::Svg::custom(move |theme| {
+                cosmic::iced::widget::svg::Style {
+                    color: Some(band_color(theme, band)),
+                }
+            }))
+            .into()
+    };
 
     widget::row::with_capacity(2)
         .align_y(Alignment::Center)
         .spacing(spacing / 2)
-        .push(battery_icon)
+        .push(widget::container(battery_icon).center_x(battery_icon::width(METRIC_ICON_SIZE)))
         .push(widget::text::monotext(label))
         .into()
 }
@@ -143,8 +154,35 @@ fn battery_band(level: u8) -> BatteryBand {
     }
 }
 
+fn band_color(theme: &Theme, band: BatteryBand) -> Color {
+    let cosmic = theme.cosmic();
+    match band {
+        BatteryBand::Success => cosmic.success_color(),
+        BatteryBand::Warning => cosmic.warning_color(),
+        BatteryBand::Destructive => cosmic.destructive_color(),
+        BatteryBand::Cached => cosmic.accent_color(),
+        BatteryBand::Unavailable => cosmic.on_bg_color(),
+    }
+    .into()
+}
+
+/// Live charging readings animate. Cached ones keep the static glyph until the
+/// device confirms it is still plugged in.
+fn live_charging_level(device: &BatteryDevice) -> Option<u8> {
+    device.level.filter(|_| {
+        device.is_connected && !device.is_loading && is_charging(device.status.as_deref())
+    })
+}
+
 fn battery_icon_name(level: u8, charging: bool) -> String {
-    let bucket = match level.min(100) {
+    let bucket = level_bucket(level);
+    let charging = if charging { "-charging" } else { "" };
+    format!("cosmic-applet-battery-level-{bucket}{charging}-symbolic")
+}
+
+/// The step of the COSMIC battery icon that represents `level`.
+fn level_bucket(level: u8) -> u8 {
+    match level.min(100) {
         0..=2 => 0,
         3..=7 => 5,
         8..=15 => 10,
@@ -155,9 +193,7 @@ fn battery_icon_name(level: u8, charging: bool) -> String {
         73..=85 => 80,
         86..=95 => 90,
         _ => 100,
-    };
-    let charging = if charging { "-charging" } else { "" };
-    format!("cosmic-applet-battery-level-{bucket}{charging}-symbolic")
+    }
 }
 
 fn is_charging(status: Option<&str>) -> bool {
@@ -206,5 +242,56 @@ mod tests {
         assert_eq!(label, "68%");
         assert_eq!(band, BatteryBand::Cached);
         assert_eq!(opacity, 0.8);
+    }
+
+    #[test]
+    fn only_live_charging_readings_animate() {
+        let charging = BatteryDevice {
+            name: "Test Mouse".to_string(),
+            level: Some(68),
+            status: Some("charging".to_string()),
+            kind: Some("mouse".to_string()),
+            codename: None,
+            is_loading: false,
+            is_connected: true,
+        };
+
+        assert_eq!(live_charging_level(&charging), Some(68));
+        for level in [96, 99, 100] {
+            let near_full = BatteryDevice {
+                level: Some(level),
+                ..charging.clone()
+            };
+            assert_eq!(level_bucket(level), 100);
+            assert_eq!(live_charging_level(&near_full), Some(level));
+            assert_eq!(battery_visuals(&near_full).1, format!("{level}%"));
+            assert_eq!(
+                live_charging_level(&BatteryDevice {
+                    status: Some("charged".to_string()),
+                    ..near_full
+                }),
+                None
+            );
+        }
+        for static_reading in [
+            BatteryDevice {
+                is_loading: true,
+                ..charging.clone()
+            },
+            BatteryDevice {
+                is_connected: false,
+                ..charging.clone()
+            },
+            BatteryDevice {
+                status: Some("charged".to_string()),
+                ..charging.clone()
+            },
+            BatteryDevice {
+                level: None,
+                ..charging
+            },
+        ] {
+            assert_eq!(live_charging_level(&static_reading), None);
+        }
     }
 }

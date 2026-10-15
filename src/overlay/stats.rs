@@ -43,6 +43,7 @@ pub struct StatsSampler {
     weather_enabled: Arc<AtomicBool>,
     solaar_enabled: Arc<AtomicBool>,
     weather_location: Arc<Mutex<String>>,
+    battery_monitor: Arc<Mutex<BatteryMonitor>>,
     notification_monitor: NotificationMonitor,
     media_monitor: MediaMonitor,
     codex_usage_monitor: CodexUsageMonitor,
@@ -65,6 +66,7 @@ impl StatsSampler {
             weather_enabled: Arc::new(AtomicBool::new(weather_enabled)),
             solaar_enabled: Arc::new(AtomicBool::new(solaar_enabled)),
             weather_location: Arc::new(Mutex::new(weather_location)),
+            battery_monitor: Arc::new(Mutex::new(BatteryMonitor::new_with_solaar(solaar_enabled))),
             notification_monitor: notification_monitor.clone(),
             media_monitor: media_monitor.clone(),
             codex_usage_monitor: CodexUsageMonitor::new(ai_usage_enabled),
@@ -76,14 +78,13 @@ impl StatsSampler {
         let solaar_enabled = Arc::clone(&sampler.solaar_enabled);
         let weather_location = Arc::clone(&sampler.weather_location);
         let media_monitor = sampler.media_monitor.clone();
+        let battery_monitor = Arc::clone(&sampler.battery_monitor);
         std::thread::spawn(move || {
             let mut utilization = UtilizationMonitor::new();
             let mut network = NetworkMonitor::new();
             let mut disk_io = DiskIoMonitor::new();
             let mut temperature = TemperatureMonitor::new();
             let mut storage = StorageMonitor::new();
-            let mut battery =
-                BatteryMonitor::new_with_solaar(solaar_enabled.load(Ordering::Relaxed));
             let mut active_weather_location = match weather_location.lock() {
                 Ok(location) => location.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
@@ -96,8 +97,11 @@ impl StatsSampler {
                 disk_io.update();
                 temperature.update();
                 storage.update();
-                battery.set_solaar_enabled(solaar_enabled.load(Ordering::Relaxed));
-                battery.update();
+                {
+                    let mut battery = battery_monitor.lock().unwrap();
+                    battery.set_solaar_enabled(solaar_enabled.load(Ordering::Relaxed));
+                    battery.update();
+                }
 
                 let configured_location = match weather_location.lock() {
                     Ok(location) => location.clone(),
@@ -127,7 +131,7 @@ impl StatsSampler {
                     cpu_temp: temperature.cpu_temp,
                     gpu_temp: temperature.gpu_temp,
                     disks: storage.disk_info.clone(),
-                    devices: battery.devices(),
+                    devices: Vec::new(), // Read the live snapshot in snapshot().
                     weather: weather_data,
                     notifications: notification_monitor.get_notifications(),
                     media: media_monitor.get_player_state(),
@@ -152,6 +156,9 @@ impl StatsSampler {
             Ok(snapshot) => snapshot.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
+        // Battery I/O already runs independently. Read its current snapshot here
+        // to avoid an extra full system-sampling interval on charging changes.
+        snapshot.devices = self.battery_monitor.lock().unwrap().devices();
         snapshot.notifications = self.notification_monitor.get_notifications();
         snapshot.media = self.media_monitor.get_player_state();
         snapshot.codex_usage = self.codex_usage_monitor.snapshot();
@@ -221,5 +228,9 @@ impl StatsSampler {
 
     pub fn seek_media(&self, progress: f64) {
         self.media_monitor.seek_to_progress(progress);
+    }
+
+    pub fn media_seek_relative(&self, offset_ms: i64) {
+        self.media_monitor.seek_relative(offset_ms);
     }
 }

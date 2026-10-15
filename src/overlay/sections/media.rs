@@ -16,6 +16,8 @@ use std::rc::Rc;
 
 const MEDIA_ACTIVE_SECTION_HEIGHT: f32 = 232.0;
 const MEDIA_CONTENT_HEIGHT: f32 = 204.0;
+pub(in crate::overlay) const MEDIA_EMPTY_CONTENT_HEIGHT: f32 = 76.0;
+const MEDIA_EMPTY_ARTWORK_SIZE: f32 = 56.0;
 const MEDIA_SOURCE_SELECTOR_HEIGHT: f32 = 34.0;
 const MEDIA_SOURCE_BUTTON_SIZE: f32 = 34.0;
 const MEDIA_SOURCE_DOT_SIZE: f32 = 12.0;
@@ -24,8 +26,10 @@ const MEDIA_VIDEO_ARTWORK_WIDTH: f32 = 128.0;
 const MEDIA_VIDEO_ARTWORK_HEIGHT: f32 = 72.0;
 const MEDIA_CONTENT_SPACING: u16 = 12;
 const MEDIA_CONTROL_ICON_SIZE: u16 = 20;
+const MEDIA_SEEK_ICON_SIZE: u16 = 24;
 const MEDIA_CONTROL_PADDING: u16 = 6;
 const MEDIA_CONTROL_SPACING: u16 = 8;
+const MEDIA_SEEK_INTERVAL_MS: i64 = 10_000;
 const MEDIA_TIMELINE_FOOTER_GAP: f32 = 4.0;
 
 pub(in crate::overlay) fn media_view<'a>(
@@ -58,7 +62,85 @@ pub(in crate::overlay) fn media_view<'a>(
     }
 
     section("emblem-music-symbolic", "Now Playing", section_spacing)
-        .push(widget::text::caption("No media playing"))
+        .push(empty_media_card())
+        .into()
+}
+
+fn empty_media_card() -> Element<'static, Message> {
+    let note = widget::icon::from_name("emblem-music-symbolic")
+        .size(32)
+        .icon()
+        .class(theme::Svg::custom(|theme| widget::svg::Style {
+            color: Some(theme.current_container().on.into()),
+        }))
+        .opacity(0.38);
+    let artwork = widget::container(note)
+        .center_x(Length::Fixed(MEDIA_EMPTY_ARTWORK_SIZE))
+        .center_y(Length::Fixed(MEDIA_EMPTY_ARTWORK_SIZE))
+        .class(theme::Container::custom(|theme| {
+            let foreground: Color = theme.current_container().on.into();
+            cosmic::iced::widget::container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.09,
+                    ..foreground
+                })),
+                border: Border {
+                    radius: 10.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }));
+    let hint = widget::container(widget::text::caption("Play something to see it here.")).class(
+        theme::Container::custom(|theme| {
+            let foreground: Color = theme.current_container().on.into();
+            cosmic::iced::widget::container::Style {
+                text_color: Some(Color {
+                    a: 0.55,
+                    ..foreground
+                }),
+                ..Default::default()
+            }
+        }),
+    );
+    let caption = widget::column::with_capacity(2)
+        .width(Length::Fill)
+        .spacing(4)
+        .push(widget::text::body("No media playing"))
+        .push(hint);
+    let content = widget::row::with_capacity(2)
+        .width(Length::Fill)
+        .align_y(Alignment::Center)
+        .spacing(12)
+        .push(artwork)
+        .push(caption);
+
+    widget::container(content)
+        .width(Length::Fill)
+        .height(Length::Fixed(MEDIA_EMPTY_CONTENT_HEIGHT))
+        .padding(10)
+        .class(theme::Container::custom(|theme| {
+            let foreground: Color = theme.current_container().on.into();
+            cosmic::iced::widget::container::Style {
+                text_color: Some(Color {
+                    a: 0.85,
+                    ..foreground
+                }),
+                background: Some(Background::Color(Color {
+                    a: if theme.transparent { 0.035 } else { 0.055 },
+                    ..foreground
+                })),
+                border: Border {
+                    color: Color {
+                        a: 0.08,
+                        ..foreground
+                    },
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..Default::default()
+            }
+        }))
         .into()
 }
 
@@ -103,25 +185,51 @@ fn media_content<'a>(
     .tooltip("Next track")
     .padding(MEDIA_CONTROL_PADDING)
     .on_press_maybe(info.can_go_next.then_some(Message::NextMedia));
-    let controls = widget::row::with_capacity(3)
+    let back = widget::button::icon(
+        widget::icon::from_svg_bytes(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/material-design/replay_10.svg"
+        )))
+        .symbolic(true),
+    )
+    .icon_size(MEDIA_SEEK_ICON_SIZE)
+    .tooltip("Back 10 seconds")
+    .padding(MEDIA_CONTROL_PADDING)
+    .on_press_maybe(
+        info.can_seek
+            .then_some(Message::SeekMediaRelative(-MEDIA_SEEK_INTERVAL_MS)),
+    );
+    let forward = widget::button::icon(
+        widget::icon::from_svg_bytes(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/material-design/forward_10.svg"
+        )))
+        .symbolic(true),
+    )
+    .icon_size(MEDIA_SEEK_ICON_SIZE)
+    .tooltip("Forward 10 seconds")
+    .padding(MEDIA_CONTROL_PADDING)
+    .on_press_maybe(
+        info.can_seek
+            .then_some(Message::SeekMediaRelative(MEDIA_SEEK_INTERVAL_MS)),
+    );
+    let controls = widget::row::with_capacity(5)
         .align_y(Alignment::Center)
         .spacing(MEDIA_CONTROL_SPACING)
         .push(previous)
+        .push(back)
         .push(play_pause)
+        .push(forward)
         .push(next);
-    let identity = widget::row::with_capacity(3)
-        .align_y(Alignment::Center)
-        .spacing(detail_spacing)
-        .push(media_player_badge(&info.player_name))
-        .push(widget::space::horizontal())
-        .push(controls);
     let subtitle = media_subtitle(info);
-    let metadata = widget::column::with_capacity(3)
+    let mut metadata = widget::column::with_capacity(3)
         .width(Length::Fill)
         .spacing(detail_spacing)
-        .push(marquee::media_title(&info.title))
-        .push(marquee::media_subtitle(&subtitle))
-        .push(identity);
+        .push(marquee::media_title(&info.title));
+    if !subtitle.is_empty() {
+        metadata = metadata.push(marquee::media_subtitle(&subtitle));
+    }
+    let metadata = metadata.push(media_player_badge(&info.player_name));
     let details = widget::row::with_capacity(2)
         .align_y(Alignment::Center)
         .spacing(MEDIA_CONTENT_SPACING)
@@ -174,11 +282,13 @@ fn media_content<'a>(
     }
     footer = footer.push(duration);
 
-    widget::column::with_capacity(5)
+    widget::column::with_capacity(7)
         .height(Length::Fixed(MEDIA_CONTENT_HEIGHT))
         .spacing(0)
         .push(details)
         .push(widget::space::vertical())
+        .push(widget::container(controls).center_x(Length::Fill))
+        .push(widget::space().height(Length::Fixed(MEDIA_TIMELINE_FOOTER_GAP)))
         .push(progress_control)
         .push(widget::space().height(Length::Fixed(MEDIA_TIMELINE_FOOTER_GAP)))
         .push(footer)
@@ -282,7 +392,7 @@ fn media_player_badge(player_name: &str) -> Element<'static, Message> {
 
 fn media_subtitle(info: &MediaInfo) -> String {
     let subtitle = match (info.artist.trim(), info.album.trim()) {
-        ("", "") => info.player_name.clone(),
+        ("", "") => String::new(),
         (artist, "") => artist.to_string(),
         ("", album) => album.to_string(),
         (artist, album) => format!("{artist} - {album}"),
@@ -298,6 +408,53 @@ fn format_media_time(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_controls_fit_the_compact_media_card() {
+        use cosmic::iced::advanced::{Layout, layout, renderer, widget::Tree};
+        use cosmic::iced::{Font, Pixels, Rectangle, Size};
+
+        fn assert_contained(layout: Layout<'_>, card: Rectangle) {
+            let bounds = layout.bounds();
+            assert!(
+                bounds.x >= card.x - 0.1
+                    && bounds.y >= card.y - 0.1
+                    && bounds.x + bounds.width <= card.x + card.width + 0.1
+                    && bounds.y + bounds.height <= card.y + card.height + 0.1,
+                "media child {bounds:?} overflows compact card {card:?}"
+            );
+            for child in layout.children() {
+                assert_contained(child, card);
+            }
+        }
+
+        let renderer = <cosmic::Renderer as renderer::Headless>::new(
+            Font::default(),
+            Pixels(14.0),
+            Some("tiny-skia"),
+        )
+        .await
+        .expect("the software renderer must be available for media layout validation");
+        let info = MediaInfo {
+            player_name: "COSMIC Player".to_string(),
+            title: "A very long episode title that needs to scroll within the card".to_string(),
+            artist: "An artist with a long name".to_string(),
+            album: "An album with a long name".to_string(),
+            duration: 1_440_000,
+            can_seek: true,
+            ..Default::default()
+        };
+        let players = crate::monitors::media::MultiPlayerState::default();
+        let card = Rectangle::with_size(Size::new(322.0, MEDIA_CONTENT_HEIGHT));
+        let mut content = media_content(&info, &players, None, 12, 4, false);
+        let mut tree = Tree::new(content.as_widget());
+        let node = content.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, card.size()),
+        );
+        assert_contained(Layout::new(&node), card);
+    }
 
     #[test]
     fn media_metadata_is_prepared_for_iced() {

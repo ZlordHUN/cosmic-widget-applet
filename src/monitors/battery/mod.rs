@@ -58,6 +58,7 @@ use std::time::{Duration, Instant};
 use super::cache::{CachedBatteryDevice, WidgetCache};
 
 mod controllers;
+mod events;
 mod headsets;
 mod logitech;
 use controllers::razer_wolverine_v3_pro_8k_pc;
@@ -107,6 +108,17 @@ pub struct BatteryDevice {
     /// True if device is currently connected and responding
     pub is_connected: bool,
 }
+
+// Timestamp observations before I/O so a slow battery reply cannot undo a
+// newer USB charging transition.
+#[derive(Debug, Clone)]
+struct MaxwellConnectionSnapshot {
+    observed_at: Instant,
+    state: Option<headsets::MaxwellConnection>,
+    last_device: Option<BatteryDevice>,
+}
+
+type SharedMaxwellConnection = Arc<Mutex<Option<MaxwellConnectionSnapshot>>>;
 
 #[derive(Debug, Default)]
 struct ExternalDeviceState {
@@ -171,6 +183,7 @@ pub struct BatteryMonitor {
     logitech_devices: Arc<Mutex<Vec<BatteryDevice>>>,
     /// Names owned by dedicated headset readers, published with `devices`.
     native_headset_coverage: Arc<Mutex<Vec<String>>>,
+    maxwell_connection: SharedMaxwellConnection,
     cached_devices: Vec<BatteryDevice>,
     initial_probe_started: Instant,
     /// Last time `update()` was called (for rate limiting)
@@ -247,6 +260,7 @@ impl BatteryMonitor {
         let devices = Arc::new(Mutex::new(startup_devices));
         let logitech_devices = Arc::new(Mutex::new(Vec::new()));
         let native_headset_coverage = Arc::new(Mutex::new(Vec::new()));
+        let maxwell_connection: SharedMaxwellConnection = Arc::new(Mutex::new(None));
         let initial_probe_started = Instant::now();
         let update_requested = Arc::new(Mutex::new(true)); // Request initial update immediately
         let solaar_enabled = Arc::new(AtomicBool::new(enable_solaar));
@@ -254,12 +268,33 @@ impl BatteryMonitor {
         // Keep the fast Logitech path independent of CLI discovery and slower
         // headset/controller probes. Never hold the snapshot lock during HID I/O.
         let logitech_snapshot = Arc::downgrade(&logitech_devices);
+        let fast_maxwell_connection = Arc::clone(&maxwell_connection);
         std::thread::spawn(move || {
             let mut monitor = logitech::Monitor::new();
+            let mut events = events::Listener::new().ok();
+            refresh_maxwell_connection(&fast_maxwell_connection);
             let mut announced = false;
             while logitech_snapshot.strong_count() > 0 {
                 let started = Instant::now();
-                let readings = query_native_logitech(&mut monitor);
+                let mut topology_changed = false;
+                let readings = query_native_logitech(&mut monitor, |updates| {
+                    // A long discovery/query must not starve USB events. This
+                    // is a nonblocking drain; it sends no hardware requests.
+                    if events
+                        .as_mut()
+                        .is_some_and(|listener| listener.wait(Duration::ZERO).topology)
+                    {
+                        refresh_maxwell_connection(&fast_maxwell_connection);
+                        topology_changed = true;
+                    }
+                    if let Some(snapshot) = logitech_snapshot.upgrade() {
+                        let mut snapshot = snapshot.lock().unwrap();
+                        merge_logitech_updates(&mut snapshot, updates);
+                    }
+                });
+                if topology_changed {
+                    monitor.invalidate_discovery();
+                }
                 if !announced && !readings.is_empty() {
                     log::info!(
                         "Using native monitoring for {} Logitech device(s)",
@@ -278,9 +313,25 @@ impl BatteryMonitor {
                     }
                 }
                 drop(snapshot);
-                // Count query time toward the cadence instead of adding it to
-                // the one-second sleep on every poll.
-                std::thread::sleep(LOGITECH_POLL_INTERVAL.saturating_sub(started.elapsed()));
+                // Kernel hotplug events wake this existing worker without extra
+                // idle polling. Only inspect sysfs here, never issue extra HID
+                // requests or postpone the original Logitech polling deadline.
+                let deadline = started + LOGITECH_POLL_INTERVAL;
+                loop {
+                    // Always drain once, including when a slow query exceeded
+                    // its polling interval and there is no sleep time left.
+                    let changes = wait_for_device_changes(
+                        &mut events,
+                        deadline.saturating_duration_since(Instant::now()),
+                    );
+                    if changes.topology {
+                        refresh_maxwell_connection(&fast_maxwell_connection);
+                        monitor.invalidate_discovery();
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
             }
         });
 
@@ -291,9 +342,11 @@ impl BatteryMonitor {
         let solaar_enabled_clone = Arc::clone(&solaar_enabled);
         let logitech_devices_clone = Arc::clone(&logitech_devices);
         let headset_coverage_clone = Arc::clone(&native_headset_coverage);
+        let native_maxwell_connection = Arc::clone(&maxwell_connection);
         let startup_cache = cached_devices.clone();
 
         std::thread::spawn(move || {
+            let mut events = events::Listener::new().ok();
             let mut last_cache_snapshot = None;
             let mut native_maxwell_authoritative = false;
             let mut native_maxwell = None;
@@ -303,7 +356,7 @@ impl BatteryMonitor {
             // Resolve Maxwell first and publish it immediately. External fallback
             // discovery can take several seconds and must not hold a live native
             // battery reading behind cached startup state.
-            match query_native_maxwell() {
+            match query_native_maxwell(&native_maxwell_connection) {
                 Ok(state) => {
                     if state.is_some() {
                         log::info!("Using native HID monitoring for Audeze Maxwell");
@@ -422,6 +475,10 @@ impl BatteryMonitor {
             );
             *devices_clone.lock().unwrap() = new_devices.clone();
 
+            apply_maxwell_connection(
+                &mut new_devices,
+                native_maxwell_connection.lock().unwrap().as_ref(),
+            );
             persist_battery_readings(&mut last_cache_snapshot, &new_devices);
 
             // Clear the initial update request flag
@@ -443,8 +500,13 @@ impl BatteryMonitor {
                         fast_initial_poll,
                     )
                 };
-                std::thread::sleep(poll_interval);
+                let changes = wait_for_device_changes(&mut events, poll_interval);
+                if changes.topology {
+                    headset_monitor.invalidate_discovery();
+                }
 
+                // Discovery is invalidated by hotplug, but HID requests keep
+                // their existing cadence even during a burst of USB events.
                 let standard_native_poll_due = fast_initial_poll
                     || last_standard_native_poll.elapsed() >= NATIVE_POLL_INTERVAL;
 
@@ -461,7 +523,7 @@ impl BatteryMonitor {
                 }
 
                 if standard_native_poll_due {
-                    if let Ok(state) = query_native_maxwell() {
+                    if let Ok(state) = query_native_maxwell(&native_maxwell_connection) {
                         native_maxwell_authoritative = true;
                         native_maxwell = state;
                         merge_native_maxwell(
@@ -577,7 +639,11 @@ impl BatteryMonitor {
                     *devices_clone.lock().unwrap() = new_devices.clone();
                 }
 
-                let current_devices = devices_clone.lock().unwrap().clone();
+                let mut current_devices = devices_clone.lock().unwrap().clone();
+                apply_maxwell_connection(
+                    &mut current_devices,
+                    native_maxwell_connection.lock().unwrap().as_ref(),
+                );
                 persist_battery_readings(&mut last_cache_snapshot, &current_devices);
             }
         });
@@ -586,6 +652,7 @@ impl BatteryMonitor {
             devices,
             logitech_devices,
             native_headset_coverage,
+            maxwell_connection,
             cached_devices: startup_cache,
             initial_probe_started,
             last_update,
@@ -619,6 +686,10 @@ impl BatteryMonitor {
             &mut devices,
             &self.cached_devices,
             self.initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
+        );
+        apply_maxwell_connection(
+            &mut devices,
+            self.maxwell_connection.lock().unwrap().as_ref(),
         );
         devices
     }
@@ -657,9 +728,107 @@ impl BatteryMonitor {
 // Native Device Queries
 // ============================================================================
 
-fn query_native_maxwell() -> Result<Option<BatteryDevice>, String> {
+// Ignore unrelated power events while retaining the original sleep deadline.
+// A failed/unsupported netlink socket preserves the existing polling fallback.
+fn wait_for_device_changes(
+    listener: &mut Option<events::Listener>,
+    timeout: Duration,
+) -> events::Changes {
+    let Some(listener) = listener else {
+        std::thread::sleep(timeout);
+        return events::Changes::default();
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        let changes = listener.wait(deadline.saturating_duration_since(Instant::now()));
+        if changes.topology || Instant::now() >= deadline {
+            return changes;
+        }
+    }
+}
+
+fn publish_maxwell_connection(
+    snapshot: &SharedMaxwellConnection,
+    observed_at: Instant,
+    state: Option<headsets::MaxwellConnection>,
+) {
+    let mut snapshot = snapshot.lock().unwrap();
+    if snapshot
+        .as_ref()
+        .is_none_or(|current| observed_at >= current.observed_at)
+    {
+        let last_device = snapshot
+            .as_mut()
+            .and_then(|current| current.last_device.take());
+        *snapshot = Some(MaxwellConnectionSnapshot {
+            observed_at,
+            state,
+            last_device,
+        });
+    }
+}
+
+fn refresh_maxwell_connection(snapshot: &SharedMaxwellConnection) {
+    let observed_at = Instant::now();
+    if let Ok(state) = headsets::query_audeze_maxwell_connection() {
+        publish_maxwell_connection(snapshot, observed_at, state);
+    }
+}
+
+fn apply_maxwell_connection(
+    devices: &mut Vec<BatteryDevice>,
+    snapshot: Option<&MaxwellConnectionSnapshot>,
+) {
+    let Some(snapshot) = snapshot else { return };
+    let Some(state) = snapshot.state.filter(|state| state.connected) else {
+        devices.retain(|device| !device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME));
+        return;
+    };
+    if !devices
+        .iter()
+        .any(|device| device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME))
+    {
+        // USB re-enumeration can briefly remove the row in an in-flight native
+        // query. Restore the last known reading provisionally until the next
+        // percentage query, rather than hiding a headset now known to be online.
+        if let Some(last_device) = &snapshot.last_device {
+            let mut device = last_device.clone();
+            device.is_loading = true;
+            devices.push(device);
+        }
+    }
+    // Only change connection/charging flags. The last confirmed percentage and
+    // its provisional/loading marker must survive a USB-only observation.
+    for device in devices
+        .iter_mut()
+        .filter(|device| device.name.eq_ignore_ascii_case(MAXWELL_DEVICE_NAME))
+    {
+        device.is_connected = true;
+        device.status = Some(
+            if state.charging {
+                "charging"
+            } else {
+                "discharging"
+            }
+            .to_string(),
+        );
+    }
+}
+
+fn query_native_maxwell(
+    connection: &SharedMaxwellConnection,
+) -> Result<Option<BatteryDevice>, String> {
+    let observed_at = Instant::now();
     let state = headsets::query_audeze_maxwell()?;
-    Ok(state.map(|state| BatteryDevice {
+    publish_maxwell_connection(
+        connection,
+        observed_at,
+        state.map(|state| headsets::MaxwellConnection {
+            connected: state.connected,
+            charging: state.charging,
+        }),
+    );
+    let device = state.map(|state| BatteryDevice {
         name: MAXWELL_DEVICE_NAME.to_string(),
         level: state.level,
         status: state.connected.then(|| {
@@ -673,7 +842,16 @@ fn query_native_maxwell() -> Result<Option<BatteryDevice>, String> {
         codename: None,
         is_loading: false,
         is_connected: state.connected,
-    }))
+    });
+    if let Some(device) = device
+        .as_ref()
+        .filter(|device| device.is_connected && device.level.is_some())
+    {
+        if let Some(snapshot) = connection.lock().unwrap().as_mut() {
+            snapshot.last_device = Some(device.clone());
+        }
+    }
+    Ok(device)
 }
 
 fn merge_native_maxwell(devices: &mut Vec<BatteryDevice>, native_maxwell: Option<BatteryDevice>) {
@@ -723,20 +901,54 @@ fn merge_native_wolverine(
     }
 }
 
-fn query_native_logitech(monitor: &mut logitech::Monitor) -> Vec<BatteryDevice> {
+fn query_native_logitech(
+    monitor: &mut logitech::Monitor,
+    mut publish: impl FnMut(&[BatteryDevice]),
+) -> Vec<BatteryDevice> {
     monitor
-        .query()
-        .into_iter()
-        .map(|state| BatteryDevice {
-            name: state.name,
-            level: state.level,
-            status: state.status,
-            kind: state.kind,
-            codename: None,
-            is_loading: false,
-            is_connected: state.connected,
+        .query_with_updates(|updates| {
+            let devices: Vec<_> = updates.iter().map(logitech_battery_device).collect();
+            publish(&devices);
         })
+        .iter()
+        .map(logitech_battery_device)
         .collect()
+}
+
+fn merge_logitech_updates(snapshot: &mut Vec<BatteryDevice>, updates: &[BatteryDevice]) {
+    for update in updates {
+        let first_match = snapshot
+            .iter()
+            .position(|device| logitech::same_device_name(&device.name, &update.name));
+        let mut replacement = update.clone();
+        for existing in snapshot
+            .iter()
+            .filter(|device| logitech::same_device_name(&device.name, &update.name))
+        {
+            if battery_device_name_quality(&existing.name)
+                > battery_device_name_quality(&replacement.name)
+            {
+                replacement.name.clone_from(&existing.name);
+            }
+        }
+        snapshot.retain(|device| !logitech::same_device_name(&device.name, &update.name));
+        let insertion_index = first_match.unwrap_or(snapshot.len()).min(snapshot.len());
+        // Keep disconnected rows in this source snapshot: the read-time merge
+        // uses them to remove stale connected rows from slower backends.
+        snapshot.insert(insertion_index, replacement);
+    }
+}
+
+fn logitech_battery_device(state: &logitech::BatteryState) -> BatteryDevice {
+    BatteryDevice {
+        name: state.name.clone(),
+        level: state.level,
+        status: state.status.clone(),
+        kind: state.kind.clone(),
+        codename: None,
+        is_loading: false,
+        is_connected: state.connected,
+    }
 }
 
 fn query_native_headsets(monitor: &mut headsets::Monitor) -> headsets::Snapshot {
@@ -799,25 +1011,7 @@ fn merge_native_logitech(devices: &mut Vec<BatteryDevice>, native_devices: &[Bat
             continue;
         }
 
-        let first_match = devices
-            .iter()
-            .position(|device| logitech::same_device_name(&device.name, &native.name));
-        let mut replacement = native.clone();
-
-        for existing in devices
-            .iter()
-            .filter(|device| logitech::same_device_name(&device.name, &native.name))
-        {
-            if battery_device_name_quality(&existing.name)
-                > battery_device_name_quality(&replacement.name)
-            {
-                replacement.name.clone_from(&existing.name);
-            }
-        }
-
-        devices.retain(|device| !logitech::same_device_name(&device.name, &native.name));
-        let insertion_index = first_match.unwrap_or(devices.len()).min(devices.len());
-        devices.insert(insertion_index, replacement);
+        merge_logitech_updates(devices, std::slice::from_ref(native));
     }
 }
 

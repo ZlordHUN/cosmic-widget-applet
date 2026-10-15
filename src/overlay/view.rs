@@ -3,6 +3,7 @@
 //! Compose the configured sections and overlay drag controls.
 
 use super::Message;
+use super::components::section::{CARD_SPACING, section_card};
 use super::media_state::DismissingMedia;
 use super::notification_state::{DismissingNotification, NotificationKey};
 use super::sections::{ai_usage, clock, devices, media, notifications, storage, system, weather};
@@ -10,7 +11,7 @@ use super::stats::SystemSnapshot;
 use super::surface::SURFACE_WIDTH;
 use crate::config::{Config, WidgetSection};
 use chrono::{DateTime, Local};
-use cosmic::iced::{Length, mouse};
+use cosmic::iced::{Length, Padding, mouse};
 use cosmic::{Element, theme, widget};
 
 pub(super) fn widget_view<'a>(
@@ -27,22 +28,26 @@ pub(super) fn widget_view<'a>(
     clearing_notifications: bool,
     clear_button_visibility: f32,
     notification_scroll_translation: f32,
-    surface_height: u32,
     dismissing_media: Option<&'a DismissingMedia>,
     media_seek_preview: Option<f64>,
     media_timeline_hovered: bool,
 ) -> Element<'a, Message> {
     let spacing = theme::system_preference().cosmic().spacing;
     let now_timestamp = now.timestamp().max(0) as u64;
-    let content_width = SURFACE_WIDTH as f32 - 2.0 * f32::from(spacing.space_m);
+    // Split the original horizontal inset between the surface and its cards,
+    // keeping all existing section content at the same width.
+    let outer_inset = spacing.space_m / 2;
+    let card_inset = spacing.space_m - outer_inset;
+    let content_width = SURFACE_WIDTH as f32 - 2.0 * f32::from(outer_inset);
     let mut content = widget::column::with_capacity(config.section_order.len() + 1)
         .width(Length::Fixed(content_width))
-        .spacing(spacing.space_s);
-    let mut has_content = false;
+        .spacing(CARD_SPACING);
 
     if config.show_clock || config.show_date {
-        content = content.push(clock::clock_view(config, now, spacing.space_xxs));
-        has_content = true;
+        content = content.push(
+            widget::container(clock::clock_view(config, now, spacing.space_xxs))
+                .padding([0, card_inset]),
+        );
     }
 
     for section in &config.section_order {
@@ -117,24 +122,30 @@ pub(super) fn widget_view<'a>(
         };
 
         if let Some(section) = migrated {
-            if has_content {
-                content = content.push(widget::divider::horizontal::light());
-            }
-            content = content.push(section);
-            has_content = true;
+            content = content.push(section_card(section, card_inset));
         }
     }
 
     let overlay: Element<'a, Message> = widget::container(content)
-        .padding(spacing.space_m)
+        .padding(Padding {
+            top: f32::from(spacing.space_m),
+            right: f32::from(outer_inset),
+            bottom: f32::from(outer_inset),
+            left: f32::from(outer_inset),
+        })
         .width(Length::Fill)
-        .height(Length::Fixed(surface_height as f32))
+        .height(Length::Shrink)
         .class(theme::Container::custom(|theme| {
             let cosmic = theme.cosmic();
             let mut style = theme::Container::background(cosmic, theme.transparent);
             style.border.radius = cosmic.corner_radii.radius_l.into();
             style
         }))
+        .into();
+    // Measure the actual cards, including wrapping and animated content. The
+    // background never reserves empty space from an estimated section height.
+    let overlay: Element<'a, Message> = cosmic::iced::widget::sensor(overlay)
+        .on_resize(|size| Message::OverlayMeasured(size.height.ceil().max(1.0) as u32))
         .into();
 
     if config.widget_movable {
@@ -162,7 +173,7 @@ pub(super) fn widget_view<'a>(
 
         return cosmic::iced::widget::Stack::with_children([overlay, drag_layer, pin_layer])
             .width(Length::Fill)
-            .height(Length::Fixed(surface_height as f32))
+            .height(Length::Shrink)
             .into();
     }
 

@@ -59,6 +59,12 @@ pub(crate) struct BatteryState {
     pub(crate) connected: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectionState {
+    pub(crate) connected: bool,
+    pub(crate) charging: bool,
+}
+
 #[derive(Debug)]
 struct HidrawDevice {
     path: PathBuf,
@@ -66,8 +72,17 @@ struct HidrawDevice {
     product_id: u16,
 }
 
-pub(crate) fn query() -> Result<Option<BatteryState>, String> {
+/// Reads connection and charging state from sysfs without opening the HID device.
+pub(crate) fn connection_state() -> Result<Option<ConnectionState>, String> {
     let devices = enumerate_hidraw().map_err(|error| error.to_string())?;
+    connection_from_devices(&devices, sound_card_present)
+        .map(|connection| connection.map(|(_, state)| state))
+}
+
+fn connection_from_devices(
+    devices: &[HidrawDevice],
+    sound_present: impl FnOnce(u16, u16) -> io::Result<bool>,
+) -> Result<Option<(&HidrawDevice, ConnectionState)>, String> {
     let Some(dongle) = devices.iter().find(|device| {
         device.vendor_id == VENDOR_ID && DONGLE_PRODUCT_IDS.contains(&device.product_id)
     }) else {
@@ -76,10 +91,23 @@ pub(crate) fn query() -> Result<Option<BatteryState>, String> {
     let wired_headset_present = devices.iter().any(|device| {
         device.vendor_id == VENDOR_ID && WIRED_PRODUCT_IDS.contains(&device.product_id)
     });
-    let audio_interface_present = sound_card_present(VENDOR_ID, dongle.product_id)
+    let audio_interface_present = sound_present(VENDOR_ID, dongle.product_id)
         .map_err(|error| format!("failed to inspect Maxwell audio interfaces: {error}"))?;
-    let connected = audio_interface_present || wired_headset_present;
-    if !connected {
+    Ok(Some((
+        dongle,
+        ConnectionState {
+            connected: audio_interface_present || wired_headset_present,
+            charging: wired_headset_present,
+        },
+    )))
+}
+
+pub(crate) fn query() -> Result<Option<BatteryState>, String> {
+    let devices = enumerate_hidraw().map_err(|error| error.to_string())?;
+    let Some((dongle, connection)) = connection_from_devices(&devices, sound_card_present)? else {
+        return Ok(None);
+    };
+    if !connection.connected {
         return Ok(Some(BatteryState {
             level: None,
             charging: false,
@@ -101,8 +129,8 @@ pub(crate) fn query() -> Result<Option<BatteryState>, String> {
     Ok(Some(parse_battery_state(
         &status_responses,
         &battery_response,
-        connected,
-        wired_headset_present,
+        connection.connected,
+        connection.charging,
     )))
 }
 
@@ -316,10 +344,91 @@ const fn hid_ioc_get_input(length: usize) -> libc::c_ulong {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAXWELL_2_INITIALIZATION_REQUESTS, MAXWELL_2_STATUS_REQUESTS, MESSAGE_SIZE,
-        hid_ioc_get_input, parse_battery_response, parse_battery_state, parse_hid_id,
-        parse_maxwell_2_battery, parse_usb_product, query,
+        ConnectionState, DONGLE_PRODUCT_IDS, HidrawDevice, MAXWELL_2_INITIALIZATION_REQUESTS,
+        MAXWELL_2_STATUS_REQUESTS, MESSAGE_SIZE, VENDOR_ID, WIRED_PRODUCT_IDS,
+        connection_from_devices, hid_ioc_get_input, parse_battery_response, parse_battery_state,
+        parse_hid_id, parse_maxwell_2_battery, parse_usb_product, query,
     };
+    use std::io;
+    use std::path::PathBuf;
+
+    fn device(vendor_id: u16, product_id: u16) -> HidrawDevice {
+        HidrawDevice {
+            path: PathBuf::from("/not-opened"),
+            vendor_id,
+            product_id,
+        }
+    }
+
+    #[test]
+    fn connection_check_requires_a_first_generation_maxwell_dongle() {
+        let devices = [device(VENDOR_ID, 0x4b1a), device(VENDOR_ID, 0x4b29)];
+        let connection = connection_from_devices(&devices, |_, _| {
+            panic!("audio interfaces must not be inspected without a Maxwell dongle")
+        })
+        .unwrap();
+        assert!(connection.is_none());
+    }
+
+    #[test]
+    fn connection_check_uses_the_dongle_audio_interface_for_the_wireless_link() {
+        let devices = [
+            device(VENDOR_ID, 0x4b18),
+            // An unrelated device with a matching product ID is not the charging cable.
+            device(0x046d, 0x4b1a),
+        ];
+        for audio_present in [false, true] {
+            let (dongle, connection) = connection_from_devices(&devices, |vendor, product| {
+                assert_eq!((vendor, product), (VENDOR_ID, 0x4b18));
+                Ok(audio_present)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(dongle.path, devices[0].path);
+            assert_eq!(
+                connection,
+                ConnectionState {
+                    connected: audio_present,
+                    charging: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn connection_check_detects_each_wired_maxwell_without_hid_requests() {
+        for dongle in DONGLE_PRODUCT_IDS {
+            for wired in WIRED_PRODUCT_IDS {
+                let devices = [device(VENDOR_ID, dongle), device(VENDOR_ID, wired)];
+                let (_, connection) = connection_from_devices(&devices, |vendor, product| {
+                    assert_eq!((vendor, product), (VENDOR_ID, dongle));
+                    Ok(false)
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    connection,
+                    ConnectionState {
+                        connected: true,
+                        charging: true,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn connection_check_preserves_audio_inspection_errors() {
+        let devices = [device(VENDOR_ID, 0x4b18)];
+        let error = connection_from_devices(&devices, |_, _| {
+            Err(io::Error::other("audio inspection unavailable"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "failed to inspect Maxwell audio interfaces: audio inspection unavailable"
+        );
+    }
 
     #[test]
     fn parses_maxwell_hid_identity() {

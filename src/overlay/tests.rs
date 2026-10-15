@@ -269,12 +269,158 @@ fn notification_group_expansion_reverses_from_its_current_progress() {
 
     let reversed_at = started + duration / 2;
     animation.transition_to(0.0, reversed_at);
-    animation.advance(reversed_at + Duration::from_millis(16));
-    assert!(animation.progress <= 0.46);
+    let frame = Duration::from_millis(16);
+    animation.advance(reversed_at + frame);
+    let expected = 0.5 - frame.as_secs_f32() / duration.as_secs_f32();
+    assert!((animation.progress - expected).abs() < 0.001);
 
     animation.advance(reversed_at + duration / 2);
 
     assert_eq!(animation.progress, 0.0);
+    assert!(animation.is_collapsed());
+}
+
+#[test]
+fn notification_groups_collapse_at_opening_speed_without_waiting_for_the_tail() {
+    for count in [3, 15, 30, 100] {
+        let snapshot = SystemSnapshot {
+            notifications: vec![notification(); count],
+            ..Default::default()
+        };
+        let source = notification_source(&snapshot.notifications[0]);
+        let started = Instant::now();
+        let duration = NOTIFICATION_GROUP_EXPANSION_DURATION;
+        let mut animation = ExpansionAnimation::with_duration(duration);
+        animation.transition_to(1.0, started);
+        let closed_at = started + duration;
+        animation.advance(closed_at);
+        let visible =
+            notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
+        animation.collapse_visible(visible, closed_at);
+        let height = |progress| {
+            notification_viewport_height_with_animation(
+                &snapshot,
+                None,
+                Some(source),
+                0.0,
+                progress,
+            )
+        };
+        assert_eq!(height(animation.progress), 188.0);
+        let visible_duration = duration.mul_f32(visible);
+        let mut opening = ExpansionAnimation::with_duration(duration);
+        opening.transition_to(1.0, started);
+        opening.advance(started + visible_duration / 2);
+        animation.advance(closed_at + visible_duration / 2);
+        assert!((height(animation.progress) - 117.5).abs() < 0.01);
+        assert!(
+            (height(animation.progress) - height(opening.progress)).abs() < 0.01,
+            "{count} rows must open and close at the same speed"
+        );
+        animation.advance(closed_at + visible_duration);
+        assert!(animation.is_collapsed());
+        assert_eq!(height(animation.progress), 47.0);
+    }
+}
+
+#[test]
+fn notification_group_quick_reversals_preserve_visible_height() {
+    let snapshot = SystemSnapshot {
+        notifications: vec![notification(); 30],
+        ..Default::default()
+    };
+    let source = notification_source(&snapshot.notifications[0]);
+    let height = |progress| {
+        notification_viewport_height_with_animation(&snapshot, None, Some(source), 0.0, progress)
+    };
+    // Reverse both before reaching the viewport limit and after filling it.
+    for open_time in [16, 80] {
+        let started = Instant::now();
+        let mut animation =
+            ExpansionAnimation::with_duration(NOTIFICATION_GROUP_EXPANSION_DURATION);
+        animation.transition_to(1.0, started);
+        let closed_at = started + Duration::from_millis(open_time);
+        animation.advance(closed_at);
+        let before = height(animation.progress);
+        let visible =
+            notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
+        animation.collapse_visible(visible, closed_at);
+        assert_eq!(height(animation.progress), before);
+        let before_closing = animation.progress;
+        let reopened_at = closed_at + Duration::from_millis(4);
+        animation.advance(reopened_at);
+        let partially_closed = animation.progress;
+        assert!(height(partially_closed) < before);
+        animation.transition_to(1.0, reopened_at);
+        assert_eq!(animation.progress, partially_closed);
+        animation.advance(reopened_at + Duration::from_millis(4));
+        let closing_distance = before_closing - partially_closed;
+        let opening_distance = animation.progress - partially_closed;
+        assert!(opening_distance > 0.0);
+        assert!((opening_distance - closing_distance).abs() < 0.0001);
+    }
+}
+
+#[test]
+fn notification_group_collapse_accounts_for_preceding_transfer_headers_and_scroll() {
+    let mut earlier = notification();
+    earlier.app_name = "COSMIC Files".to_string();
+    earlier.file_transfer = Some(FileTransfer {
+        progress: 30,
+        state: FileTransferState::Running,
+    });
+    let mut notifications = vec![earlier];
+    notifications.extend(vec![notification(); 30]);
+    let snapshot = SystemSnapshot {
+        notifications,
+        ..Default::default()
+    };
+    let source = notification_source(&snapshot.notifications[1]);
+    let children_height = 30.0 * NOTIFICATION_ITEM_HEIGHT as f32;
+    // The 71 px transfer header and 47 px group header leave 70 px visible.
+    let at_top = notification_group_visible_fraction(&snapshot, source, 1.0, 0.0);
+    assert!((at_top * children_height - 70.0).abs() < 0.01);
+    // Scrolling the transfer header away exposes three complete child rows.
+    let scrolled = notification_group_visible_fraction(&snapshot, source, 1.0, 71.0);
+    assert!((scrolled * children_height - 141.0).abs() < 0.01);
+}
+
+#[test]
+fn notification_group_collapse_clamps_stale_scroll_offsets() {
+    let snapshot = SystemSnapshot {
+        notifications: vec![notification(); 30],
+        ..Default::default()
+    };
+    let source = notification_source(&snapshot.notifications[0]);
+    // This early in expansion the content fits, so an old scroll offset is zero.
+    let at_top = notification_group_visible_fraction(&snapshot, source, 0.02, 0.0);
+    let stale = notification_group_visible_fraction(&snapshot, source, 0.02, 5000.0);
+    assert_eq!(stale, at_top);
+    // With overflowing content, clamp to its actual maximum scroll position.
+    let valid = notification_group_visible_fraction(&snapshot, source, 0.5, 564.0);
+    let stale = notification_group_visible_fraction(&snapshot, source, 0.5, 5000.0);
+    assert_eq!(stale, valid);
+    assert!((stale - 0.5).abs() < 0.001);
+}
+
+#[test]
+fn small_notification_groups_keep_their_existing_collapse_timing() {
+    let snapshot = SystemSnapshot {
+        notifications: vec![notification(); 2],
+        ..Default::default()
+    };
+    let source = notification_source(&snapshot.notifications[0]);
+    let started = Instant::now();
+    let duration = NOTIFICATION_GROUP_EXPANSION_DURATION;
+    let mut animation = ExpansionAnimation::with_duration(duration);
+    animation.transition_to(1.0, started);
+    animation.advance(started + duration);
+    let visible = notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
+    assert_eq!(visible, 1.0);
+    animation.collapse_visible(visible, started + duration);
+    animation.advance(started + duration + duration / 2);
+    assert!((animation.progress - 0.5).abs() < 0.01);
+    animation.advance(started + duration * 2);
     assert!(animation.is_collapsed());
 }
 
@@ -840,6 +986,8 @@ fn notification() -> Notification {
         server_owner: None,
         sender_owner: None,
         app_name: "System".to_string(),
+        app_icon: None,
+        desktop_entry: None,
         summary: "Package manager updated".to_string(),
         body: "System is up to date.".to_string(),
         timestamp: 1_000,

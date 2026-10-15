@@ -18,6 +18,31 @@ const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+pub(super) fn is_cosmic_player(bus_name: &str) -> bool {
+    let Some(name) = bus_name.strip_prefix(MPRIS_PREFIX) else {
+        return false;
+    };
+    // COSMIC Player versions that pass a full name to mpris-server publish
+    // the MPRIS namespace twice. Keep the complete bus name for controls.
+    let name = name.strip_prefix(MPRIS_PREFIX).unwrap_or(name);
+    name == "cosmic-player" || name.starts_with("cosmic-player.")
+}
+
+fn local_video_title(media_url: &str) -> Option<String> {
+    super::video_title::from_url(media_url)
+}
+
+pub(super) fn apply_cosmic_player_metadata(bus_name: &str, info: &mut MediaInfo) {
+    // COSMIC Player uses audio-stream tags for its MPRIS title, so a video
+    // can be advertised as "Japan" or "English" instead of its episode name.
+    // Apply this after recording the raw metadata used to match playerctld.
+    if is_cosmic_player(bus_name)
+        && let Some(title) = info.media_url.as_deref().and_then(local_video_title)
+    {
+        info.title = title;
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Monitor {
     players: Arc<Mutex<HashMap<String, MediaInfo>>>,
@@ -349,7 +374,16 @@ fn media_info_from_properties(
     properties: &HashMap<String, OwnedValue>,
 ) -> Option<MediaInfo> {
     let metadata = metadata(properties)?;
-    let title = metadata_string(&metadata, "xesam:title").unwrap_or_default();
+    let media_url = metadata_string(&metadata, "xesam:url");
+    let mut title = metadata_string(&metadata, "xesam:title").unwrap_or_default();
+    // Keep nonempty titles raw for proxy matching, but discover local videos
+    // even when COSMIC Player has no audio title tag to advertise.
+    if title.is_empty() && is_cosmic_player(bus_name) {
+        title = media_url
+            .as_deref()
+            .and_then(local_video_title)
+            .unwrap_or_default();
+    }
     if title.is_empty() {
         return None;
     }
@@ -367,7 +401,7 @@ fn media_info_from_properties(
         artist: metadata_string_array(&metadata, "xesam:artist").unwrap_or_default(),
         album: metadata_string(&metadata, "xesam:album").unwrap_or_default(),
         art_url: metadata_string(&metadata, "mpris:artUrl"),
-        media_url: metadata_string(&metadata, "xesam:url"),
+        media_url,
         album_art: None,
         status,
         position: property_i64(properties, "Position").unwrap_or(0).max(0) as u64 / 1000,
@@ -470,6 +504,126 @@ mod tests {
     fn rejects_players_without_track_metadata() {
         let properties = HashMap::new();
         assert!(media_info_from_properties("org.mpris.MediaPlayer2.empty", &properties).is_none());
+    }
+
+    fn video_properties(title: Option<&str>, url: &str) -> HashMap<String, OwnedValue> {
+        let mut metadata = HashMap::new();
+        if let Some(title) = title {
+            metadata.insert("xesam:title".to_string(), owned(Value::from(title)));
+        }
+        metadata.insert("xesam:url".to_string(), owned(Value::from(url)));
+        HashMap::from([("Metadata".to_string(), OwnedValue::from(metadata))])
+    }
+
+    #[test]
+    fn cosmic_player_video_titles_use_filenames_instead_of_audio_labels() {
+        let url = "file:///tmp/Example.Series.S01E01.The.First.Episode.1080p.mkv";
+        let properties = video_properties(Some("Japan"), url);
+        for bus in [
+            "org.mpris.MediaPlayer2.cosmic-player",
+            "org.mpris.MediaPlayer2.cosmic-player.pid123",
+            "org.mpris.MediaPlayer2.org.mpris.MediaPlayer2.cosmic-player.pid123",
+        ] {
+            let mut info = media_info_from_properties(bus, &properties).unwrap();
+            assert_eq!(
+                info.title, "Japan",
+                "preserve raw metadata for proxy matching"
+            );
+            apply_cosmic_player_metadata(bus, &mut info);
+            assert_eq!(info.player_name, "COSMIC Player");
+            assert_eq!(info.title, "Example Series — S01E01 — The First Episode");
+            assert_eq!(info.media_url.as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn cosmic_player_decodes_video_filenames_even_without_a_title_tag() {
+        for title in [None, Some(""), Some("Japan")] {
+            let properties = video_properties(title, "file:///tmp/%E6%97%A5%E6%9C%AC%20-%2001.MKV");
+            let mut info = media_info_from_properties(
+                "org.mpris.MediaPlayer2.cosmic-player.pid123",
+                &properties,
+            )
+            .unwrap();
+            apply_cosmic_player_metadata("org.mpris.MediaPlayer2.cosmic-player.pid123", &mut info);
+            assert_eq!(info.title, "日本 - 01");
+        }
+    }
+
+    #[test]
+    fn cosmic_player_preserves_titles_for_music_streams_and_unusable_paths() {
+        for url in [
+            "file:///tmp/song.flac",
+            "file:///tmp/song.mp3",
+            "file:///tmp/song.m4a",
+            "https://example.test/episode.mkv",
+            "file://server/share/episode.mkv",
+            "file:///tmp/unknown.bin",
+            "file:///tmp/no-extension",
+            "file:///tmp/",
+            "not a URL",
+            "",
+        ] {
+            let properties = video_properties(Some("Original title"), url);
+            let mut info = media_info_from_properties(
+                "org.mpris.MediaPlayer2.cosmic-player.pid123",
+                &properties,
+            )
+            .unwrap();
+            apply_cosmic_player_metadata("org.mpris.MediaPlayer2.cosmic-player.pid123", &mut info);
+            assert_eq!(info.title, "Original title", "{url}");
+        }
+    }
+
+    #[test]
+    fn cosmic_player_workaround_leaves_other_players_untouched() {
+        let properties = video_properties(Some("Original title"), "file:///tmp/episode.mkv");
+        for bus in [
+            "org.mpris.MediaPlayer2.firefox.instance_1",
+            "org.mpris.MediaPlayer2.vlc.instance_1",
+            "org.mpris.MediaPlayer2.cosmic-player-extra",
+            "org.mpris.MediaPlayer2.other.cosmic-player",
+        ] {
+            assert!(!is_cosmic_player(bus));
+            let mut info = media_info_from_properties(bus, &properties).unwrap();
+            apply_cosmic_player_metadata(bus, &mut info);
+            assert_eq!(info.title, "Original title");
+            assert_ne!(info.player_name, "COSMIC Player");
+        }
+        assert!(!is_cosmic_player("cosmic-player"));
+        assert_eq!(
+            PlayerId::Mpris("org.mpris.MediaPlayer2.firefox.instance_1".into()).display_name(),
+            "Firefox"
+        );
+    }
+
+    #[test]
+    fn cosmic_player_video_title_still_merges_its_raw_mpris_proxy() {
+        use super::super::{TrackSignature, merge_mpris_proxy_player};
+
+        let bus = "org.mpris.MediaPlayer2.org.mpris.MediaPlayer2.cosmic-player.pid123";
+        let properties = video_properties(Some("Japan"), "file:///tmp/Example%20S01E01.mkv");
+        let mut info = media_info_from_properties(bus, &properties).unwrap();
+        let mut proxy =
+            media_info_from_properties("org.mpris.MediaPlayer2.playerctld", &properties).unwrap();
+        proxy.duration = 90_000;
+        proxy.position = 12_000;
+        proxy.can_seek = true;
+        let id = PlayerId::Mpris(bus.into());
+        let raw_tracks = HashMap::from([(id.clone(), TrackSignature::from(&info))]);
+        apply_cosmic_player_metadata(bus, &mut info);
+        let mut players = vec![(id, info)];
+
+        assert!(merge_mpris_proxy_player(
+            &mut players,
+            &raw_tracks,
+            &proxy,
+            &TrackSignature::from(&proxy),
+        ));
+        assert_eq!(players[0].1.player_name, "COSMIC Player");
+        assert_eq!(players[0].1.title, "Example — S01E01");
+        assert_eq!(players[0].1.position, 12_000);
+        assert!(players[0].1.can_seek);
     }
 
     #[test]

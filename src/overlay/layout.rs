@@ -2,8 +2,9 @@
 
 //! Surface and notification viewport dimensions for the current content.
 
+use super::components::section::{CARD_SPACING, CARD_VERTICAL_PADDING};
 use super::notification_state::{NotificationKey, notification_source};
-use super::sections::ai_usage;
+use super::sections::{ai_usage, media};
 use super::stats::SystemSnapshot;
 use crate::config::{Config, WidgetSection};
 use std::collections::HashSet;
@@ -27,7 +28,12 @@ pub(super) const MAX_VISIBLE_NOTIFICATION_ROWS: u32 = 4;
 pub(super) const NOTIFICATION_LINE_HEIGHT: u32 = 17;
 pub(super) const NOTIFICATION_CHARS_PER_LINE: usize = 32;
 
-pub(super) const EMPTY_MEDIA_HEIGHT: u32 = 107;
+// Heading and standard section gap, placeholder, card padding and card gap.
+pub(super) const EMPTY_MEDIA_HEIGHT: u32 = 21
+    + 12
+    + media::MEDIA_EMPTY_CONTENT_HEIGHT as u32
+    + 2 * CARD_VERTICAL_PADDING as u32
+    + CARD_SPACING as u32;
 pub(super) const MEDIA_SECTION_HEIGHT: u32 = 248;
 
 pub(super) fn desired_surface_height(config: &Config, snapshot: &SystemSnapshot) -> u32 {
@@ -243,6 +249,47 @@ fn notification_display_rows(snapshot: &SystemSnapshot, expanded_group: Option<&
             }
         })
         .sum()
+}
+
+/// Fraction of a group's children that can affect the current viewport.
+/// Rows below its bottom can be skipped when reversing or starting a collapse.
+pub(super) fn notification_group_visible_fraction(
+    snapshot: &SystemSnapshot,
+    source: &str,
+    group_progress: f32,
+    scroll_offset: f32,
+) -> f32 {
+    // Keep the same source order and header heights as the notification list.
+    let mut groups: Vec<(&str, f32, f32)> = Vec::new();
+    for notification in &snapshot.notifications {
+        let source = notification_source(notification);
+        let height = notification_base_height(notification) as f32;
+        if let Some((_, header, children)) = groups
+            .iter_mut()
+            .find(|(group_source, _, _)| *group_source == source)
+        {
+            *header = header.max(height);
+            *children += height;
+        } else {
+            groups.push((source, height, height));
+        }
+    }
+
+    let compact_height: f32 = groups.iter().map(|(_, header, _)| header).sum();
+    let viewport_limit = (NOTIFICATION_ITEM_HEIGHT * MAX_VISIBLE_NOTIFICATION_ROWS) as f32;
+    let mut children_top = 0.0;
+    for (group_source, header, children) in groups {
+        children_top += header;
+        if group_source != source {
+            continue;
+        }
+        // Iced can clamp scrolling without emitting another scroll event when
+        // content shrinks. Never let a stale offset retain an invisible tail.
+        let content_height = compact_height + children * group_progress.clamp(0.0, 1.0);
+        let offset = scroll_offset.clamp(0.0, (content_height - viewport_limit).max(0.0));
+        return ((offset + viewport_limit - children_top) / children).clamp(0.0, 1.0);
+    }
+    0.0
 }
 
 pub(super) fn notification_viewport_height(

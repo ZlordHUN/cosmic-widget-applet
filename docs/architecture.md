@@ -58,8 +58,17 @@ The surface:
 `src/overlay/app.rs` owns application state, subscriptions, and input handling.
 Animation, surface management, and layout have dedicated modules.
 `src/overlay/view.rs` composes the feature views in `src/overlay/sections/`.
+Each visible section sits in a translucent rounded card. The outer inset and
+card padding preserve the section content width, and compact gaps replace the
+separator lines. Cards and the Clear all pill reveal the widget's compositor
+blur. Idle media shows an inset placeholder card with a muted artwork tile.
+The overlay background fits the rendered content with a bottom inset matching
+its sides. A layout sensor keeps compositor blur and input bounds aligned with
+the actual card height, including media changes and notification animations.
 Reusable controls in `src/overlay/components/` provide gauges, marquee text,
-sliding transitions, and translated content.
+sliding transitions, and translated content. A device with a live charging
+reading shows a vector copy of the COSMIC battery icon whose charge repeatedly
+sweeps to full and fades back; cached readings keep the static icon.
 
 System readings are sampled once per second. The UI interpolates utilization
 bars and temperature gauges between samples so animation cadence is independent
@@ -110,6 +119,18 @@ native readers, deduplication, and optional external fallbacks.
   CLI queries cannot delay charging updates or overwrite them with older data.
   Persistent HID++ listeners also retain battery notifications between polls,
   allowing charging changes to update a sleeping device's last reading.
+  Sysfs readings and queued charging reports are published before querying the
+  remaining devices, so one slow HID request does not delay other devices.
+- `battery/events.rs` listens passively for kernel USB/HID/audio changes during
+  the existing workers' sleep periods. Hotplug invalidates device discovery;
+  idle polling intervals, worker count, and dependencies are unchanged.
+  Events are coalesced and polling deadlines remain bounded. Unsupported event
+  sockets fall back to the usual polling schedule.
+- Maxwell USB charging/connection state is read from sysfs independently of its
+  slower battery-percentage requests and CLI fallbacks. Timestamped observations
+  prevent an older in-flight query from undoing a cable transition. The UI reads
+  the latest battery snapshot directly instead of waiting for the general system
+  sampler's next iteration.
 - `battery/headsets/mod.rs` contains the explicit native headset registry and
   dispatches to vendor protocol modules.
 - `battery/controllers/` contains model-specific controller readers.
@@ -146,6 +167,19 @@ from the disk cache. The required Files-side patch and wire contract live under
 The accompanying daemon patch renews replacement timers, allowing completion
 popups to expire normally while remaining in notification history.
 
+
+Notification app icons and desktop-entry identities survive live capture, history
+refreshes, replacements, and the on-disk cache. The overlay resolves installed
+icons using that identity (including Discord conversation notifications), keeps
+Instagram's embedded icon, and uses a bell for unknown sources. Icon handles are
+cached with a fixed entry limit; resolution uses local files and icon themes only.
+
+When a notification group collapses, the overlay skips children below the
+visible viewport before starting the transition. The visible rows collapse at
+the same speed as opening, including quick reversals. Clipping accounts for
+partial expansion, preceding groups, taller transfer rows and the current scroll
+offset, so large groups close without an offscreen delay.
+
 ### Media
 
 The media monitor merges several sources into a stable player list:
@@ -153,6 +187,24 @@ The media monitor merges several sources into a stable player list:
 - MPRIS players discovered and updated over D-Bus;
 - Cider through its local HTTP API;
 - Emby sessions found from the local client state and queried over HTTP.
+
+For local video files played in COSMIC Player, the displayed title separates
+series, season/episode, and episode name while removing recognized release tags.
+The formatter uses information in the decoded filename; it does not invent
+episode metadata. COSMIC Player can advertise an audio stream label such as
+"Japan" as the track title. Music and other players retain supplied titles, and
+raw metadata remains available for proxy matching. Both regular and duplicated
+MPRIS namespaces identify the app as COSMIC Player.
+
+Local video frames use the asynchronous artwork queue and bounded LRU cache.
+Optional FFmpeg extracts one frame, with a timeout and size limits, without
+controlling the player. Failed extraction keeps the normal artwork fallback.
+The full-width transport row includes ten-second backward/forward controls for
+seekable media. Relative seeks clamp to the timeline and update the selected
+player immediately after queueing so repeated clicks accumulate.
+COSMIC Player versions that leave MPRIS seeking unimplemented need the
+[`integrations/cosmic-player`](../integrations/cosmic-player/README.md) companion
+patch; the widget respects each player's advertised seeking capability.
 
 When the displayed source disappears or clears its track metadata, the overlay
 retains its card for the same 220 ms left slide used by notification dismissal.
@@ -182,11 +234,35 @@ its account usage endpoint every five minutes using the existing Claude Code
 sign-in, with bounded reads, request timeouts, and retry backoff. Neither monitor
 makes inference requests or estimates allowance from token counts.
 
+Claude saves validated quota reports and retry deadlines in a private, atomically
+replaced cache. A SHA-256 fingerprint binds each report to its access token without
+storing credentials. Restarting restores matching reports before network requests,
+preserving their original age and reset times. Missing or expired credentials clear
+the cache; different tokens cannot restore another login's report. Temporary
+request failures retry from 30 seconds with backoff, rate limits honor `Retry-After`,
+and authentication rejection retries periodically instead of remaining latched for
+the entire widget session.
+
 `src/overlay/sections/ai_usage.rs` displays remaining allowance in compact arches
 shared with the temperature gauge component. Provider icons, quota labels, and
 reset times remain visible; hover details include the age of the report. Stale
 reports stay marked, and expired windows wait for a fresh report instead of
 assuming the allowance has refilled.
+
+### Animated Weather Icons
+
+The weather view uses the Meteocons fill artwork in `assets/weather/meteocons/`.
+Original SVGs and their license are vendored at a pinned upstream revision.
+`tools/render_weather_icons.py` renders their SMIL animations into transparent
+PNG atlases; these generated assets are committed and embedded in the binary.
+Normal builds and runtime need neither Chromium nor a network connection for icons.
+
+`src/overlay/components/weather_icon.rs` decodes the current condition's atlas once
+and caches its individual frames as RGBA image handles. Every frame draws at the
+same icon bounds, avoiding software-renderer rounding jumps and large redraw
+regions caused by translating a whole atlas. Its own frame clock schedules redraws
+without application messages or weather polling. Offscreen/static icons do not
+schedule frames, and removing the Weather section removes its animation.
 
 ## Configuration
 

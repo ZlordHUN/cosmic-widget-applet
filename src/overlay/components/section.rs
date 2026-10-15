@@ -1,10 +1,41 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::overlay::Message;
-use cosmic::iced::Alignment;
-use cosmic::{Element, widget};
+use cosmic::iced::{Alignment, Background, Border, Color, Length};
+use cosmic::{Element, theme, widget};
 
 pub(in crate::overlay) const METRIC_ICON_SIZE: u16 = 18;
+
+pub(in crate::overlay) const CARD_VERTICAL_PADDING: u16 = 12;
+pub(in crate::overlay) const CARD_SPACING: u16 = 8;
+
+pub(in crate::overlay) fn section_card<'a>(
+    content: Element<'a, Message>,
+    horizontal_padding: u16,
+) -> Element<'a, Message> {
+    widget::container(content)
+        .width(Length::Fill)
+        .padding([CARD_VERTICAL_PADDING, horizontal_padding])
+        .class(theme::Container::custom(|theme| {
+            let foreground: Color = theme.current_container().on.into();
+            cosmic::iced::widget::container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.045,
+                    ..foreground
+                })),
+                border: Border {
+                    color: Color {
+                        a: 0.10,
+                        ..foreground
+                    },
+                    width: 1.0,
+                    radius: 16.0.into(),
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
 
 pub(in crate::overlay) fn section<'a>(
     icon_name: &'static str,

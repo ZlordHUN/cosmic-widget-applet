@@ -20,7 +20,7 @@ pub(in crate::overlay) fn utilization_view<'a>(
 ) -> Element<'a, Message> {
     let mut section = section(
         "utilities-system-monitor-symbolic",
-        "Utilization",
+        "System Utilization",
         section_spacing,
     );
 

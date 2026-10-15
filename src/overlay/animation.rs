@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 pub(super) const NOTIFICATION_EXPANSION_DURATION: Duration = Duration::from_millis(220);
-pub(super) const NOTIFICATION_GROUP_EXPANSION_DURATION: Duration = Duration::from_millis(320);
+pub(super) const NOTIFICATION_GROUP_EXPANSION_DURATION: Duration = Duration::from_millis(540);
 
 #[derive(Debug, Clone)]
 pub(super) struct ExpansionAnimation {
@@ -44,14 +44,29 @@ impl ExpansionAnimation {
 
     pub(super) fn transition_to(&mut self, target: f32, now: Instant) {
         self.advance(now);
+        self.start_transition(target, now);
+    }
+
+    pub(super) fn collapse_visible(&mut self, visible_fraction: f32, now: Instant) {
+        self.advance(now);
+        let visible_fraction = visible_fraction.clamp(0.0, 1.0);
+        // Discard only the clipped tail. The first visible frame stays in place,
+        // and the remaining distance uses the same speed as opening.
+        self.progress = self.progress.min(visible_fraction);
+        self.start_transition(0.0, now);
+    }
+
+    fn start_transition(&mut self, target: f32, now: Instant) {
         self.start = self.progress;
         self.target = target.clamp(0.0, 1.0);
         let distance = (self.start - self.target).abs();
         self.started_at = if distance > f32::EPSILON {
-            self.active_duration = self
-                .duration
-                .mul_f32(distance)
-                .max(Duration::from_millis(48));
+            self.active_duration = self.duration.mul_f32(distance);
+            // Linear group transitions keep their speed even for a short
+            // visible remainder. Eased transitions retain their minimum time.
+            if !self.linear {
+                self.active_duration = self.active_duration.max(Duration::from_millis(48));
+            }
             Some(now)
         } else {
             None

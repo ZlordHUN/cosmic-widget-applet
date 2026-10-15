@@ -19,11 +19,13 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
 use serde::Deserialize;
 
+use super::claude_cache::{self, CacheRecord};
 use super::{UsageSnapshot, UsageStatus, UsageWindow};
 
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_INTERVAL_SECS: i64 = 5 * 60;
+const INITIAL_RETRY_SECS: i64 = 30;
 const MAX_BACKOFF_SECS: i64 = 60 * 60;
 const STALE_AFTER_SECS: i64 = 15 * 60;
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
@@ -55,15 +57,29 @@ impl ClaudeUsageMonitor {
             .name("claude-usage".into())
             .spawn(move || {
                 let client = usage_client().ok();
-                let mut reader = UsageReader::default();
+                let mut reader = UsageReader {
+                    cache_path: claude_cache::cache_path(),
+                    ..UsageReader::default()
+                };
                 loop {
                     if worker_enabled.load(Ordering::Relaxed) {
                         let value = match (credentials.as_ref(), client.as_ref()) {
-                            (Some(path), Some(client)) => reader.refresh(
-                                path,
-                                chrono::Utc::now().timestamp(),
-                                |token, now| fetch_usage(client, token, now),
-                            ),
+                            (Some(path), Some(client)) => {
+                                let now = chrono::Utc::now().timestamp();
+                                let credentials = reader.prepare_refresh(path, now);
+                                // Publish the saved report before a network request
+                                // can block. Its original age and reset times remain.
+                                if let Ok(mut snapshot) = worker_snapshot.lock() {
+                                    *snapshot = reader.snapshot.clone();
+                                }
+                                if let Some(credentials) = credentials {
+                                    reader.refresh_prepared(path, now, credentials, |token, now| {
+                                        fetch_usage(client, token, now)
+                                    })
+                                } else {
+                                    reader.snapshot.clone()
+                                }
+                            }
                             (None, _) => sign_in_required(),
                             _ => UsageSnapshot::default(),
                         };
@@ -193,11 +209,17 @@ fn read_bounded(reader: impl Read, max_bytes: u64) -> Option<Vec<u8>> {
 #[derive(Debug)]
 enum FetchError {
     SignInRequired,
-    Retry { after_secs: Option<i64> },
+    Retry {
+        after_secs: Option<i64>,
+        status: Option<u16>,
+    },
 }
 
 fn fetch_usage(client: &Client, token: &str, now: i64) -> Result<UsageSnapshot, FetchError> {
-    let retry = || FetchError::Retry { after_secs: None };
+    let retry = || FetchError::Retry {
+        after_secs: None,
+        status: None,
+    };
     let mut authorization =
         HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| retry())?;
     authorization.set_sensitive(true);
@@ -213,6 +235,7 @@ fn fetch_usage(client: &Client, token: &str, now: i64) -> Result<UsageSnapshot, 
         200 => {}
         _ => {
             return Err(FetchError::Retry {
+                status: Some(response.status().as_u16()),
                 after_secs: response
                     .headers()
                     .get(RETRY_AFTER)
@@ -294,36 +317,103 @@ fn parse_usage(bytes: &[u8], now: i64) -> Option<UsageSnapshot> {
 #[derive(Default)]
 struct UsageReader {
     stamp: Option<CredentialStamp>,
+    credential_key: Option<String>,
+    cache_path: Option<PathBuf>,
     snapshot: UsageSnapshot,
     next_request_at: i64,
     failures: u32,
 }
 
 impl UsageReader {
+    fn reset(&mut self) {
+        let cache_path = self.cache_path.take();
+        *self = Self {
+            cache_path,
+            ..Self::default()
+        };
+    }
+
+    fn clear_cache(&self) {
+        if let Some(path) = &self.cache_path {
+            claude_cache::clear(path);
+        }
+    }
+
+    fn persist(&self) {
+        if let (Some(path), Some(key)) = (&self.cache_path, &self.credential_key) {
+            let record = CacheRecord {
+                version: claude_cache::CACHE_VERSION,
+                credential_key: key.clone(),
+                snapshot: self.snapshot.clone(),
+                next_request_at: self.next_request_at,
+                failures: self.failures,
+            };
+            if claude_cache::save(path, &record).is_err() {
+                log::warn!("Unable to save Claude usage cache");
+            }
+        }
+    }
+
+    fn prepare_refresh(&mut self, credentials_path: &Path, now: i64) -> Option<OAuthCredentials> {
+        let Some((credentials, stamp)) = read_credentials(credentials_path, now) else {
+            // A logged-out or expired session must not show another account's
+            // last successful quota, even when the desktop cache still exists.
+            self.clear_cache();
+            self.reset();
+            self.snapshot = sign_in_required();
+            return None;
+        };
+        let key = claude_cache::credential_key(&credentials.access_token);
+        if self.credential_key.as_ref() != Some(&key) {
+            self.reset();
+            if let Some(record) = self
+                .cache_path
+                .as_ref()
+                .and_then(|path| claude_cache::load(path, &key, now))
+            {
+                self.snapshot = record.snapshot;
+                self.next_request_at = record.next_request_at;
+                self.failures = record.failures;
+            } else {
+                self.snapshot.status = UsageStatus::Loading;
+            }
+            self.credential_key = Some(key);
+        }
+        self.stamp = Some(stamp);
+        self.age_snapshot(now);
+        Some(credentials)
+    }
+
+    #[cfg(test)]
     fn refresh(
         &mut self,
         credentials_path: &Path,
         now: i64,
         fetch: impl FnOnce(&str, i64) -> Result<UsageSnapshot, FetchError>,
     ) -> UsageSnapshot {
-        let Some((credentials, stamp)) = read_credentials(credentials_path, now) else {
-            // A logged-out or expired session must not show another account's
-            // last successful quota, even when the desktop cache still exists.
-            *self = Self::default();
-            self.snapshot = sign_in_required();
+        let Some(credentials) = self.prepare_refresh(credentials_path, now) else {
             return self.snapshot.clone();
         };
-        if self.stamp.as_ref() != Some(&stamp) {
-            *self = Self::default();
-            self.stamp = Some(stamp);
-        }
+        self.refresh_prepared(credentials_path, now, credentials, fetch)
+    }
+
+    fn refresh_prepared(
+        &mut self,
+        credentials_path: &Path,
+        now: i64,
+        credentials: OAuthCredentials,
+        fetch: impl FnOnce(&str, i64) -> Result<UsageSnapshot, FetchError>,
+    ) -> UsageSnapshot {
         if now >= self.next_request_at {
             let result = fetch(&credentials.access_token, now);
             // A login can change while the network request is in flight. Never
             // publish that response as the newly selected account's quota.
             let current_stamp = credential_stamp(credentials_path);
             if current_stamp != self.stamp {
-                *self = Self::default();
+                if current_stamp.is_none() {
+                    self.clear_cache();
+                }
+                self.reset();
                 self.snapshot.status = if current_stamp.is_some() {
                     UsageStatus::Loading
                 } else {
@@ -339,18 +429,31 @@ impl UsageReader {
                 }
                 Err(FetchError::SignInRequired) => {
                     self.snapshot = sign_in_required();
-                    // Retry when Claude Code updates its credentials, without
-                    // repeatedly sending the same rejected access token.
-                    self.next_request_at = i64::MAX;
-                }
-                Err(FetchError::Retry { after_secs }) => {
                     self.failures = self.failures.saturating_add(1);
-                    let delay = retry_delay(self.failures, after_secs);
+                    // A transient rejection must not disable usage for the
+                    // entire session. Changed credentials still retry at once.
+                    let delay =
+                        retry_delay(self.failures, None, Some(401)).max(REQUEST_INTERVAL_SECS);
+                    self.next_request_at = now.saturating_add(delay);
+                    log::warn!("Claude usage authentication rejected; retrying in {delay}s");
+                }
+                Err(FetchError::Retry { after_secs, status }) => {
+                    self.failures = self.failures.saturating_add(1);
+                    let delay = retry_delay(self.failures, after_secs, status);
                     self.next_request_at = now.saturating_add(delay);
                     self.mark_stale();
+                    log::warn!(
+                        "Claude usage request failed (HTTP {status:?}); retrying in {delay}s"
+                    );
                 }
             }
+            self.persist();
         }
+        self.age_snapshot(now);
+        self.snapshot.clone()
+    }
+
+    fn age_snapshot(&mut self, now: i64) {
         for window in &mut self.snapshot.windows {
             window.is_stale |= now.saturating_sub(window.updated_at) > STALE_AFTER_SECS
                 || window.resets_at.is_some_and(|reset| reset <= now);
@@ -358,7 +461,6 @@ impl UsageReader {
         if self.snapshot.windows.iter().any(|window| window.is_stale) {
             self.snapshot.status = UsageStatus::Stale;
         }
-        self.snapshot.clone()
     }
 
     fn mark_stale(&mut self) {
@@ -373,10 +475,15 @@ impl UsageReader {
     }
 }
 
-fn retry_delay(failures: u32, after_secs: Option<i64>) -> i64 {
-    let backoff = REQUEST_INTERVAL_SECS * (1_i64 << failures.saturating_sub(1).min(4));
+fn retry_delay(failures: u32, after_secs: Option<i64>, status: Option<u16>) -> i64 {
+    let minimum = if status == Some(429) {
+        REQUEST_INTERVAL_SECS
+    } else {
+        INITIAL_RETRY_SECS
+    };
+    let backoff = minimum * (1_i64 << failures.saturating_sub(1).min(7));
     backoff
-        .clamp(REQUEST_INTERVAL_SECS, MAX_BACKOFF_SECS)
+        .clamp(minimum, MAX_BACKOFF_SECS)
         // The cap applies to our own retry policy, never to a server's request
         // to wait longer. Scheduling uses saturating_add for extreme values.
         .max(after_secs.unwrap_or_default())
@@ -436,6 +543,7 @@ mod tests {
     impl Drop for CredentialFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("cache.json"));
         }
     }
 
@@ -486,6 +594,7 @@ mod tests {
         let stale = reader.refresh(&file.0, NOW + 300, |_, _| {
             Err(FetchError::Retry {
                 after_secs: Some(900),
+                status: Some(429),
             })
         });
         assert_eq!(stale.status, UsageStatus::Stale);
@@ -508,18 +617,23 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_session_waits_for_new_credentials_and_clears_old_account() {
+    fn rejected_session_retries_and_new_credentials_clear_old_account() {
         let file = CredentialFile::new();
         let mut reader = UsageReader::default();
         reader.refresh(&file.0, NOW, |_, _| Ok(report()));
         let snapshot = reader.refresh(&file.0, NOW + 300, |_, _| Err(FetchError::SignInRequired));
         assert_eq!(snapshot.status, UsageStatus::SignInRequired);
         assert!(snapshot.windows.is_empty());
-        reader.refresh(&file.0, NOW + 600, |_, _| panic!("same rejected token"));
+        reader.refresh(&file.0, NOW + 330, |_, _| panic!("retry too early"));
+        let recovered = reader.refresh(&file.0, NOW + 600, |_, _| Ok(report()));
+        assert_eq!(recovered.status, UsageStatus::Available);
         file.write("different-account-access-token", NOW + 3600);
         let snapshot = reader.refresh(&file.0, NOW + 630, |token, _| {
             assert_eq!(token, "different-account-access-token");
-            Err(FetchError::Retry { after_secs: None })
+            Err(FetchError::Retry {
+                after_secs: None,
+                status: None,
+            })
         });
         assert_eq!(snapshot.status, UsageStatus::Unavailable);
         assert!(snapshot.windows.is_empty());
@@ -544,16 +658,151 @@ mod tests {
 
     #[test]
     fn retry_backoff_and_input_sizes_are_bounded() {
-        assert_eq!(retry_delay(1, None), 300);
-        assert_eq!(retry_delay(2, None), 600);
-        assert_eq!(retry_delay(100, None), 3600);
-        assert_eq!(retry_delay(1, Some(7200)), 7200);
-        assert_eq!(retry_delay(100, Some(i64::MAX)), i64::MAX);
-        assert_eq!(retry_delay(1, Some(-3)), 300);
+        assert_eq!(retry_delay(1, None, None), 30);
+        assert_eq!(retry_delay(2, None, Some(503)), 60);
+        assert_eq!(retry_delay(1, None, Some(429)), 300);
+        assert_eq!(retry_delay(2, None, Some(429)), 600);
+        assert_eq!(retry_delay(100, None, None), 3600);
+        assert_eq!(retry_delay(1, Some(7200), Some(503)), 7200);
+        assert_eq!(retry_delay(100, Some(i64::MAX), Some(429)), i64::MAX);
+        assert_eq!(retry_delay(1, Some(-3), None), 30);
         assert_eq!(retry_after_secs("600", NOW), Some(600));
         assert_eq!(retry_after_secs("not a date", NOW), None);
         assert_eq!(read_bounded(&b"abc"[..], 3), Some(b"abc".to_vec()));
         assert!(read_bounded(&b"abcd"[..], 3).is_none());
+    }
+
+    fn cached_reader(file: &CredentialFile) -> UsageReader {
+        UsageReader {
+            cache_path: Some(file.0.with_extension("cache.json")),
+            ..UsageReader::default()
+        }
+    }
+
+    #[test]
+    fn restart_restores_usage_before_fetching_and_preserves_poll_deadline() {
+        let file = CredentialFile::new();
+        cached_reader(&file).refresh(&file.0, NOW, |_, _| Ok(report()));
+        let mut restarted = cached_reader(&file);
+        let credentials = restarted.prepare_refresh(&file.0, NOW + 30).unwrap();
+        assert_eq!(restarted.snapshot, report());
+        restarted.refresh_prepared(&file.0, NOW + 30, credentials, |_, _| {
+            panic!("restart must not create an extra request")
+        });
+        // A rewritten login file with the same token must not erase the report.
+        file.write("test-access-token", NOW + 7200);
+        let restored = restarted.refresh(&file.0, NOW + 60, |_, _| {
+            panic!("rewriting the same token must preserve the polling deadline")
+        });
+        assert_eq!(restored.updated_at, Some(NOW));
+    }
+
+    #[test]
+    fn restart_keeps_last_known_usage_when_refresh_fails_and_retries_promptly() {
+        let file = CredentialFile::new();
+        cached_reader(&file).refresh(&file.0, NOW, |_, _| Ok(report()));
+        let mut restarted = cached_reader(&file);
+        restarted.prepare_refresh(&file.0, NOW + 300).unwrap();
+        assert_eq!(restarted.snapshot.windows[0].remaining_percent, 92.0);
+        let failed = restarted.refresh(&file.0, NOW + 300, |_, _| {
+            Err(FetchError::Retry {
+                after_secs: None,
+                status: None,
+            })
+        });
+        assert_eq!(failed.status, UsageStatus::Stale);
+        assert_eq!(failed.updated_at, Some(NOW));
+        let mut restarted_again = cached_reader(&file);
+        let waiting = restarted_again.refresh(&file.0, NOW + 310, |_, _| {
+            panic!("restart must preserve the retry deadline")
+        });
+        assert_eq!(waiting, failed);
+        let recovered = restarted_again.refresh(&file.0, NOW + 330, |_, now| {
+            let mut snapshot = report();
+            snapshot.updated_at = Some(now);
+            for window in &mut snapshot.windows {
+                window.updated_at = now;
+            }
+            Ok(snapshot)
+        });
+        assert_eq!(recovered.status, UsageStatus::Available);
+        assert_eq!(recovered.updated_at, Some(NOW + 330));
+    }
+
+    #[test]
+    fn restart_honors_rate_limits_without_erasing_saved_quota() {
+        let file = CredentialFile::new();
+        let mut reader = cached_reader(&file);
+        reader.refresh(&file.0, NOW, |_, _| Ok(report()));
+        reader.refresh(&file.0, NOW + 300, |_, _| {
+            Err(FetchError::Retry {
+                after_secs: Some(900),
+                status: Some(429),
+            })
+        });
+        let snapshot = cached_reader(&file).refresh(&file.0, NOW + 600, |_, _| {
+            panic!("restart bypassed the server's Retry-After")
+        });
+        assert_eq!(snapshot.status, UsageStatus::Stale);
+        assert_eq!(snapshot.windows[0].remaining_percent, 92.0);
+    }
+
+    #[test]
+    fn startup_failures_recover_without_waiting_five_minutes() {
+        let file = CredentialFile::new();
+        let mut reader = cached_reader(&file);
+        let failed = reader.refresh(&file.0, NOW, |_, _| {
+            Err(FetchError::Retry {
+                after_secs: None,
+                status: Some(503),
+            })
+        });
+        assert_eq!(failed.status, UsageStatus::Unavailable);
+        assert_eq!(reader.next_request_at, NOW + 30);
+        let recovered = cached_reader(&file).refresh(&file.0, NOW + 30, |_, _| Ok(report()));
+        assert_eq!(recovered.status, UsageStatus::Available);
+    }
+
+    #[test]
+    fn restart_never_restores_another_login_or_expired_credentials() {
+        let file = CredentialFile::new();
+        cached_reader(&file).refresh(&file.0, NOW, |_, _| Ok(report()));
+        file.write("new-account-token", NOW + 3600);
+        let mut restarted = cached_reader(&file);
+        restarted.prepare_refresh(&file.0, NOW + 30).unwrap();
+        assert!(restarted.snapshot.windows.is_empty());
+        assert_eq!(restarted.snapshot.status, UsageStatus::Loading);
+        file.write("test-access-token", NOW + 3600);
+        let mut expired = cached_reader(&file);
+        assert!(expired.prepare_refresh(&file.0, NOW + 3600).is_none());
+        assert_eq!(expired.snapshot.status, UsageStatus::SignInRequired);
+        assert!(expired.snapshot.windows.is_empty());
+        assert!(!file.0.with_extension("cache.json").exists());
+    }
+
+    #[test]
+    fn restored_reports_keep_their_age_and_expired_windows_do_not_refill() {
+        let file = CredentialFile::new();
+        file.write("test-access-token", NOW + 7200);
+        cached_reader(&file).refresh(&file.0, NOW, |_, _| {
+            let mut snapshot = report();
+            snapshot.windows[0].resets_at = Some(NOW + 100);
+            Ok(snapshot)
+        });
+        let mut restarted = cached_reader(&file);
+        restarted.prepare_refresh(&file.0, NOW + 120).unwrap();
+        assert_eq!(restarted.snapshot.status, UsageStatus::Stale);
+        assert!(restarted.snapshot.windows[0].is_stale);
+        assert_eq!(restarted.snapshot.windows[0].remaining_percent, 92.0);
+        assert_eq!(restarted.snapshot.updated_at, Some(NOW));
+        restarted.prepare_refresh(&file.0, NOW + 1200).unwrap();
+        assert!(
+            restarted
+                .snapshot
+                .windows
+                .iter()
+                .all(|window| window.is_stale)
+        );
     }
 
     /// Explicit, uncharged integration check. Never included in normal tests;

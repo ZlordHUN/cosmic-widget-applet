@@ -1,0 +1,109 @@
+{
+  "upstream_revision": "fdd19749b9389f0b4e00d55584b083a7ab2deded",
+  "frame_size": 128,
+  "frame_ms": 50,
+  "icons": {
+    "clear-day": {
+      "columns": 12,
+      "rows": 11,
+      "frames": 125,
+      "frame_ms": 45,
+      "source_sha256": "05ec57e3bf50c723dd83849e24de2ddd91ee49fb7c72c3a80e4061eb723cacde",
+      "duration_changes": {}
+    },
+    "clear-night": {
+      "columns": 15,
+      "rows": 14,
+      "frames": 200,
+      "frame_ms": 50,
+      "source_sha256": "44e47e47c96c54501f577da9294014414a2f716ee0f6fa63a44f981be79337d2",
+      "duration_changes": {}
+    },
+    "partly-cloudy-day": {
+      "columns": 12,
+      "rows": 11,
+      "frames": 125,
+      "frame_ms": 45,
+      "source_sha256": "a38dc435238bbce7a7e3126813b12c25d37d4a4c18623f41e96641c61030736a",
+      "duration_changes": {}
+    },
+    "partly-cloudy-night": {
+      "columns": 15,
+      "rows": 14,
+      "frames": 200,
+      "frame_ms": 50,
+      "source_sha256": "8de411e16d819233af89f134da8524fd5cf6b3185123aeb36588d904c653e6eb",
+      "duration_changes": {}
+    },
+    "overcast": {
+      "columns": 12,
+      "rows": 12,
+      "frames": 140,
+      "frame_ms": 50,
+      "source_sha256": "1503a8ba3c992ffdfa426dd044659a92a74a03801e674a6d6551585447bc1d47",
+      "duration_changes": {}
+    },
+    "rain": {
+      "columns": 4,
+      "rows": 4,
+      "frames": 14,
+      "frame_ms": 50,
+      "source_sha256": "e548655cfe76a605bc4cf35986dbb054ee7a87b58078dad32ce00ab808f872c6",
+      "duration_changes": {}
+    },
+    "partly-cloudy-day-rain": {
+      "columns": 12,
+      "rows": 12,
+      "frames": 140,
+      "frame_ms": 50,
+      "source_sha256": "8411b5b7e4135e0c943b657932bf19afb0161b6c453c9e55734b88a5c1f66686",
+      "duration_changes": {
+        "45s": "56s"
+      }
+    },
+    "partly-cloudy-night-rain": {
+      "columns": 14,
+      "rows": 14,
+      "frames": 196,
+      "frame_ms": 50,
+      "source_sha256": "860252e3eebb101da2c81e4cd83b88a6cfbbcff01ddfd2b264d0638b6b46a4ae",
+      "duration_changes": {
+        "10s": "9.8s"
+      }
+    },
+    "thunderstorms": {
+      "columns": 7,
+      "rows": 6,
+      "frames": 40,
+      "frame_ms": 50,
+      "source_sha256": "e6fd65a4d7c7569de2af6581685a1dbdb61066d5e9f548239ed6de9b0c0fcdb5",
+      "duration_changes": {}
+    },
+    "snow": {
+      "columns": 13,
+      "rows": 13,
+      "frames": 160,
+      "frame_ms": 50,
+      "source_sha256": "6c51cbcb310caa8edff9d7ea5d984d90a9a918d4796e86147ec0aa5e4a8f0ffb",
+      "duration_changes": {
+        "9s": "8s"
+      }
+    },
+    "mist": {
+      "columns": 10,
+      "rows": 10,
+      "frames": 100,
+      "frame_ms": 50,
+      "source_sha256": "408493bf944160b38121d58e8c6983cf3a93f6db22750315b07d4d49edc32a98",
+      "duration_changes": {}
+    },
+    "not-available": {
+      "columns": 1,
+      "rows": 1,
+      "frames": 1,
+      "frame_ms": 50,
+      "source_sha256": "71622bd8cd1d7a78fda6f32e4774353f848fee17b7d15101ca78bb9d41473afc",
+      "duration_changes": {}
+    }
+  }
+}

@@ -41,6 +41,8 @@ use std::time::{Duration, Instant, SystemTime};
 mod bandcamp;
 mod cider;
 mod mpris;
+mod video_artwork;
+mod video_title;
 
 const MAX_ARTWORK_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ARTWORK_DIMENSION: u32 = 4096;
@@ -238,6 +240,7 @@ impl PlayerId {
         match self {
             PlayerId::Cider => "Cider".to_string(),
             PlayerId::Emby(_) => "Emby".to_string(),
+            PlayerId::Mpris(name) if mpris::is_cosmic_player(name) => "COSMIC Player".to_string(),
             PlayerId::Mpris(name) => {
                 // Extract friendly name from D-Bus name
                 // e.g., "org.mpris.MediaPlayer2.firefox.instance_1_278" -> "Firefox"
@@ -674,18 +677,19 @@ impl TrackArtwork {
 enum ArtworkSource {
     Image(String),
     BandcampPage(String),
+    VideoFrame(String),
 }
 
 impl ArtworkSource {
     fn url(&self) -> &str {
         match self {
-            Self::Image(url) | Self::BandcampPage(url) => url,
+            Self::Image(url) | Self::BandcampPage(url) | Self::VideoFrame(url) => url,
         }
     }
 
     fn priority(&self) -> u8 {
-        // A verified album cover takes precedence over browser placeholder art.
-        u8::from(matches!(self, Self::BandcampPage(_)))
+        // Resolved covers and video frames take precedence over placeholder art.
+        u8::from(matches!(self, Self::BandcampPage(_) | Self::VideoFrame(_)))
     }
 
     async fn load(
@@ -694,6 +698,7 @@ impl ArtworkSource {
     ) -> (Option<AlbumArt>, Option<bandcamp::PageMetadata>) {
         match self {
             Self::Image(url) => (MediaMonitor::download_artwork(client, url).await, None),
+            Self::VideoFrame(url) => (video_artwork::load(url).await, None),
             Self::BandcampPage(url) => {
                 let Some(page) = bandcamp::page_url(url) else {
                     return (None, None);
@@ -1291,6 +1296,7 @@ impl MediaMonitor {
 
                 let raw_track = TrackSignature::from(&info);
                 raw_mpris_tracks.insert(player_id.clone(), raw_track.clone());
+                mpris::apply_cosmic_player_metadata(&bus_name, &mut info);
                 Self::apply_bandcamp_metadata(
                     &bus_name,
                     &mut info,
@@ -1820,6 +1826,11 @@ impl MediaMonitor {
 
     fn artwork_candidate_sources(info: &MediaInfo) -> Vec<ArtworkSource> {
         let mut sources = Vec::new();
+        if let Some(url) = info.media_url.as_deref()
+            && video_title::local_video_path(url).is_some()
+        {
+            sources.push(ArtworkSource::VideoFrame(url.to_string()));
+        }
         if let Some(page) = info.media_url.as_deref().and_then(bandcamp::page_url) {
             sources.push(ArtworkSource::BandcampPage(page.to_string()));
         }
@@ -2220,26 +2231,49 @@ impl MediaMonitor {
 
     /// Seek to position based on progress (0.0 to 1.0).
     pub fn seek_to_progress(&self, progress: f64) -> bool {
+        self.seek_with(|info| {
+            (info.duration > 0 && progress.is_finite())
+                .then(|| (info.duration as f64 * progress.clamp(0.0, 1.0)) as u64)
+        })
+    }
+
+    /// Move the selected player's position by a signed number of milliseconds.
+    pub fn seek_relative(&self, offset_ms: i64) -> bool {
+        self.seek_with(|info| Some(info.position.saturating_add_signed(offset_ms)))
+    }
+
+    fn seek_with(&self, target: impl FnOnce(&MediaInfo) -> Option<u64>) -> bool {
         let mut state = self.player_state.lock().unwrap();
         let current_index = state.current_index;
-        if let Some((player_id, info)) = state.players.get_mut(current_index) {
-            let player_id = player_id.clone();
-            let target_ms = (info.duration as f64 * progress.clamp(0.0, 1.0)) as u64;
-            info.position = target_ms;
-            drop(state);
-
-            match &player_id {
-                PlayerId::Cider => self.cider_seek(target_ms as f64 / 1000.0),
-                PlayerId::Emby(session_id) => self.send_emby_playstate_command(
-                    session_id,
-                    "Seek",
-                    Some(("SeekPositionTicks", target_ms.saturating_mul(10_000))),
-                ),
-                PlayerId::Mpris(bus_name) => self.mpris_seek(bus_name, target_ms * 1000),
-            }
-        } else {
-            false
+        let Some((player_id, info)) = state.players.get_mut(current_index) else {
+            return false;
+        };
+        if !info.can_seek {
+            return false;
         }
+        let Some(target_ms) = target(info) else {
+            return false;
+        };
+        let target_ms = if info.duration > 0 {
+            target_ms.min(info.duration)
+        } else {
+            target_ms
+        };
+        let enqueued = match player_id {
+            PlayerId::Cider => self.cider_seek(target_ms as f64 / 1000.0),
+            PlayerId::Emby(session_id) => self.send_emby_playstate_command(
+                session_id,
+                "Seek",
+                Some(("SeekPositionTicks", target_ms.saturating_mul(10_000))),
+            ),
+            PlayerId::Mpris(bus_name) => self.mpris_seek(bus_name, target_ms.saturating_mul(1000)),
+        };
+        if enqueued {
+            // Update while holding the selection lock so repeated clicks add up
+            // immediately and a rejected command never moves the local timeline.
+            info.position = target_ms;
+        }
+        enqueued
     }
 
     // ========================================================================

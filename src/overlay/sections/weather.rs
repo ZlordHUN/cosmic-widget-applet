@@ -2,9 +2,9 @@
 
 use crate::monitors::weather::WeatherData;
 use crate::overlay::Message;
-use crate::overlay::components::section::section;
+use crate::overlay::components::{section::section, weather_icon::weather_icon};
 use crate::overlay::stats::SystemSnapshot;
-use cosmic::iced::{Alignment, Background, Border, Color, ContentFit, Length};
+use cosmic::iced::{Alignment, Background, Border, Color, Length};
 use cosmic::{Element, theme, widget};
 
 pub(in crate::overlay) fn weather_view<'a>(
@@ -48,19 +48,8 @@ fn weather_content<'a>(
     widget::row::with_capacity(2)
         .align_y(Alignment::Center)
         .spacing(content_spacing)
-        .push(weather_condition_icon(&data.icon))
+        .push(weather_icon(&data.icon))
         .push(details)
-        .into()
-}
-
-fn weather_condition_icon(icon: &str) -> Element<'static, Message> {
-    let mut handle = widget::icon::from_name(weather_icon_name(icon)).handle();
-    handle.symbolic = true;
-    // Some theme icons are wider than they are tall (the COSMIC rain icon is 17×16).
-    // Preserve that aspect ratio so the SVG renderer does not clip them to a square.
-    widget::icon::icon(handle)
-        .size(64)
-        .content_fit(ContentFit::Contain)
         .into()
 }
 
@@ -90,21 +79,6 @@ fn feels_like_badge(value: f32) -> Element<'static, Message> {
     .into()
 }
 
-fn weather_icon_name(icon: &str) -> &'static str {
-    match icon {
-        "01d" => "weather-clear-symbolic",
-        "01n" => "weather-clear-night-symbolic",
-        "02d" => "weather-few-clouds-symbolic",
-        "02n" => "weather-few-clouds-night-symbolic",
-        "03d" | "03n" | "04d" | "04n" => "weather-overcast-symbolic",
-        "09d" | "09n" | "10d" | "10n" => "weather-showers-symbolic",
-        "11d" | "11n" => "weather-storm-symbolic",
-        "13d" | "13n" => "weather-snow-symbolic",
-        "50d" | "50n" => "weather-fog-symbolic",
-        _ => "weather-severe-alert-symbolic",
-    }
-}
-
 fn format_weather_temperature(value: f32) -> String {
     let rounded = (value * 10.0).round() / 10.0;
     if rounded.fract().abs() < f32::EPSILON {
@@ -119,11 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weather_visuals_use_cosmic_condition_icons_and_compact_units() {
-        assert_eq!(weather_icon_name("01n"), "weather-clear-night-symbolic");
-        assert_eq!(weather_icon_name("02d"), "weather-few-clouds-symbolic");
-        assert_eq!(weather_icon_name("04d"), "weather-overcast-symbolic");
-        assert_eq!(weather_icon_name("13d"), "weather-snow-symbolic");
+    fn weather_temperature_uses_compact_units() {
         assert_eq!(format_weather_temperature(3.2), "3.2\u{b0}C");
         assert_eq!(format_weather_temperature(1.0), "1\u{b0}C");
     }

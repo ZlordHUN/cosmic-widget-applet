@@ -19,6 +19,8 @@ widget-desktop-dst := base-dir / 'share' / 'applications' / appid + '.Widget.des
 settings-desktop-dst := base-dir / 'share' / 'applications' / appid + '.Settings.desktop'
 icon-dst := base-dir / 'share' / 'icons' / 'hicolor' / 'scalable' / 'apps' / appid + '.svg'
 headset-rules-dst := base-dir / 'lib' / 'udev' / 'rules.d' / '70-cosmic-widget-headsets.rules'
+meteocons-license-dst := base-dir / 'share' / 'licenses' / name / 'meteocons-LICENSE'
+material-icons-license-dst := base-dir / 'share' / 'licenses' / name / 'material-icons-LICENSE'
 
 # Default recipe which runs `just build-release`
 default: build-release
@@ -67,21 +69,67 @@ run-settings *args:
 run-iced-widget *args:
     env RUST_BACKTRACE=full cargo run --release --bin cosmic-widget-iced {{args}}
 
-# Installs files
-install:
-    install -Dm0755 {{ cargo-target-dir / 'release' / name }} {{bin-dst}}
-    install -Dm0755 {{ cargo-target-dir / 'release' / widget-source-name }} {{widget-bin-dst}}
-    install -Dm0755 {{ cargo-target-dir / 'release' / settings-name }} {{settings-bin-dst}}
-    install -Dm0644 resources/app.desktop {{desktop-dst}}
-    install -Dm0644 resources/widget.desktop {{widget-desktop-dst}}
-    install -Dm0644 resources/settings.desktop {{settings-desktop-dst}}
-    install -Dm0644 resources/app.metainfo.xml {{appdata-dst}}
-    install -Dm0644 resources/icon.svg {{icon-dst}}
-    install -Dm0644 resources/70-cosmic-widget-headsets.rules {{headset-rules-dst}}
+# Check installation inputs and build missing binaries without running Cargo as root.
+[private]
+_prepare-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for source in resources/app.desktop resources/widget.desktop resources/settings.desktop resources/app.metainfo.xml resources/icon.svg resources/70-cosmic-widget-headsets.rules assets/weather/meteocons/LICENSE assets/icons/material-design/LICENSE; do
+        if [[ ! -f "$source" ]]; then
+            printf 'Missing installation file: %s\n' "$source" >&2
+            exit 1
+        fi
+    done
+    target_dir={{ quote(cargo-target-dir) }}
+    binaries=({{ quote(name) }} {{ quote(widget-source-name) }} {{ quote(settings-name) }})
+    missing=false
+    for binary in "${binaries[@]}"; do
+        if [[ ! -x "$target_dir/release/$binary" ]]; then
+            printf 'Missing release binary: %s\n' "$target_dir/release/$binary" >&2
+            missing=true
+        fi
+    done
+    if [[ "$missing" == false ]]; then
+        exit 0
+    fi
+    build=(build --locked --release --target-dir "$target_dir")
+    for binary in "${binaries[@]}"; do
+        build+=(--bin "$binary")
+    done
+    if [[ "$EUID" == 0 ]]; then
+        if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == root ]]; then
+            printf 'Run just build-release as your normal user, then run the installation again.\n' >&2
+            exit 1
+        fi
+        printf 'Building missing release binaries as %s...\n' "$SUDO_USER"
+        sudo -H -u "$SUDO_USER" -- sh -c 'PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec cargo "$@"' sh "${build[@]}"
+    else
+        cargo "${build[@]}"
+    fi
+    for binary in "${binaries[@]}"; do
+        if [[ ! -x "$target_dir/release/$binary" ]]; then
+            printf 'Build did not produce %s\n' "$target_dir/release/$binary" >&2
+            exit 1
+        fi
+    done
+
+# Installs prebuilt files, building any missing release binaries first.
+install: _prepare-install
+    install -Dm0755 {{ quote(cargo-target-dir / 'release' / name) }} {{ quote(bin-dst) }}
+    install -Dm0755 {{ quote(cargo-target-dir / 'release' / widget-source-name) }} {{ quote(widget-bin-dst) }}
+    install -Dm0755 {{ quote(cargo-target-dir / 'release' / settings-name) }} {{ quote(settings-bin-dst) }}
+    install -Dm0644 resources/app.desktop {{ quote(desktop-dst) }}
+    install -Dm0644 resources/widget.desktop {{ quote(widget-desktop-dst) }}
+    install -Dm0644 resources/settings.desktop {{ quote(settings-desktop-dst) }}
+    install -Dm0644 resources/app.metainfo.xml {{ quote(appdata-dst) }}
+    install -Dm0644 resources/icon.svg {{ quote(icon-dst) }}
+    install -Dm0644 resources/70-cosmic-widget-headsets.rules {{ quote(headset-rules-dst) }}
+    install -Dm0644 assets/weather/meteocons/LICENSE {{ quote(meteocons-license-dst) }}
+    install -Dm0644 assets/icons/material-design/LICENSE {{ quote(material-icons-license-dst) }}
 
 # Uninstalls installed files
 uninstall:
-    rm {{bin-dst}} {{widget-bin-dst}} {{settings-bin-dst}} {{desktop-dst}} {{widget-desktop-dst}} {{settings-desktop-dst}} {{icon-dst}} {{headset-rules-dst}}
+    rm {{bin-dst}} {{widget-bin-dst}} {{settings-bin-dst}} {{desktop-dst}} {{widget-desktop-dst}} {{settings-desktop-dst}} {{icon-dst}} {{headset-rules-dst}} {{meteocons-license-dst}} {{material-icons-license-dst}}
 
 # Vendor dependencies locally
 vendor:
