@@ -212,6 +212,7 @@ mod tests {
                 updated_at: Some(NOW - 60),
                 status: UsageStatus::Stale,
                 source: Some(UsageSource::ClaudeCode),
+                credits: None,
             },
             next_request_at: NOW + 900,
             failures: 2,

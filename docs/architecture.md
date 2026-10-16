@@ -249,6 +249,15 @@ its account usage endpoint every five minutes using the existing Claude Code
 sign-in, with bounded reads, request timeouts, and retry backoff. Neither monitor
 makes inference requests or estimates allowance from token counts.
 
+Codex credit reports are parsed separately from percentage windows. Validated
+balances retain their decimal precision, and Unlimited is a distinct state.
+Credit-only reports can update the balance without replacing quota windows.
+Missing or invalid credit data is unavailable rather than an assumed zero.
+The balance has its own report timestamp and 15-minute stale threshold; an
+expired quota reset does not expire purchased credits. Only the general Codex
+account bucket supplies the shared balance; model-specific credit buckets are
+not substituted or summed.
+
 Claude saves validated quota reports and retry deadlines in a private, atomically
 replaced cache. A SHA-256 fingerprint binds each report to its access token without
 storing credentials. Restarting restores matching reports before network requests,
@@ -281,6 +290,10 @@ Provider icons, quota labels, and reset times (or their unavailable state) remai
 visible; hover details explain the source, update cadence, and original age of
 the report. Stale reports stay marked, and expired windows clear their fill while
 waiting for a fresh report instead of assuming the allowance has refilled.
+A compact ChatGPT credits row below both cards shows the shared Codex/ChatGPT
+Work balance without a percentage gauge or invented reset date. The row reserves
+space even while unavailable, and its tooltip preserves the complete balance and
+original report age.
 
 ### Animated Weather Icons
 

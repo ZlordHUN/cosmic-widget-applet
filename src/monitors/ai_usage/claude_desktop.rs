@@ -220,6 +220,7 @@ impl DesktopUsageReader {
                 UsageStatus::Available
             },
             source: Some(UsageSource::ClaudeDesktop),
+            credits: None,
         })
     }
 

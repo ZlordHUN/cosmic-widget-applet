@@ -2,7 +2,8 @@
 
 //! Read the account quota snapshots that Codex records after server responses.
 //!
-//! These percentages come from `token_count.rate_limits`, not token estimates.
+//! Quota percentages and purchased credit balances come from
+//! `token_count.rate_limits`, not token estimates.
 //! Session files stay local and read-only; credentials and conversation content
 //! are never sent anywhere. Only a bounded tail of recently modified files is
 //! read, and unchanged files are skipped. An old snapshot remains explicitly
@@ -17,7 +18,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use super::{UsageSnapshot, UsageStatus, UsageWindow};
+use super::{CreditBalance, UsageCredits, UsageSnapshot, UsageStatus, UsageWindow};
 use serde::Deserialize;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -139,8 +140,12 @@ struct RateLimits {
     #[serde(default = "default_limit_id")]
     limit_id: String,
     limit_name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_window")]
     primary: Option<RateWindow>,
+    #[serde(default, deserialize_with = "deserialize_window")]
     secondary: Option<RateWindow>,
+    #[serde(default, deserialize_with = "deserialize_credits")]
+    credits: CreditUpdate,
 }
 
 fn default_limit_id() -> String {
@@ -163,6 +168,69 @@ impl RateWindow {
     }
 }
 
+fn deserialize_window<'de, D>(deserializer: D) -> Result<Option<RateWindow>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<RateWindow>(value)
+        .ok()
+        .filter(RateWindow::is_valid))
+}
+
+#[derive(Debug, Clone, Default)]
+struct CreditUpdate {
+    present: bool,
+    balance: Option<CreditBalance>,
+}
+
+fn deserialize_credits<'de, D>(deserializer: D) -> Result<CreditUpdate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(CreditUpdate {
+        present: true,
+        balance: parse_credit_balance(&value),
+    })
+}
+
+fn parse_credit_balance(value: &serde_json::Value) -> Option<CreditBalance> {
+    let has_credits = value.get("has_credits")?.as_bool()?;
+    if value.get("unlimited")?.as_bool()? {
+        return Some(CreditBalance::Unlimited);
+    }
+    let amount = value.get("balance")?.as_str()?;
+    // Bound the UI value and accept only nonnegative decimal amounts. Avoid
+    // parsing through f64: balances may contain more precision than it retains.
+    if amount.is_empty() || amount.len() > 64 {
+        return None;
+    }
+    let mut parts = amount.split('.');
+    let integer = parts.next()?;
+    let decimal = parts.next();
+    if integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || decimal
+            .is_some_and(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    let nonzero = amount.bytes().any(|byte| matches!(byte, b'1'..=b'9'));
+    if nonzero && !has_credits {
+        return None;
+    }
+    Some(CreditBalance::Amount(amount.to_owned()))
+}
+
+#[derive(Debug, Clone)]
+struct CreditRecord {
+    updated_at: i64,
+    recorded_at_millis: i64,
+    balance: Option<CreditBalance>,
+}
+
 #[derive(Debug, Clone)]
 struct QuotaRecord {
     updated_at: i64,
@@ -180,6 +248,7 @@ struct FileStamp {
 struct SessionReader {
     files: HashMap<PathBuf, FileStamp>,
     latest: BTreeMap<String, QuotaRecord>,
+    latest_credits: BTreeMap<String, CreditRecord>,
 }
 
 impl SessionReader {
@@ -201,12 +270,17 @@ impl SessionReader {
                     if record.updated_at > now + 5 * 60 {
                         continue;
                     }
+                    merge_credit_record(&mut self.latest_credits, &record);
                     merge_record(&mut self.latest, record);
                 }
                 self.files.insert(path, stamp);
             }
         }
-        snapshot_from_records(self.latest.values(), now)
+        with_credits(
+            snapshot_from_records(self.latest.values(), now),
+            &self.latest_credits,
+            now,
+        )
     }
 }
 
@@ -259,13 +333,11 @@ fn records_from_tail(bytes: &[u8]) -> Vec<QuotaRecord> {
             if event.event_type != "event_msg" || event.payload.event_type != "token_count" {
                 return None;
             }
-            let mut limits = event.payload.rate_limits?;
+            let limits = event.payload.rate_limits?;
             if limits.limit_id.trim().is_empty() {
                 return None;
             }
-            limits.primary = limits.primary.filter(RateWindow::is_valid);
-            limits.secondary = limits.secondary.filter(RateWindow::is_valid);
-            if limits.primary.is_none() && limits.secondary.is_none() {
+            if limits.primary.is_none() && limits.secondary.is_none() && !limits.credits.present {
                 return None;
             }
             let timestamp = chrono::DateTime::parse_from_rfc3339(&event.timestamp).ok()?;
@@ -279,6 +351,10 @@ fn records_from_tail(bytes: &[u8]) -> Vec<QuotaRecord> {
 }
 
 fn merge_record(records: &mut BTreeMap<String, QuotaRecord>, record: QuotaRecord) {
+    // Credit-only responses must not discard the last genuine quota report.
+    if record.limits.primary.is_none() && record.limits.secondary.is_none() {
+        return;
+    }
     let id = record.limits.limit_id.clone();
     if records
         .get(&id)
@@ -286,6 +362,46 @@ fn merge_record(records: &mut BTreeMap<String, QuotaRecord>, record: QuotaRecord
     {
         records.insert(id, record);
     }
+}
+
+fn merge_credit_record(records: &mut BTreeMap<String, CreditRecord>, record: &QuotaRecord) {
+    let id = &record.limits.limit_id;
+    if records
+        .get(id)
+        .is_none_or(|previous| previous.recorded_at_millis <= record.recorded_at_millis)
+    {
+        // A newer unavailable balance clears the old one. Missing, malformed,
+        // and explicit null reports must never be mistaken for zero credits.
+        records.insert(
+            id.clone(),
+            CreditRecord {
+                updated_at: record.updated_at,
+                recorded_at_millis: record.recorded_at_millis,
+                balance: record.limits.credits.balance.clone(),
+            },
+        );
+    }
+}
+
+fn with_credits(
+    mut snapshot: UsageSnapshot,
+    records: &BTreeMap<String, CreditRecord>,
+    now: i64,
+) -> UsageSnapshot {
+    // Only the general account bucket establishes this shared credit pool.
+    // Model-specific balances must not substitute for, override, or add to it.
+    let record = records.get("codex");
+    if let Some(record) = record {
+        if let Some(balance) = &record.balance {
+            let is_stale = now.saturating_sub(record.updated_at) > STALE_AFTER_SECS;
+            snapshot.credits = Some(UsageCredits {
+                balance: balance.clone(),
+                updated_at: record.updated_at,
+                is_stale,
+            });
+        }
+    }
+    snapshot
 }
 
 fn window_label(minutes: Option<i64>, fallback: &str) -> String {
@@ -483,8 +599,14 @@ mod tests {
 
     #[test]
     fn invalid_percentage_or_unrelated_event_cannot_become_quota() {
-        assert!(records_from_tail(&event(NOW, weekly(101.0))).is_empty());
-        assert!(records_from_tail(&event(NOW, weekly(-1.0))).is_empty());
+        for used in [101.0, -1.0] {
+            let records = records_from_tail(&event(NOW, weekly(used)));
+            assert!(
+                snapshot_from_records(records.iter(), NOW)
+                    .windows
+                    .is_empty()
+            );
+        }
         let unrelated = String::from_utf8(event(NOW, weekly(83.0)))
             .unwrap()
             .replace("event_msg", "response_item");
@@ -551,6 +673,255 @@ mod tests {
         assert_eq!(fresh.windows[0].remaining_percent, 16.0);
         assert_eq!(fresh.status, UsageStatus::Available);
         assert_eq!(reader.refresh(&directory.0, NOW + 1), fresh);
+    }
+
+    fn credit_report(balance: serde_json::Value) -> serde_json::Value {
+        json!({
+            "limit_id": "codex",
+            "credits": { "has_credits": true, "unlimited": false, "balance": balance }
+        })
+    }
+
+    fn snapshot_from_events(bytes: &[u8], now: i64) -> UsageSnapshot {
+        let mut quotas = BTreeMap::new();
+        let mut credits = BTreeMap::new();
+        for record in records_from_tail(bytes) {
+            merge_credit_record(&mut credits, &record);
+            merge_record(&mut quotas, record);
+        }
+        with_credits(snapshot_from_records(quotas.values(), now), &credits, now)
+    }
+
+    #[test]
+    fn credit_amounts_preserve_exact_decimal_precision_and_explicit_zero() {
+        for amount in [
+            "0",
+            "0.000",
+            "127.50",
+            "12345678901234567890.12345678901234567890",
+        ] {
+            let mut report = credit_report(json!(amount));
+            report["credits"]["has_credits"] =
+                json!(amount.bytes().any(|byte| matches!(byte, b'1'..=b'9')));
+            let snapshot = snapshot_from_events(&event(NOW, report), NOW);
+            assert_eq!(
+                snapshot.credits,
+                Some(UsageCredits {
+                    balance: CreditBalance::Amount(amount.into()),
+                    updated_at: NOW,
+                    is_stale: false,
+                })
+            );
+            // Credit availability does not imply subscription quota data.
+            assert!(snapshot.windows.is_empty());
+            assert_eq!(snapshot.status, UsageStatus::Unavailable);
+            assert_eq!(snapshot.updated_at, None);
+        }
+        let snapshot = snapshot_from_events(
+            &event(
+                NOW,
+                json!({
+                    "credits": { "has_credits": true, "unlimited": true, "balance": null }
+                }),
+            ),
+            NOW,
+        );
+        assert_eq!(snapshot.credits.unwrap().balance, CreditBalance::Unlimited);
+    }
+
+    #[test]
+    fn missing_and_malformed_credit_values_preserve_valid_quota_windows() {
+        let mut invalid_values = vec![
+            json!(null),
+            json!(false),
+            json!("75"),
+            json!({}),
+            json!({ "has_credits": false, "unlimited": false }),
+            json!({ "has_credits": "true", "unlimited": false, "balance": "75" }),
+            json!({ "has_credits": false, "unlimited": false, "balance": "75" }),
+        ];
+        for amount in [
+            json!(75),
+            json!(-1),
+            json!(null),
+            json!(""),
+            json!("-1"),
+            json!("NaN"),
+            json!("Infinity"),
+            json!("1e3"),
+            json!("1,000"),
+            json!(" 1"),
+            json!(".5"),
+            json!("1."),
+            json!("1.2.3"),
+            json!("１２"),
+            json!("1".repeat(65)),
+        ] {
+            invalid_values
+                .push(json!({ "has_credits": true, "unlimited": false, "balance": amount }));
+        }
+        for value in invalid_values {
+            let mut report = weekly(25.0);
+            report["credits"] = value;
+            let snapshot = snapshot_from_events(&event(NOW, report), NOW);
+            assert_eq!(snapshot.windows[0].remaining_percent, 75.0);
+            assert_eq!(snapshot.status, UsageStatus::Available);
+            assert_eq!(snapshot.credits, None);
+        }
+        let mut missing = weekly(25.0);
+        missing.as_object_mut().unwrap().remove("credits");
+        let snapshot = snapshot_from_events(&event(NOW, missing), NOW);
+        assert_eq!(snapshot.windows[0].remaining_percent, 75.0);
+        assert_eq!(snapshot.credits, None);
+    }
+
+    #[test]
+    fn malformed_quota_fields_do_not_hide_valid_credit_balances() {
+        let mut report = credit_report(json!("30.25"));
+        report["primary"] = json!({ "used_percent": "invalid" });
+        report["secondary"] = json!("not a quota");
+        let snapshot = snapshot_from_events(&event(NOW, report), NOW);
+        assert!(snapshot.windows.is_empty());
+        assert_eq!(
+            snapshot.credits.unwrap().balance,
+            CreditBalance::Amount("30.25".into())
+        );
+    }
+
+    #[test]
+    fn credit_only_updates_preserve_quota_timestamp_and_independent_freshness() {
+        let old = NOW - STALE_AFTER_SECS - 1;
+        let mut quota = weekly(75.0);
+        quota["primary"]["resets_at"] = json!(NOW - 1);
+        let mut bytes = event(old, quota);
+        bytes.extend(event(NOW, credit_report(json!("12.345"))));
+        let snapshot = snapshot_from_events(&bytes, NOW);
+        assert_eq!(snapshot.updated_at, Some(old));
+        assert_eq!(snapshot.windows[0].updated_at, old);
+        assert_eq!(snapshot.windows[0].remaining_percent, 25.0);
+        assert_eq!(snapshot.status, UsageStatus::Stale);
+        let credits = snapshot.credits.unwrap();
+        assert_eq!(credits.updated_at, NOW);
+        assert!(!credits.is_stale);
+        assert_eq!(credits.balance, CreditBalance::Amount("12.345".into()));
+
+        let expired = snapshot_from_events(&bytes, NOW + STALE_AFTER_SECS + 1);
+        let credits = expired.credits.unwrap();
+        assert!(credits.is_stale);
+        assert_eq!(credits.balance, CreditBalance::Amount("12.345".into()));
+    }
+
+    #[test]
+    fn newer_unavailable_credits_clear_old_balance_without_erasing_quotas() {
+        let mut missing = weekly(40.0);
+        missing.as_object_mut().unwrap().remove("credits");
+        for report in [
+            missing,
+            json!({ "credits": null }),
+            json!({ "credits": {} }),
+            credit_report(json!("bad")),
+        ] {
+            let mut bytes = event(NOW - 2, weekly(70.0));
+            bytes.extend(event(NOW - 1, credit_report(json!("60"))));
+            bytes.extend(event(NOW, report));
+            // Late reading of an older file must not restore the old amount.
+            bytes.extend(event(NOW - 1, credit_report(json!("60"))));
+            let snapshot = snapshot_from_events(&bytes, NOW);
+            assert_eq!(snapshot.windows.len(), 1);
+            assert_eq!(snapshot.credits, None);
+        }
+    }
+
+    #[test]
+    fn general_credit_reports_keep_subsecond_order_without_model_substitution() {
+        let mut general: serde_json::Value =
+            serde_json::from_slice(&event(NOW, credit_report(json!("50")))).unwrap();
+        let mut specialized = general.clone();
+        specialized["payload"]["rate_limits"]["limit_id"] = json!("codex_other");
+        specialized["payload"]["rate_limits"]["credits"]["balance"] = json!("40");
+        general["timestamp"] = json!("2026-09-24T12:00:00.100Z");
+        specialized["timestamp"] = general["timestamp"].clone();
+        let join = |first: &serde_json::Value, second: &serde_json::Value| {
+            let mut bytes = serde_json::to_vec(first).unwrap();
+            bytes.push(b'\n');
+            bytes.extend(serde_json::to_vec(second).unwrap());
+            bytes
+        };
+        for bytes in [join(&general, &specialized), join(&specialized, &general)] {
+            assert_eq!(
+                snapshot_from_events(&bytes, NOW).credits.unwrap().balance,
+                CreditBalance::Amount("50".into())
+            );
+        }
+        specialized["timestamp"] = json!("2026-09-24T12:00:00.900Z");
+        assert_eq!(
+            snapshot_from_events(&join(&specialized, &general), NOW)
+                .credits
+                .unwrap()
+                .balance,
+            CreditBalance::Amount("50".into())
+        );
+        assert_eq!(
+            snapshot_from_events(&serde_json::to_vec(&specialized).unwrap(), NOW).credits,
+            None
+        );
+        specialized["payload"]["rate_limits"]["credits"] = json!(null);
+        assert_eq!(
+            snapshot_from_events(&join(&specialized, &general), NOW)
+                .credits
+                .unwrap()
+                .balance,
+            CreditBalance::Amount("50".into())
+        );
+        let mut newer_general = general.clone();
+        newer_general["timestamp"] = json!("2026-09-24T12:00:00.900Z");
+        newer_general["payload"]["rate_limits"]["credits"]["balance"] = json!("40");
+        assert_eq!(
+            snapshot_from_events(&join(&newer_general, &general), NOW)
+                .credits
+                .unwrap()
+                .balance,
+            CreditBalance::Amount("40".into())
+        );
+        newer_general["payload"]["rate_limits"]["credits"] = json!(null);
+        assert_eq!(
+            snapshot_from_events(&join(&newer_general, &general), NOW).credits,
+            None
+        );
+    }
+
+    #[test]
+    fn old_saved_snapshots_without_credits_still_deserialize() {
+        let snapshot = UsageSnapshot::default();
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("credits").is_none());
+        assert_eq!(
+            serde_json::from_value::<UsageSnapshot>(json).unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    #[ignore = "Reads only local Codex credit reports; run explicitly for a local smoke check"]
+    fn local_codex_credit_snapshot() {
+        let path = codex_home().expect("Codex home directory").join("sessions");
+        let now = chrono::Utc::now().timestamp();
+        let mut reader = SessionReader::default();
+        let snapshot = reader.refresh(&path, now);
+        // Only validated credit fields and report age, never raw event content.
+        match snapshot.credits {
+            Some(credits) => println!(
+                "credits={:?}, age_seconds={}, stale={}",
+                credits.balance,
+                now.saturating_sub(credits.updated_at),
+                credits.is_stale
+            ),
+            None => println!("credits=unavailable"),
+        }
+        assert!(
+            !reader.latest_credits.is_empty(),
+            "No local Codex rate-limit report found"
+        );
     }
 
     #[test]

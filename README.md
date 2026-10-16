@@ -96,6 +96,12 @@ Only one overlay instance can run at a time.
   reported by Codex, not estimates from token counts. Usage updates after Codex
   responses; older readings are marked as last known, and elapsed reset times
   wait for a new report.
+- ChatGPT credits appear below the allowance cards as the reported remaining
+  balance (or Unlimited). These credits are shared by Codex and ChatGPT Work;
+  they are separate from the subscription's percentage allowances. The widget
+  reads them from the same local Codex reports, with no extra network requests.
+  Zero is shown only when reported; missing balances remain unavailable. Credit
+  reports older than 15 minutes are marked stale, and hovering shows their age.
 - Claude usage shows the five-hour and weekly allowances shared across Claude
   Desktop, web, and Claude Code. An available Claude Code sign-in provides account
   reports with reset times every five minutes, with backoff on request failures.
@@ -110,8 +116,8 @@ Only one overlay instance can run at a time.
   unavailable. The original report age remains in the tooltip, and readings become
   stale after 20 minutes. Reports from a logged-out Desktop session are ignored.
   Sign in through Claude Desktop or Claude Code if the widget asks; it does not
-  refresh or modify your credentials or make
-  inference requests. Expired windows wait for a fresh report.
+  refresh or modify your credentials or make inference requests. Expired windows
+  wait for a fresh report.
 
 Toggle or reorder **AI Usage** in the widget settings. Turning it off pauses both
 usage monitors. No browser extension is needed.

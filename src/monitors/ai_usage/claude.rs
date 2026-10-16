@@ -320,6 +320,7 @@ pub(super) fn parse_usage(bytes: &[u8], now: i64) -> Option<UsageSnapshot> {
         updated_at: Some(now),
         status,
         source: Some(UsageSource::ClaudeCode),
+        credits: None,
     })
 }
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::monitors::ai_usage::{UsageSnapshot, UsageSource, UsageStatus, UsageWindow};
+use crate::monitors::ai_usage::{
+    CreditBalance, UsageSnapshot, UsageSource, UsageStatus, UsageWindow,
+};
 use crate::overlay::Message;
 use crate::overlay::components::gauge;
 use crate::overlay::components::section::{CARD_SPACING, CARD_VERTICAL_PADDING};
@@ -15,6 +17,7 @@ const CARD_PADDING: u16 = 10;
 const PROVIDER_SPACING: u16 = 12;
 const WINDOW_HEIGHT: f32 = 56.0;
 const WINDOW_SPACING: u16 = 14;
+const CREDITS_HEIGHT: f32 = HEADING_HEIGHT + 2.0 * CARD_PADDING as f32;
 
 fn card_body_height(codex: &UsageSnapshot, claude: &UsageSnapshot) -> f32 {
     // Keep the reference's two-row cards stable while reports load. Additional
@@ -30,6 +33,8 @@ pub(in crate::overlay) fn section_height(codex: &UsageSnapshot, claude: &UsageSn
         + HEADING_HEIGHT
         + f32::from(PROVIDER_SPACING)
         + card_body_height(codex, claude)
+        + f32::from(SECTION_SPACING)
+        + CREDITS_HEIGHT
         + 2.0 * f32::from(CARD_VERTICAL_PADDING)
         + f32::from(CARD_SPACING)
 }
@@ -123,10 +128,11 @@ pub(in crate::overlay) fn view<'a>(
             use_24hour_time,
             body_height,
         ));
-    widget::column::with_capacity(2)
+    widget::column::with_capacity(3)
         .spacing(SECTION_SPACING)
         .push(heading)
         .push(cards)
+        .push(credits_row(codex, now))
         .into()
 }
 
@@ -161,24 +167,110 @@ fn provider_card<'a>(
     )
     .width(Length::FillPortion(1))
     .padding(CARD_PADDING)
-    .class(theme::Container::custom(|theme| {
-        let foreground: Color = theme.current_container().on.into();
-        cosmic::iced::widget::container::Style {
-            background: Some(Background::Color(Color {
-                a: 0.035,
+    .class(theme::Container::custom(provider_surface))
+    .into()
+}
+
+fn provider_surface(theme: &cosmic::Theme) -> cosmic::iced::widget::container::Style {
+    let foreground: Color = theme.current_container().on.into();
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(Color {
+            a: 0.035,
+            ..foreground
+        })),
+        border: Border {
+            color: Color {
+                a: 0.12,
                 ..foreground
-            })),
-            border: Border {
-                color: Color {
-                    a: 0.12,
-                    ..foreground
-                },
-                width: 1.0,
-                radius: 16.0.into(),
             },
-            ..Default::default()
+            width: 1.0,
+            radius: 16.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+struct CreditDetails {
+    value: String,
+    stale: bool,
+    tooltip: String,
+}
+
+fn credit_details(usage: &UsageSnapshot, now: DateTime<Local>) -> CreditDetails {
+    let Some(credits) = &usage.credits else {
+        return CreditDetails {
+            value: if usage.status == UsageStatus::Loading { "Loading…" } else { "—" }.into(),
+            stale: false,
+            tooltip: "ChatGPT credit balance unavailable.\nAppears when Codex saves an account usage report that includes credits.".into(),
+        };
+    };
+    let (value, balance) = match &credits.balance {
+        CreditBalance::Amount(amount) => {
+            // Strip decimal padding without rounding away any reported credit.
+            let display = if amount.contains('.') {
+                amount.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                amount.as_str()
+            };
+            (
+                format!("{display} left"),
+                format!("{amount} credits remaining"),
+            )
         }
-    }))
+        CreditBalance::Unlimited => ("Unlimited".into(), "Unlimited credits".into()),
+    };
+    CreditDetails {
+        value,
+        stale: credits.is_stale,
+        tooltip: format!(
+            "ChatGPT credits · {}\n{balance}\nShared by Codex and ChatGPT Work.\n{}\nUpdates from local Codex reports every 30 seconds.",
+            if credits.is_stale {
+                "Last known balance"
+            } else {
+                "Reported balance"
+            },
+            report_age(Some(credits.updated_at), now.timestamp()),
+        ),
+    }
+}
+
+fn credits_row(usage: &UsageSnapshot, now: DateTime<Local>) -> Element<'static, Message> {
+    let details = credit_details(usage, now);
+    let mut icon = widget::icon::from_svg_bytes(Provider::Codex.icon());
+    icon.symbolic = true;
+    let mut row = widget::row::with_capacity(4)
+        .width(Length::Fill)
+        .height(HEADING_HEIGHT)
+        .align_y(Alignment::Center)
+        .spacing(8)
+        .push(
+            widget::icon::icon(icon)
+                .size(18)
+                .content_fit(ContentFit::Contain),
+        )
+        .push(widget::text::caption_heading("ChatGPT credits").size(12));
+    if details.stale {
+        row = row.push(widget::text::caption("Stale").size(10));
+    }
+    row = row.push(
+        widget::text::body(details.value)
+            .size(13)
+            .width(Length::Fill)
+            .align_x(cosmic::iced::alignment::Horizontal::Right)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            )),
+    );
+    widget::tooltip(
+        widget::container(row)
+            .width(Length::Fill)
+            .height(CREDITS_HEIGHT)
+            .padding(CARD_PADDING)
+            .class(theme::Container::custom(provider_surface)),
+        widget::text::caption(details.tooltip),
+        widget::tooltip::Position::Top,
+    )
     .into()
 }
 
@@ -499,6 +591,7 @@ mod tests {
             updated_at: Some(now.timestamp() - 300),
             status: UsageStatus::Available,
             source: Some(UsageSource::ClaudeCode),
+            credits: None,
         };
         let mut renderer =
             <Renderer as renderer::Headless>::new(Font::default(), Pixels(14.0), Some("tiny-skia"))
@@ -517,6 +610,12 @@ mod tests {
             "meters",
             "meters-circular",
             "meters-charging",
+            "credits",
+            "credits-zero",
+            "credits-unlimited",
+            "credits-stale",
+            "credits-unavailable",
+            "credits-long",
         ] {
             match case {
                 "available" => {
@@ -549,6 +648,34 @@ mod tests {
                     }
                 }
                 _ => {}
+            }
+            if case.starts_with("credits") {
+                codex = UsageSnapshot {
+                    windows: vec![window("Weekly", 0.0, Some(now.timestamp() + 86400))],
+                    status: UsageStatus::Available,
+                    credits: if case == "credits-unavailable" {
+                        None
+                    } else {
+                        Some(crate::monitors::ai_usage::UsageCredits {
+                            balance: match case {
+                                "credits-unlimited" => CreditBalance::Unlimited,
+                                "credits-zero" => CreditBalance::Amount("0".into()),
+                                "credits-long" => CreditBalance::Amount(
+                                    "123456789012345678901234567890.123456789".into(),
+                                ),
+                                _ => CreditBalance::Amount("12345.6789010000".into()),
+                            },
+                            updated_at: now.timestamp()
+                                - if case == "credits-stale" { 1800 } else { 300 },
+                            is_stale: case == "credits-stale",
+                        })
+                    },
+                    ..Default::default()
+                };
+                claude.source = Some(UsageSource::ClaudeCode);
+                for window in &mut claude.windows {
+                    window.resets_at = Some(now.timestamp() + 3600);
+                }
             }
             let theme = if case.starts_with("bars-") || case.starts_with("meters") {
                 cosmic::theme::system_preference()
@@ -685,6 +812,16 @@ mod tests {
             );
             let height = node.size().height.ceil() as u32;
             assert!(height > 32 && height < 4096);
+            if case.starts_with("credits") {
+                // Preview adds 32px outer padding; section_height includes an
+                // 8px inter-section gap that is not part of the rendered card.
+                let expected = section_height(&codex, &claude) - f32::from(CARD_SPACING) + 32.0;
+                assert!(
+                    (node.size().height - expected).abs() < 1.0,
+                    "{case}: rendered {}, reserved {expected}",
+                    node.size().height
+                );
+            }
             let viewport = Rectangle::with_size(Size::new(370.0, height as f32));
             renderer.reset(viewport);
             let foreground: Color = theme.current_container().on.into();
@@ -740,6 +877,60 @@ mod tests {
             image::save_buffer(&path, &pixels, 370, height, image::ColorType::Rgba8).unwrap();
             println!("AI_USAGE_PREVIEW {path} 370x{height}");
         }
+    }
+
+    #[test]
+    fn credits_preserve_exact_balances_and_distinguish_unavailable_and_unlimited() {
+        let now = DateTime::from_timestamp(2_000_000_000, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let mut usage = UsageSnapshot::default();
+        assert_eq!(credit_details(&usage, now).value, "—");
+        for amount in ["0", "0.0001", "12345678901234567890.123456789"] {
+            usage.credits = Some(crate::monitors::ai_usage::UsageCredits {
+                balance: CreditBalance::Amount(amount.into()),
+                updated_at: now.timestamp() - 300,
+                is_stale: false,
+            });
+            let details = credit_details(&usage, now);
+            assert_eq!(details.value, format!("{amount} left"));
+            assert!(details.tooltip.contains(amount));
+            assert!(!details.tooltip.contains("Resets"));
+            assert!(!details.value.contains('%'));
+        }
+        usage.credits.as_mut().unwrap().balance = CreditBalance::Amount("12345.67890000".into());
+        let details = credit_details(&usage, now);
+        assert_eq!(details.value, "12345.6789 left");
+        assert!(details.tooltip.contains("12345.67890000"));
+        usage.credits.as_mut().unwrap().balance = CreditBalance::Amount("0.0000".into());
+        assert_eq!(credit_details(&usage, now).value, "0 left");
+        usage.credits.as_mut().unwrap().balance = CreditBalance::Unlimited;
+        assert_eq!(credit_details(&usage, now).value, "Unlimited");
+    }
+
+    #[test]
+    fn credit_freshness_is_independent_of_quota_status() {
+        let now = DateTime::from_timestamp(2_000_000_000, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let mut usage = UsageSnapshot {
+            status: UsageStatus::Stale,
+            credits: Some(crate::monitors::ai_usage::UsageCredits {
+                balance: CreditBalance::Amount("12.5".into()),
+                updated_at: now.timestamp() - 300,
+                is_stale: false,
+            }),
+            ..Default::default()
+        };
+        assert!(!credit_details(&usage, now).stale);
+        usage.status = UsageStatus::Available;
+        let credits = usage.credits.as_mut().unwrap();
+        credits.updated_at = now.timestamp() - 1800;
+        credits.is_stale = true;
+        let details = credit_details(&usage, now);
+        assert!(details.stale);
+        assert!(details.tooltip.contains("Last known balance"));
+        assert!(details.tooltip.contains("Updated 30m ago"));
     }
 
     #[test]
