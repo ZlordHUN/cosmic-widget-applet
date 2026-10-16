@@ -184,10 +184,10 @@ for partial expansion, preceding groups, taller transfer rows and the current
 scroll offset, so large groups close without an offscreen delay.
 
 Media controls and source selectors share the OS accent hover and pressed
-colors. In notifications, that accent feedback is limited to Clear all and the
-group expand/collapse arrow buttons. Notification bodies remain unhighlighted,
-while dismiss/Open controls keep their neutral theme styling. Clear all retains
-its frosted resting surface.
+colors. In notifications, Clear all, group expand/collapse arrows, and dismiss
+buttons use that accent feedback. Notification bodies remain unhighlighted,
+while Open controls keep their neutral theme styling. Clear all retains its
+frosted resting surface.
 
 ### Media
 
@@ -263,16 +263,21 @@ Desktop usage report every 30 seconds. The fallback selects the latest complete
 five-hour and seven-day record from a signed-in Desktop session, preserving its
 original timestamp. Desktop normally saves usage every 5–15 minutes; rereading
 that record does not make it newer. Reports older than 20 minutes are marked
-stale, and logged-out sessions are rejected. Desktop reports omit reset timestamps,
-so the UI shows “Desktop report” and the report age instead of a reset estimate.
+stale, and logged-out sessions are rejected. The accepted history organization
+also identifies two exact usage-response entries in Desktop's Chromium HTTP cache.
+Bounded reads validate their keys, checksums, response dates, and JSON bodies;
+unchanged files reuse parsed metadata. A current complete response supplies both
+percentages and real reset timestamps together. A newer history reading falls
+back to percentages with “Reset time unavailable”; timestamps are never guessed
+or borrowed from another report. Source and report age stay in the tooltip.
 Both sources describe the same account-wide Claude allowance. The monitor prefers
-Code account reports when available because they include reset times.
+available Code account reports, then the current Desktop report.
 
 `src/overlay/sections/ai_usage.rs` displays remaining allowance in equal-width
 Codex and Claude cards with horizontal meters. Both cards reserve two quota rows
 while loading and grow together for additional reported windows. Their rounded
 meters share styling with utilization, storage, media, and transfer progress.
-Provider icons, quota labels, and reset times (or Desktop report age) remain
+Provider icons, quota labels, and reset times (or their unavailable state) remain
 visible; hover details explain the source, update cadence, and original age of
 the report. Stale reports stay marked, and expired windows clear their fill while
 waiting for a fresh report instead of assuming the allowance has refilled.

@@ -441,14 +441,19 @@ fn notification_item<'a>(
             cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
         )
     };
-    let dismiss = widget::button::icon(widget::icon::from_name("window-close-symbolic").size(14))
+    let dismiss = widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+        .icon_size(14)
+        .class(button_style::accent_hover(|| theme::Button::Icon))
         .tooltip("Dismiss notification")
-        .width(Length::Fixed(28.0))
-        .height(Length::Fixed(28.0))
-        .padding(5)
+        .width(Length::Fixed(20.0))
+        .height(Length::Fixed(20.0))
+        .padding(3)
         .on_press_maybe((!dismissing).then_some(Message::DismissNotification {
             key: notification.identity(),
         }));
+    let dismiss = widget::container(dismiss)
+        .center_x(Length::Fixed(28.0))
+        .center_y(Length::Fixed(28.0));
     let text = widget::column::with_capacity(2)
         .width(Length::Fill)
         .spacing(0)

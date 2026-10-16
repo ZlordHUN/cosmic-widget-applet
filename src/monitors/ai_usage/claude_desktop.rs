@@ -2,6 +2,10 @@
 
 //! Read Claude Desktop's existing usage reports without accessing its credentials.
 
+mod cache;
+
+use cache::UsageCacheReader;
+
 use super::{UsageSnapshot, UsageSource, UsageStatus, UsageWindow};
 use serde::Deserialize;
 use std::fs::{self, File};
@@ -68,8 +72,9 @@ struct HistoryUsage {
     sd: Option<f64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DesktopReport {
+    organization: String,
     timestamp_ms: i64,
     five_hour: f32,
     seven_day: f32,
@@ -81,6 +86,7 @@ pub(super) struct DesktopUsageReader {
     directory: Option<PathBuf>,
     cached_inputs: Option<(FileStamp, FileStamp)>,
     report: Option<DesktopReport>,
+    usage_cache: UsageCacheReader,
     account_id: Option<String>,
     report_after_ms: Option<i64>,
 }
@@ -97,6 +103,7 @@ impl DesktopUsageReader {
             directory,
             cached_inputs: None,
             report: None,
+            usage_cache: UsageCacheReader::default(),
             account_id: None,
             report_after_ms: None,
         }
@@ -114,7 +121,10 @@ impl DesktopUsageReader {
         if let Some(history_stamp) = history_stamp
             && self.cached_inputs == Some((config_stamp, history_stamp))
         {
-            return self.report.and_then(|report| self.present(report, now));
+            return self
+                .report
+                .clone()
+                .and_then(|report| self.present(report, now));
         }
 
         let config = read_bounded(&config_path, MAX_CONFIG_BYTES)
@@ -159,11 +169,11 @@ impl DesktopUsageReader {
             return None;
         }
         self.cached_inputs = Some((config_stamp, history_stamp));
-        self.report = Some(report);
+        self.report = Some(report.clone());
         self.present(report, now)
     }
 
-    fn present(&self, report: DesktopReport, now: i64) -> Option<UsageSnapshot> {
+    fn present(&mut self, report: DesktopReport, now: i64) -> Option<UsageSnapshot> {
         if report.timestamp_ms <= 0
             || report.timestamp_ms > now.checked_mul(1000)?.checked_add(999)?
             || self
@@ -176,6 +186,18 @@ impl DesktopUsageReader {
         let age = now.checked_sub(updated_at)?;
         if !(0..=MAX_AGE_SECONDS).contains(&age) {
             return None;
+        }
+        if let Some(snapshot) =
+            self.usage_cache
+                .snapshot(self.directory.as_ref()?, &report.organization, now)
+            && cache_matches_report(&snapshot, &report)
+            && self.report_after_ms.is_none_or(|cutoff| {
+                snapshot
+                    .updated_at
+                    .is_some_and(|timestamp| timestamp > cutoff / 1000)
+            })
+        {
+            return Some(snapshot);
         }
         let stale = age > FRESH_SECONDS;
         let window = |limit_id: &str, label: &str, used_percent| UsageWindow {
@@ -204,6 +226,7 @@ impl DesktopUsageReader {
     fn clear_report(&mut self) {
         self.cached_inputs = None;
         self.report = None;
+        self.usage_cache = UsageCacheReader::default();
     }
 
     fn clear_account(&mut self, now: i64) {
@@ -214,6 +237,33 @@ impl DesktopUsageReader {
         }
         self.clear_report();
     }
+}
+
+/// Select a complete HTTP report, never attach its resets to another reading.
+fn cache_matches_report(snapshot: &UsageSnapshot, history: &DesktopReport) -> bool {
+    let Some(timestamp) = snapshot.updated_at else {
+        return false;
+    };
+    let windows = [
+        ("five_hour", history.five_hour),
+        ("seven_day", history.seven_day),
+    ];
+    let mut same_percentages = true;
+    for (id, used) in windows {
+        let Some(window) = snapshot.windows.iter().find(|window| window.limit_id == id) else {
+            return false;
+        };
+        same_percentages &= (window.remaining_percent - (100.0 - used)).abs() < 0.001;
+    }
+    let history_time = history.timestamp_ms / 1000;
+    // The HTTP Date has whole-second precision and can precede the history
+    // write slightly. Only accept that overlap when both percentages match.
+    let same_period = !snapshot
+        .windows
+        .iter()
+        .any(|window| window.resets_at.is_some_and(|reset| reset <= history_time));
+    timestamp > history_time
+        || (timestamp >= history_time.saturating_sub(5) && same_percentages && same_period)
 }
 
 fn valid_identity(value: &str) -> bool {
@@ -256,6 +306,7 @@ fn parse_report(bytes: &[u8]) -> Option<DesktopReport> {
                 value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
             };
             Some(DesktopReport {
+                organization: organization.to_owned(),
                 timestamp_ms: sample.t,
                 five_hour: valid(sample.u.fh)? as f32,
                 seven_day: valid(sample.u.sd)? as f32,
@@ -426,6 +477,93 @@ mod tests {
     }
 
     #[test]
+    fn cached_reset_times_refresh_independently_and_never_override_newer_history() {
+        const ORG: &str = "11111111-1111-4111-8111-111111111111";
+        let directory = Directory::new();
+        directory.config("account-a", true);
+        directory.history(json!([sample(NOW, ORG, 1.0, 2.0)]));
+        let resets = [NOW + 3600, NOW + 86400];
+        cache::write_test_report(&directory.0, ORG, NOW, [1.0, 2.0], resets);
+        let mut reader = directory.reader();
+        let snapshot = reader.snapshot(NOW).unwrap();
+        assert_eq!(snapshot.source, Some(UsageSource::ClaudeDesktop));
+        assert_eq!(snapshot.windows[0].resets_at, Some(resets[0]));
+        assert_eq!(snapshot.windows[1].resets_at, Some(resets[1]));
+
+        // A cache update must be noticed even if the history file is unchanged.
+        cache::write_test_report(&directory.0, ORG, NOW + 1, [3.0, 4.0], resets);
+        let snapshot = reader.snapshot(NOW + 1).unwrap();
+        assert_eq!(snapshot.updated_at, Some(NOW + 1));
+        assert_eq!(snapshot.windows[0].remaining_percent, 97.0);
+        assert_eq!(snapshot.windows[1].resets_at, Some(resets[1]));
+
+        // An older HTTP report cannot lend its resets to newer percentages.
+        directory.history(json!([sample(NOW + 10, ORG, 7.0, 8.0)]));
+        let snapshot = reader.snapshot(NOW + 10).unwrap();
+        assert_eq!(snapshot.windows[0].remaining_percent, 93.0);
+        assert!(
+            snapshot
+                .windows
+                .iter()
+                .all(|window| window.resets_at.is_none())
+        );
+
+        // Date resolution/network delay is allowed only for matching readings.
+        cache::write_test_report(&directory.0, ORG, NOW + 9, [7.0, 8.0], resets);
+        let snapshot = reader.snapshot(NOW + 10).unwrap();
+        assert_eq!(snapshot.updated_at, Some(NOW + 9));
+        assert_eq!(snapshot.windows[0].resets_at, Some(resets[0]));
+        cache::write_test_report(&directory.0, ORG, NOW + 9, [7.0, 9.0], resets);
+        let snapshot = reader.snapshot(NOW + 10).unwrap();
+        assert!(
+            snapshot
+                .windows
+                .iter()
+                .all(|window| window.resets_at.is_none())
+        );
+
+        // Matching percentages alone cannot bridge a reset between reports.
+        cache::write_test_report(&directory.0, ORG, NOW + 8, [7.0, 8.0], [NOW + 9, resets[1]]);
+        let snapshot = reader.snapshot(NOW + 10).unwrap();
+        assert!(
+            snapshot
+                .windows
+                .iter()
+                .all(|window| window.resets_at.is_none())
+        );
+    }
+
+    #[test]
+    fn cached_usage_respects_logout_and_organization_changes() {
+        const ORG_A: &str = "11111111-1111-4111-8111-111111111111";
+        const ORG_B: &str = "22222222-2222-4222-8222-222222222222";
+        let directory = Directory::new();
+        directory.config("account-a", true);
+        directory.history(json!([sample(NOW, ORG_A, 1.0, 2.0)]));
+        let resets = [NOW + 3600, NOW + 86400];
+        cache::write_test_report(&directory.0, ORG_A, NOW, [1.0, 2.0], resets);
+        let mut reader = directory.reader();
+        assert!(reader.snapshot(NOW).unwrap().windows[0].resets_at.is_some());
+        directory.config("account-a", false);
+        assert!(reader.snapshot(NOW + 1).is_none());
+        directory.config("account-b", true);
+        assert!(reader.snapshot(NOW + 2).is_none());
+        directory.history(json!([sample(NOW + 3, ORG_B, 3.0, 4.0)]));
+        let snapshot = reader.snapshot(NOW + 3).unwrap();
+        assert_eq!(snapshot.windows[0].remaining_percent, 97.0);
+        assert!(
+            snapshot
+                .windows
+                .iter()
+                .all(|window| window.resets_at.is_none())
+        );
+        cache::write_test_report(&directory.0, ORG_B, NOW + 3, [3.0, 4.0], resets);
+        let snapshot = reader.snapshot(NOW + 3).unwrap();
+        assert_eq!(snapshot.windows[0].resets_at, Some(resets[0]));
+        assert_eq!(snapshot.windows[0].remaining_percent, 97.0);
+    }
+
+    #[test]
     fn malformed_versions_identities_percentages_and_bounds_are_rejected() {
         let document = |version, samples| {
             serde_json::to_vec(&json!({"version":version,"samples":samples})).unwrap()
@@ -483,12 +621,17 @@ mod tests {
             .snapshot(now)
             .expect("recent signed-in Claude Desktop report");
         println!(
-            "Claude Desktop report: age={}s, remaining={:?}",
+            "Claude Desktop report: age={}s, remaining={:?}, resets={:?}",
             now - snapshot.updated_at.unwrap(),
             snapshot
                 .windows
                 .iter()
                 .map(|window| window.remaining_percent)
+                .collect::<Vec<_>>(),
+            snapshot
+                .windows
+                .iter()
+                .map(|window| window.resets_at)
                 .collect::<Vec<_>>()
         );
     }

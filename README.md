@@ -102,12 +102,15 @@ Only one overlay instance can run at a time.
   Saved readings reappear immediately after widget restarts; temporary failures
   start retrying after 30 seconds, while server rate limits retain their required
   delay. Without an available Code report, the widget can read the latest complete
-  usage report saved by a signed-in Claude Desktop app. It checks that local file
-  every 30 seconds; Desktop normally saves reports every 5–15 minutes. These
-  readings show “Desktop report” and their original age because Desktop does not
-  save reset times, and become stale after 20 minutes. Reports from a logged-out
-  Desktop session are ignored. Sign in through Claude Desktop or Claude Code if
-  the widget asks; it does not refresh or modify your credentials or make
+  usage report saved by a signed-in Claude Desktop app. It checks local metadata
+  every 30 seconds; Desktop normally saves reports every 5–15 minutes. Matching
+  usage responses in Desktop's HTTP cache provide the actual reset times without
+  accessing credentials or making extra requests. If that cached response is
+  unavailable, the widget keeps the saved percentages and labels the reset time
+  unavailable. The original report age remains in the tooltip, and readings become
+  stale after 20 minutes. Reports from a logged-out Desktop session are ignored.
+  Sign in through Claude Desktop or Claude Code if the widget asks; it does not
+  refresh or modify your credentials or make
   inference requests. Expired windows wait for a fresh report.
 
 Toggle or reorder **AI Usage** in the widget settings. Turning it off pauses both

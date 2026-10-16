@@ -264,7 +264,7 @@ fn retry_after_secs(value: &str, now: i64) -> Option<i64> {
     })
 }
 
-fn parse_usage(bytes: &[u8], now: i64) -> Option<UsageSnapshot> {
+pub(super) fn parse_usage(bytes: &[u8], now: i64) -> Option<UsageSnapshot> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let value = value.as_object()?;
     let mut windows = Vec::new();

@@ -202,12 +202,10 @@ fn provider_heading(
         .push(widget::text::heading(provider.name()).size(13))
         .push(widget::space::horizontal());
     let stale = usage.status == UsageStatus::Stale
-        || usage.windows.iter().any(|window| {
-            window.is_stale
-                || window
-                    .resets_at
-                    .is_some_and(|reset| reset <= now.timestamp())
-        });
+        || usage
+            .windows
+            .iter()
+            .any(|window| window.is_stale || reset_time(window).is_some_and(|reset| reset <= now));
     let badge = if stale {
         Some("Stale")
     } else {
@@ -255,17 +253,22 @@ fn detail_row(left: String, right: String) -> Element<'static, Message> {
         .into()
 }
 
-fn usage_window<'a>(
+struct UsageWindowDetails {
+    remaining_percent: Option<f32>,
+    stale: bool,
+    reset_caption: String,
+    tooltip: String,
+}
+
+fn usage_window_details(
     provider: Provider,
-    usage: &'a UsageSnapshot,
-    window: &'a UsageWindow,
+    usage: &UsageSnapshot,
+    window: &UsageWindow,
     now: DateTime<Local>,
     use_24hour_time: bool,
-) -> Element<'a, Message> {
-    let expired = window
-        .resets_at
-        .is_some_and(|reset| reset <= now.timestamp());
-    let stale = usage.status == UsageStatus::Stale || window.is_stale;
+) -> UsageWindowDetails {
+    let expired = reset_time(window).is_some_and(|reset| reset <= now);
+    let stale = expired || usage.status == UsageStatus::Stale || window.is_stale;
     let value = (!expired && window.remaining_percent.is_finite())
         .then(|| window.remaining_percent.clamp(0.0, 100.0));
     let desktop_report = usage.source == Some(UsageSource::ClaudeDesktop);
@@ -283,11 +286,7 @@ fn usage_window<'a>(
         provider.name(),
         window.label,
         state,
-        if desktop_report {
-            "Desktop reports do not include reset times.".to_string()
-        } else {
-            reset_label(window, now, use_24hour_time, provider.name())
-        },
+        reset_label(window, now, use_24hour_time, provider.name()),
         if desktop_report {
             format!(
                 "Reported {}",
@@ -299,6 +298,23 @@ fn usage_window<'a>(
         value.map_or_else(|| "—".into(), |value| format!("{value:.0}% left")),
         provider.update_hint(desktop_report),
     );
+    UsageWindowDetails {
+        remaining_percent: value,
+        stale,
+        reset_caption: compact_reset_label(window, now, use_24hour_time),
+        tooltip,
+    }
+}
+
+fn usage_window<'a>(
+    provider: Provider,
+    usage: &'a UsageSnapshot,
+    window: &'a UsageWindow,
+    now: DateTime<Local>,
+    use_24hour_time: bool,
+) -> Element<'a, Message> {
+    let details = usage_window_details(provider, usage, window, now, use_24hour_time);
+    let value = details.remaining_percent;
     let mut title = widget::row::with_capacity(2)
         .width(Length::Fill)
         .height(20)
@@ -323,23 +339,21 @@ fn usage_window<'a>(
         )
         .size(12),
     );
-    let reset = if desktop_report {
-        desktop_report_label(window, now.timestamp())
-    } else {
-        compact_reset_label(window, now, use_24hour_time)
-    };
-    let (left, right) = reset.split_once('\n').unwrap_or((&reset, ""));
+    let (left, right) = details
+        .reset_caption
+        .split_once('\n')
+        .unwrap_or((&details.reset_caption, ""));
     let content = widget::column::with_capacity(5)
         .width(Length::Fill)
         .height(WINDOW_HEIGHT)
         .push(title)
         .push(widget::space().height(4))
-        .push(gauge::remaining_bar(value, stale))
+        .push(gauge::remaining_bar(value, details.stale))
         .push(widget::space().height(8))
         .push(detail_row(left.into(), right.into()));
     widget::tooltip(
         content,
-        widget::text::caption(tooltip),
+        widget::text::caption(details.tooltip),
         widget::tooltip::Position::Top,
     )
     .into()
@@ -375,21 +389,25 @@ fn unavailable_usage(
     .into()
 }
 
+fn reset_time(window: &UsageWindow) -> Option<DateTime<Local>> {
+    window
+        .resets_at
+        .filter(|timestamp| *timestamp > 0)
+        .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
+        .map(|reset| reset.with_timezone(&Local))
+}
+
 fn compact_reset_label(
     window: &UsageWindow,
     now: DateTime<Local>,
     use_24hour_time: bool,
 ) -> String {
-    let Some(reset) = window
-        .resets_at
-        .and_then(|reset| DateTime::from_timestamp(reset, 0))
-    else {
+    let Some(reset) = reset_time(window) else {
         return "Reset time\nunavailable".to_string();
     };
     if reset.timestamp() <= now.timestamp() {
         return "Awaiting\nupdate".to_string();
     }
-    let reset = reset.with_timezone(&Local);
     let day = if reset.date_naive() == now.date_naive() {
         "today".to_string()
     } else {
@@ -409,16 +427,12 @@ fn reset_label(
     use_24hour_time: bool,
     provider: &str,
 ) -> String {
-    let Some(reset) = window
-        .resets_at
-        .and_then(|reset| DateTime::from_timestamp(reset, 0))
-    else {
+    let Some(reset) = reset_time(window) else {
         return "Reset time unavailable".to_string();
     };
     if reset.timestamp() <= now.timestamp() {
         return format!("Reset passed · Awaiting {provider} update");
     }
-    let reset = reset.with_timezone(&Local);
     let format = match (reset.date_naive() == now.date_naive(), use_24hour_time) {
         (true, true) => "today at %H:%M",
         (true, false) => "today at %-I:%M %p",
@@ -443,13 +457,6 @@ fn compact_report_age(updated_at: i64, now: i64) -> String {
         3600..=86399 => format!("{}h ago", seconds / 3600),
         _ => format!("{}d ago", seconds / 86400),
     }
-}
-
-fn desktop_report_label(window: &UsageWindow, now: i64) -> String {
-    format!(
-        "Desktop report\n{}",
-        compact_report_age(window.updated_at, now)
-    )
 }
 
 #[cfg(test)]
@@ -743,29 +750,78 @@ mod tests {
         assert_eq!(report_age(Some(1000), 87400), "Updated 1d ago");
     }
 
-    #[test]
-    fn desktop_caption_keeps_the_original_report_age() {
+    fn desktop_window() -> (UsageSnapshot, UsageWindow, DateTime<Local>) {
+        use chrono::TimeZone;
+
+        let now = Local.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+        let usage = UsageSnapshot {
+            status: UsageStatus::Available,
+            source: Some(UsageSource::ClaudeDesktop),
+            ..Default::default()
+        };
         let window = UsageWindow {
-            limit_id: "claude".into(),
+            limit_id: "five_hour".into(),
             label: "5-hour".into(),
             remaining_percent: 70.0,
             resets_at: None,
-            updated_at: 1_000,
+            updated_at: now.timestamp() - 900,
             is_stale: false,
         };
-        assert_eq!(
-            desktop_report_label(&window, 1_000),
-            "Desktop report\njust now"
-        );
-        assert_eq!(
-            desktop_report_label(&window, 1_900),
-            "Desktop report\n15m ago"
-        );
-        assert_eq!(
-            desktop_report_label(&window, 4_600),
-            "Desktop report\n1h ago"
-        );
+        (usage, window, now)
+    }
+
+    #[test]
+    fn desktop_source_displays_real_reset_times_in_both_clock_formats() {
+        let (usage, mut window, now) = desktop_window();
+        window.resets_at = Some(now.timestamp() + 3600);
+
+        let details = usage_window_details(Provider::Claude, &usage, &window, now, true);
+        assert_eq!(details.reset_caption, "Resets today\n13:00");
+        assert!(details.tooltip.contains("Resets today at 13:00"));
+        assert!(details.tooltip.contains("Saved Claude Desktop report"));
+        assert!(details.tooltip.contains("Reported 15m ago"));
+        assert!(!details.tooltip.contains("do not include reset times"));
+        assert_eq!(details.remaining_percent, Some(70.0));
+        assert!(!details.stale);
+
+        let details = usage_window_details(Provider::Claude, &usage, &window, now, false);
+        assert_eq!(details.reset_caption, "Resets today\n1:00 PM");
+        assert!(details.tooltip.contains("Resets today at 1:00 PM"));
+    }
+
+    #[test]
+    fn missing_or_invalid_resets_keep_report_age_without_inventing_a_timer() {
+        let (usage, mut window, now) = desktop_window();
+        for reset in [None, Some(0), Some(-1), Some(i64::MAX)] {
+            window.resets_at = reset;
+            let details = usage_window_details(Provider::Claude, &usage, &window, now, true);
+            assert_eq!(details.reset_caption, "Reset time\nunavailable");
+            assert!(details.tooltip.contains("Reset time unavailable"));
+            assert!(details.tooltip.contains("Reported 15m ago"));
+            assert_eq!(details.remaining_percent, Some(70.0));
+        }
+        let later = now + chrono::Duration::minutes(45);
+        let details = usage_window_details(Provider::Claude, &usage, &window, later, true);
+        assert!(details.tooltip.contains("Reported 1h ago"));
         assert_eq!(compact_report_age(1_000, 999), "just now");
+    }
+
+    #[test]
+    fn expired_desktop_reset_waits_without_refilling_allowance() {
+        let (usage, mut window, now) = desktop_window();
+        window.resets_at = Some(now.timestamp());
+        let details = usage_window_details(Provider::Claude, &usage, &window, now, true);
+        assert_eq!(details.reset_caption, "Awaiting\nupdate");
+        assert!(
+            details
+                .tooltip
+                .contains("Reset passed · Awaiting Claude update")
+        );
+        assert!(details.tooltip.contains("Awaiting a new report"));
+        assert!(details.tooltip.contains("Reported 15m ago"));
+        assert_eq!(details.remaining_percent, None);
+        assert!(details.stale);
+        assert_eq!(window.remaining_percent, 70.0);
     }
 
     #[test]
