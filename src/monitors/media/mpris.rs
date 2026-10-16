@@ -13,6 +13,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
+const ROOT_INTERFACE: &str = "org.mpris.MediaPlayer2";
 const PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -48,6 +49,7 @@ pub(super) struct Monitor {
     players: Arc<Mutex<HashMap<String, MediaInfo>>>,
     connection: Arc<Mutex<Option<Connection>>>,
     refresh_lock: Arc<Mutex<()>>,
+    player_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Monitor {
@@ -56,6 +58,7 @@ impl Monitor {
             players: Arc::new(Mutex::new(HashMap::new())),
             connection: Arc::new(Mutex::new(None)),
             refresh_lock: Arc::new(Mutex::new(())),
+            player_names: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let listener = monitor.clone();
@@ -96,7 +99,7 @@ impl Monitor {
         let mut refreshed = None;
         for _ in 0..4 {
             std::thread::sleep(Duration::from_millis(150));
-            refreshed = query_player(&connection, bus_name).ok().flatten();
+            refreshed = self.query_player(&connection, bus_name).ok().flatten();
             if refreshed.as_ref().is_some_and(|info| info.duration > 0) {
                 break;
             }
@@ -222,11 +225,25 @@ impl Monitor {
             .connection
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(command_connection.clone());
+        self.player_names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.refresh_with(&command_connection)?;
         log::info!("Using native zbus MPRIS monitoring");
 
         for message in &mut messages {
-            message?;
+            let message = message?;
+            if message.header().member().map(|member| member.as_str()) == Some("NameOwnerChanged")
+                && let Ok((name, _, _)) = message.body().deserialize::<(String, String, String)>()
+            {
+                // An application may reuse its well-known name after restarting.
+                // Its identity belongs to the owner, not the persistent bus name.
+                self.player_names
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&name);
+            }
             if let Err(error) = self.refresh_with(&command_connection) {
                 log::debug!("Native MPRIS signal refresh failed: {error}");
             }
@@ -257,6 +274,11 @@ impl Monitor {
             .collect::<Vec<_>>();
         names.sort();
 
+        self.player_names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|name, _| names.contains(name));
+
         let previous = self
             .players
             .lock()
@@ -264,7 +286,7 @@ impl Monitor {
             .clone();
         let mut refreshed = HashMap::new();
         for name in names {
-            match query_player(connection, &name) {
+            match self.query_player(connection, &name) {
                 Ok(Some(info)) => {
                     refreshed.insert(name, info);
                 }
@@ -283,6 +305,30 @@ impl Monitor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed;
         Ok(())
+    }
+
+    fn query_player(
+        &self,
+        connection: &Connection,
+        bus_name: &str,
+    ) -> zbus::Result<Option<MediaInfo>> {
+        let properties = query_properties(connection, bus_name)?;
+        let Some(mut info) = media_info_from_properties(bus_name, &properties) else {
+            return Ok(None);
+        };
+        let mut player_names = self
+            .player_names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(name) = player_names.get(bus_name) {
+            info.player_name = name.clone();
+        } else if let Some(name) = query_player_name(connection, bus_name) {
+            info.player_name = name.clone();
+            player_names.insert(bus_name.to_string(), name);
+        }
+        // Failed identity requests remain uncached so the normal reconciliation
+        // can retry, while successful identities need no per-tick D-Bus or /proc reads.
+        Ok(Some(info))
     }
 
     fn connection(&self) -> Option<Connection> {
@@ -356,9 +402,82 @@ impl Monitor {
     }
 }
 
-fn query_player(connection: &Connection, bus_name: &str) -> zbus::Result<Option<MediaInfo>> {
-    let properties = query_properties(connection, bus_name)?;
-    Ok(media_info_from_properties(bus_name, &properties))
+fn query_player_name(connection: &Connection, bus_name: &str) -> Option<String> {
+    let properties = Proxy::new(connection, bus_name, MPRIS_PATH, PROPERTIES_INTERFACE).ok()?;
+    let root: HashMap<String, OwnedValue> = properties.call("GetAll", &(ROOT_INTERFACE,)).ok()?;
+    let desktop_entry = property_string(&root, "DesktopEntry");
+    let identity = property_string(&root, "Identity");
+    let advertised = player_display_name(
+        bus_name,
+        desktop_entry.as_deref(),
+        identity.as_deref(),
+        None,
+    );
+
+    // Firefox derivatives can retain Firefox's MPRIS name and identity. Check
+    // only that player's native executable, once per owner; never infer its
+    // source from unrelated browsers running on the desktop. Flatpak uses a
+    // proxy executable, so its advertised DesktopEntry/Identity stays authoritative.
+    let executable = if advertised == "Firefox" {
+        zbus::blocking::fdo::DBusProxy::new(connection)
+            .ok()
+            .and_then(|bus| {
+                bus.get_connection_unix_process_id(bus_name.try_into().ok()?)
+                    .ok()
+            })
+            .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok())
+    } else {
+        None
+    };
+    Some(player_display_name(
+        bus_name,
+        desktop_entry.as_deref(),
+        identity.as_deref(),
+        executable.as_deref(),
+    ))
+}
+
+fn player_display_name(
+    bus_name: &str,
+    desktop_entry: Option<&str>,
+    identity: Option<&str>,
+    executable: Option<&std::path::Path>,
+) -> String {
+    if is_cosmic_player(bus_name) {
+        return "COSMIC Player".to_string();
+    }
+    let desktop = desktop_entry
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let desktop = desktop.strip_suffix(".desktop").unwrap_or(&desktop);
+    let identity = identity.map(str::trim).filter(|name| !name.is_empty());
+    let normalized_identity = identity.unwrap_or_default().to_ascii_lowercase();
+    let executable = executable
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str);
+    if matches!(
+        desktop,
+        "zen" | "zen-browser" | "app.zen_browser.zen" | "org.mozilla.zen"
+    ) || matches!(
+        normalized_identity.as_str(),
+        "zen" | "mozilla zen" | "zen browser"
+    ) || matches!(executable, Some("zen" | "zen-bin" | "zen-browser"))
+    {
+        return "Zen".to_string();
+    }
+    if matches!(
+        desktop,
+        "firefox" | "firefox-esr" | "org.mozilla.firefox" | "firefox-developer-edition"
+    ) || matches!(
+        normalized_identity.as_str(),
+        "firefox" | "mozilla firefox" | "firefox web browser"
+    ) {
+        return "Firefox".to_string();
+    }
+    identity
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| PlayerId::Mpris(bus_name.to_string()).display_name())
 }
 
 fn query_properties(
@@ -463,6 +582,95 @@ mod tests {
 
     fn owned(value: Value<'_>) -> OwnedValue {
         OwnedValue::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn identifies_zen_even_when_its_mpris_bus_advertises_firefox() {
+        let bus = "org.mpris.MediaPlayer2.firefox.instance_1_5693";
+        for (desktop, identity) in [
+            (Some("zen"), Some("Mozilla zen")),
+            (Some("app.zen_browser.zen.desktop"), Some("Firefox")),
+            (Some("org.mozilla.zen"), None),
+            (None, Some("Zen Browser")),
+        ] {
+            assert_eq!(player_display_name(bus, desktop, identity, None), "Zen");
+        }
+        assert_eq!(
+            player_display_name(
+                bus,
+                Some("firefox"),
+                Some("Firefox"),
+                Some(std::path::Path::new("/opt/zen/zen-bin"))
+            ),
+            "Zen"
+        );
+    }
+
+    #[test]
+    fn preserves_firefox_and_unrelated_player_identities() {
+        let bus = "org.mpris.MediaPlayer2.firefox.instance_1";
+        for desktop in ["firefox", "firefox-esr", "org.mozilla.firefox.desktop"] {
+            assert_eq!(
+                player_display_name(bus, Some(desktop), Some("Mozilla Firefox"), None),
+                "Firefox"
+            );
+        }
+        // A directory name containing 'zen' must not misidentify real Firefox.
+        assert_eq!(
+            player_display_name(
+                bus,
+                Some("firefox"),
+                Some("Firefox"),
+                Some(std::path::Path::new("/home/zen/firefox/firefox"))
+            ),
+            "Firefox"
+        );
+        assert_eq!(
+            player_display_name(bus, None, Some("LibreWolf"), None),
+            "LibreWolf"
+        );
+        assert_eq!(
+            player_display_name(
+                "org.mpris.MediaPlayer2.vlc",
+                None,
+                Some("VLC media player"),
+                None
+            ),
+            "VLC media player"
+        );
+        assert_eq!(
+            player_display_name(
+                "org.mpris.MediaPlayer2.cosmic-player.pid1",
+                None,
+                Some("cosmic-player"),
+                None
+            ),
+            "COSMIC Player"
+        );
+    }
+
+    #[test]
+    fn missing_or_blank_identity_falls_back_to_mpris_name() {
+        for identity in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                player_display_name(
+                    "org.mpris.MediaPlayer2.firefox.instance_1",
+                    None,
+                    identity,
+                    None
+                ),
+                "Firefox"
+            );
+        }
+        assert_eq!(
+            player_display_name(
+                "org.mpris.MediaPlayer2.cider",
+                Some("zen-extra"),
+                None,
+                None
+            ),
+            "Cider"
+        );
     }
 
     #[test]
@@ -634,8 +842,8 @@ mod tests {
 
         for (name, info) in &players {
             eprintln!(
-                "{name}: {:?}, {} / {} ms, can_seek={}",
-                info.status, info.position, info.duration, info.can_seek
+                "{name} ({}): {:?}, {} / {} ms, can_seek={}",
+                info.player_name, info.status, info.position, info.duration, info.can_seek
             );
         }
     }

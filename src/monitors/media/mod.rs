@@ -1328,11 +1328,11 @@ impl MediaMonitor {
 
                 // Fallback to app icon if no album art
                 if info.album_art.is_none() {
-                    let icon_cache_key = format!("__icon__{}", bus_name);
+                    let icon_cache_key = format!("__icon__{bus_name}:{}", info.player_name);
                     let cached = artwork_cache.lock().unwrap().get(&icon_cache_key);
                     if let Some(art) = cached {
                         info.album_art = Some(art);
-                    } else if let Some(art) = Self::load_app_icon(&bus_name) {
+                    } else if let Some(art) = Self::load_app_icon(&bus_name, &info.player_name) {
                         artwork_cache
                             .lock()
                             .unwrap()
@@ -1897,15 +1897,20 @@ impl MediaMonitor {
     /// Get the icon path for a player application.
     ///
     /// Searches common icon locations for the app's icon.
-    fn get_player_icon_path(bus_name: &str) -> Option<String> {
-        // Extract app name from bus name (e.g., "org.mpris.MediaPlayer2.firefox.instance_1_278" -> "firefox")
-        let app_name = bus_name
-            .strip_prefix("org.mpris.MediaPlayer2.")
-            .unwrap_or(bus_name)
-            .split('.')
-            .next()
-            .unwrap_or(bus_name)
-            .to_lowercase();
+    fn get_player_icon_path(bus_name: &str, player_name: &str) -> Option<String> {
+        // Zen retains Firefox's bus name; use its resolved identity for fallback
+        // artwork too, so missing album art cannot bring the Firefox logo back.
+        let app_name = if player_name == "Zen" {
+            "zen".to_string()
+        } else {
+            bus_name
+                .strip_prefix("org.mpris.MediaPlayer2.")
+                .unwrap_or(bus_name)
+                .split('.')
+                .next()
+                .unwrap_or(bus_name)
+                .to_lowercase()
+        };
 
         // Common icon directories to search
         let icon_dirs = [
@@ -1922,6 +1927,23 @@ impl MediaMonitor {
             "/var/lib/flatpak/exports/share/icons/hicolor/256x256/apps",
             "/var/lib/flatpak/exports/share/icons/hicolor/128x128/apps",
             "/var/lib/flatpak/exports/share/icons/hicolor/64x64/apps",
+            "/var/lib/flatpak/exports/share/icons/hicolor/scalable/apps",
+            &format!(
+                "{}/.local/share/flatpak/exports/share/icons/hicolor/scalable/apps",
+                std::env::var("HOME").unwrap_or_default()
+            ),
+            &format!(
+                "{}/.local/share/flatpak/exports/share/icons/hicolor/256x256/apps",
+                std::env::var("HOME").unwrap_or_default()
+            ),
+            &format!(
+                "{}/.local/share/flatpak/exports/share/icons/hicolor/128x128/apps",
+                std::env::var("HOME").unwrap_or_default()
+            ),
+            &format!(
+                "{}/.local/share/flatpak/exports/share/icons/hicolor/64x64/apps",
+                std::env::var("HOME").unwrap_or_default()
+            ),
             &format!(
                 "{}/.local/share/icons/hicolor/256x256/apps",
                 std::env::var("HOME").unwrap_or_default()
@@ -1952,6 +1974,12 @@ impl MediaMonitor {
 
         // Try common browser variations
         let variations: &[&str] = match app_name.as_str() {
+            "zen" => &[
+                "app.zen_browser.zen",
+                "zen",
+                "zen-browser",
+                "org.mozilla.zen",
+            ],
             "firefox" => &[
                 "firefox",
                 "firefox-esr",
@@ -1983,23 +2011,55 @@ impl MediaMonitor {
     }
 
     /// Load an app icon as album art (fallback when no real album art).
-    fn load_app_icon(bus_name: &str) -> Option<AlbumArt> {
-        let icon_path = Self::get_player_icon_path(bus_name)?;
+    fn load_app_icon(bus_name: &str, player_name: &str) -> Option<AlbumArt> {
+        let icon_path = Self::get_player_icon_path(bus_name, player_name)?;
 
         log::info!("Loading app icon as fallback: {}", icon_path);
 
-        let image_data = std::fs::read(&icon_path).ok()?;
-
-        // Handle SVG separately
-        if icon_path.ends_with(".svg") {
-            // For SVG, we need to rasterize - but that requires additional deps
-            // For now, skip SVG files
-            log::info!("Skipping SVG icon (not supported for fallback)");
+        if std::fs::metadata(&icon_path).ok()?.len() > MAX_ARTWORK_BYTES as u64 {
             return None;
+        }
+        let image_data = std::fs::read(&icon_path).ok()?;
+        if icon_path.ends_with(".svg") {
+            return Self::decode_svg_icon(&image_data);
         }
 
         // Decode image
         Self::decode_artwork(image_data)
+    }
+
+    fn decode_svg_icon(bytes: &[u8]) -> Option<AlbumArt> {
+        let options = resvg::usvg::Options {
+            image_href_resolver: resvg::usvg::ImageHrefResolver {
+                resolve_string: Box::new(|_, _| None),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tree = resvg::usvg::Tree::from_data(bytes, &options).ok()?;
+        let scale = 256.0 / tree.size().width().max(tree.size().height());
+        let width = (tree.size().width() * scale).ceil().max(1.0) as u32;
+        let height = (tree.size().height() * scale).ceil().max(1.0) as u32;
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
+        // PNG stores straight alpha; undo the rasterizer's premultiplication
+        // so transparent icon edges retain their original color.
+        let pixels = pixmap
+            .pixels()
+            .iter()
+            .flat_map(|pixel| {
+                let pixel = pixel.demultiply();
+                [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]
+            })
+            .collect();
+        let image = image::RgbaImage::from_raw(width, height, pixels)?;
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
+        Self::decode_artwork(encoded.into_inner())
     }
 
     /// Download and decode album artwork from URL.

@@ -3,16 +3,17 @@
 use crate::monitors::media::{AlbumArt, MediaInfo, PlaybackStatus};
 use crate::overlay::Message;
 use crate::overlay::components::{
-    marquee,
+    button_style, marquee, media_artwork as rounded_artwork,
     section::{compact_single_line, section},
     slide,
 };
 use crate::overlay::media_state::DismissingMedia;
 use crate::overlay::stats::SystemSnapshot;
-use cosmic::iced::core::image::FilterMethod;
 use cosmic::iced::{Alignment, Background, Border, Color, ContentFit, Length};
 use cosmic::{Element, theme, widget};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Mutex, OnceLock};
 
 const MEDIA_ACTIVE_SECTION_HEIGHT: f32 = 232.0;
 const MEDIA_CONTENT_HEIGHT: f32 = 204.0;
@@ -163,6 +164,8 @@ fn media_content<'a>(
     let previous = widget::button::icon(
         widget::icon::from_name("media-skip-backward-symbolic").size(MEDIA_CONTROL_ICON_SIZE),
     )
+    .icon_size(MEDIA_CONTROL_ICON_SIZE)
+    .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Previous track")
     .padding(MEDIA_CONTROL_PADDING)
     .on_press_maybe(info.can_go_previous.then_some(Message::PreviousMedia));
@@ -173,6 +176,8 @@ fn media_content<'a>(
     let play_pause = widget::button::icon(
         widget::icon::from_name(play_pause_icon).size(MEDIA_CONTROL_ICON_SIZE),
     )
+    .icon_size(MEDIA_CONTROL_ICON_SIZE)
+    .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip(match info.status {
         PlaybackStatus::Playing => "Pause",
         PlaybackStatus::Paused | PlaybackStatus::Stopped => "Play",
@@ -182,6 +187,8 @@ fn media_content<'a>(
     let next = widget::button::icon(
         widget::icon::from_name("media-skip-forward-symbolic").size(MEDIA_CONTROL_ICON_SIZE),
     )
+    .icon_size(MEDIA_CONTROL_ICON_SIZE)
+    .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Next track")
     .padding(MEDIA_CONTROL_PADDING)
     .on_press_maybe(info.can_go_next.then_some(Message::NextMedia));
@@ -193,6 +200,7 @@ fn media_content<'a>(
         .symbolic(true),
     )
     .icon_size(MEDIA_SEEK_ICON_SIZE)
+    .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Back 10 seconds")
     .padding(MEDIA_CONTROL_PADDING)
     .on_press_maybe(
@@ -207,6 +215,7 @@ fn media_content<'a>(
         .symbolic(true),
     )
     .icon_size(MEDIA_SEEK_ICON_SIZE)
+    .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Forward 10 seconds")
     .padding(MEDIA_CONTROL_PADDING)
     .on_press_maybe(
@@ -261,11 +270,7 @@ fn media_content<'a>(
             .on_exit(Message::MediaTimelineHoverChanged(false))
             .into()
     } else {
-        widget::progress_bar::linear::Linear::new()
-            .girth(6)
-            .progress(progress as f32)
-            .width(Length::Fill)
-            .into()
+        crate::overlay::components::gauge::progress_bar(progress as f32 * 100.0)
     };
     let current_time =
         widget::container(widget::text::body(format_media_time(position))).width(Length::Fill);
@@ -303,6 +308,10 @@ fn media_seek_style(
     use cosmic::iced::widget::slider::{Catalog as _, HandleShape};
 
     let mut style = theme.style(&theme::style::iced::Slider::Standard, status);
+    let meter = crate::overlay::components::gauge::progress_bar_style(theme);
+    style.rail.backgrounds = (meter.bar, meter.background);
+    style.rail.width = crate::overlay::components::gauge::BAR_HEIGHT;
+    style.rail.border = meter.border;
     if !show_handle {
         style.handle.shape = HandleShape::Circle { radius: 0.0 };
         style.handle.background = Background::Color(Color::TRANSPARENT);
@@ -325,7 +334,7 @@ fn media_source_selector<'a>(
             .width(Length::Fixed(MEDIA_SOURCE_BUTTON_SIZE))
             .height(Length::Fixed(MEDIA_SOURCE_BUTTON_SIZE))
             .padding((MEDIA_SOURCE_BUTTON_SIZE - MEDIA_SOURCE_DOT_SIZE) / 2.0)
-            .class(theme::Button::Text)
+            .class(button_style::accent_hover(|| theme::Button::Text))
             .on_press(Message::SelectMediaPlayer(player_id.clone()));
         dots = dots.push(widget::tooltip(
             button,
@@ -350,7 +359,7 @@ fn media_source_dot(active: bool) -> Element<'static, Message> {
                 background: active.then_some(Background::Color(accent)),
                 border: Border {
                     color: Color { a: 0.55, ..neutral },
-                    width: if active { 0.0 } else { 1.0 },
+                    width: 1.0,
                     radius: [MEDIA_SOURCE_DOT_SIZE / 2.0; 4].into(),
                 },
                 ..Default::default()
@@ -367,13 +376,7 @@ fn media_artwork(art: Option<&AlbumArt>) -> Element<'static, Message> {
         } else {
             (MEDIA_ARTWORK_SIZE, MEDIA_ARTWORK_SIZE)
         };
-        return widget::image(art.iced_handle.clone())
-            .width(Length::Fixed(width))
-            .height(Length::Fixed(height))
-            .content_fit(ContentFit::Cover)
-            .filter_method(FilterMethod::Linear)
-            .border_radius([4.0; 4])
-            .into();
+        return rounded_artwork::view(art, width, height);
     }
 
     widget::container(widget::icon::from_name("audio-x-generic-symbolic").size(48))
@@ -384,10 +387,56 @@ fn media_artwork(art: Option<&AlbumArt>) -> Element<'static, Message> {
 }
 
 fn media_player_badge(player_name: &str) -> Element<'static, Message> {
-    widget::container(widget::text::body(compact_single_line(player_name, 18)))
+    let badge = widget::row::with_capacity(2)
+        .align_y(Alignment::Center)
+        .spacing(6)
+        .push(
+            widget::icon::icon(media_player_icon(player_name))
+                .size(16)
+                .content_fit(ContentFit::Contain),
+        )
+        .push(widget::text::body(compact_single_line(player_name, 18)));
+    widget::container(badge)
         .padding([3, 8])
         .class(theme::Container::Secondary)
         .into()
+}
+
+fn media_player_icon(player_name: &str) -> widget::icon::Handle {
+    static CACHE: OnceLock<Mutex<HashMap<String, widget::icon::Handle>>> = OnceLock::new();
+    let name = player_name.to_ascii_lowercase();
+    let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
+    if let Some(handle) = cache.get(&name) {
+        return handle.clone();
+    }
+    let icons: &[&str] = match name.as_str() {
+        "zen" | "zen browser" => &["app.zen_browser.zen", "zen", "zen-browser"],
+        "firefox" | "mozilla firefox" => &["firefox", "org.mozilla.firefox"],
+        "chromium" => &["chromium", "chromium-browser", "org.chromium.Chromium"],
+        "chrome" | "google chrome" => &["google-chrome", "com.google.Chrome"],
+        "brave" | "brave web browser" => &["brave-browser", "com.brave.Browser", "brave"],
+        "cider" => &["cider", "sh.cider.Cider"],
+        "cosmic player" => &["com.system76.CosmicPlayer", "cosmic-player"],
+        "spotify" => &["spotify", "com.spotify.Client"],
+        "emby" => &["emby-theater", "tv.emby.EmbyTheater", "emby"],
+        "vlc" | "vlc media player" => &["vlc", "org.videolan.VLC"],
+        _ => &[],
+    };
+    let handle = icons
+        .iter()
+        .find_map(|name| {
+            widget::icon::from_name(*name)
+                .size(16)
+                .fallback(None)
+                .path()
+                .map(widget::icon::from_path)
+        })
+        .unwrap_or_else(|| widget::icon::from_name("emblem-music-symbolic").handle());
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(name, handle.clone());
+    handle
 }
 
 fn media_subtitle(info: &MediaInfo) -> String {

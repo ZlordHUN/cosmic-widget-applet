@@ -28,7 +28,7 @@ and a frosted-glass desktop overlay.
 - Bandcamp track titles in Zen/Firefox when the playing duration uniquely
   identifies a track, without a browser extension
 - AI Usage below Now Playing, with Codex and Claude remaining allowances,
-  compact temperature-style arches, provider icons, reset times, and report
+  compact provider cards with horizontal meters, reset times, and report
   details on hover
 - Reorderable and individually configurable sections
 - COSMIC theming, accent colors, blur, rounded corners, and drag-to-position
@@ -52,11 +52,13 @@ sudo udevadm trigger
 Reconnect newly supported USB receivers after the first installation so the
 udev permissions take effect. The install recipe places the applet, overlay,
 settings application, desktop entries, icon, metadata, and headset udev rules
-under `/usr/local`. If a required release binary is missing, `sudo just install`
-builds all three installed binaries as your normal user before copying any files.
-To rebuild existing binaries after source changes, keep using `just build-release`
-first. For a custom Cargo output directory, pass it explicitly through sudo:
-`sudo just cargo-target-dir=/path/to/target install`.
+under `/usr/local`. `sudo just install` refreshes all three installed binaries
+as your normal user before copying any files, including when release binaries
+already exist. The separate build step is optional. Installation through `pkexec`
+also builds as the invoking user. For a custom Cargo output directory, pass it
+explicitly through sudo: `sudo just cargo-target-dir=/path/to/target install`.
+Packagers and direct root sessions can use `just install-prebuilt` after building
+as a normal user; it checks every required binary and resource before copying.
 
 Add **COSMIC Widget** to the COSMIC panel. Its popup can show or hide the
 overlay and open the settings application.
@@ -94,14 +96,19 @@ Only one overlay instance can run at a time.
   reported by Codex, not estimates from token counts. Usage updates after Codex
   responses; older readings are marked as last known, and elapsed reset times
   wait for a new report.
-- Claude usage reads your five-hour and weekly plan allowances using your existing
-  Claude Code sign-in. It checks the same usage endpoint as the Claude Code client
-  every five minutes, and backs off on request failures. Saved readings reappear
-  immediately after widget restarts; temporary failures start retrying after
-  30 seconds, while server rate limits retain their required delay. Sign in through Claude
-  Code if the widget asks; the widget does not refresh or modify your credentials.
-  Older readings are labeled as last known after a failed refresh, and expired
-  windows wait for a fresh report.
+- Claude usage shows the five-hour and weekly allowances shared across Claude
+  Desktop, web, and Claude Code. An available Claude Code sign-in provides account
+  reports with reset times every five minutes, with backoff on request failures.
+  Saved readings reappear immediately after widget restarts; temporary failures
+  start retrying after 30 seconds, while server rate limits retain their required
+  delay. Without an available Code report, the widget can read the latest complete
+  usage report saved by a signed-in Claude Desktop app. It checks that local file
+  every 30 seconds; Desktop normally saves reports every 5–15 minutes. These
+  readings show “Desktop report” and their original age because Desktop does not
+  save reset times, and become stale after 20 minutes. Reports from a logged-out
+  Desktop session are ignored. Sign in through Claude Desktop or Claude Code if
+  the widget asks; it does not refresh or modify your credentials or make
+  inference requests. Expired windows wait for a fresh report.
 
 Toggle or reorder **AI Usage** in the widget settings. Turning it off pauses both
 usage monitors. No browser extension is needed.
@@ -129,6 +136,7 @@ reading or the normal unavailable state.
 cargo fmt --all -- --check
 cargo test --all-targets
 cargo clippy --all-targets
+python3 tools/check_installer.py
 ```
 
 The production overlay is implemented by the `cosmic-widget-iced` Cargo target

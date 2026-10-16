@@ -2,9 +2,11 @@
 
 //! Cached application icons for notification groups and individual rows.
 
+mod normalize;
+
 use crate::monitors::notifications::Notification;
 use crate::overlay::{Message, notification_state::notification_source};
-use cosmic::iced::Length;
+use cosmic::iced::{ContentFit, Length};
 use cosmic::{Element, widget};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -89,10 +91,14 @@ fn known_app(notification: &Notification) -> Option<App> {
 }
 
 pub(in crate::overlay) fn view(notification: &Notification) -> Element<'static, Message> {
-    widget::container(widget::icon::icon(handle(notification)).size(SIZE))
-        .center_x(Length::Fixed(f32::from(SIZE)))
-        .center_y(Length::Fixed(f32::from(SIZE)))
-        .into()
+    widget::container(
+        widget::icon::icon(handle(notification))
+            .size(SIZE)
+            .content_fit(ContentFit::Contain),
+    )
+    .center_x(Length::Fixed(f32::from(SIZE)))
+    .center_y(Length::Fixed(f32::from(SIZE)))
+    .into()
 }
 
 fn handle(notification: &Notification) -> widget::icon::Handle {
@@ -141,12 +147,20 @@ fn resolve(key: &IconKey) -> widget::icon::Handle {
         return handle;
     }
     // Unknown sources still get a notification icon instead of a colored dot.
-    let mut handle = widget::icon::from_svg_bytes(include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/icons/notification-bell-filled-symbolic.svg"
-    )));
-    handle.symbolic = true;
-    handle
+    static FALLBACK: OnceLock<widget::icon::Handle> = OnceLock::new();
+    FALLBACK
+        .get_or_init(|| {
+            let bytes = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/icons/notification-bell-filled-symbolic.svg"
+            ));
+            normalize::from_svg_bytes(bytes, true).unwrap_or_else(|| {
+                let mut handle = widget::icon::from_svg_bytes(bytes);
+                handle.symbolic = true;
+                handle
+            })
+        })
+        .clone()
 }
 
 fn theme_icon(name: &str) -> Option<widget::icon::Handle> {
@@ -157,7 +171,7 @@ fn theme_icon(name: &str) -> Option<widget::icon::Handle> {
         .size(SIZE)
         .fallback(None)
         .path()
-        .map(widget::icon::from_path)
+        .and_then(|path| normalize::from_path(&path))
 }
 
 fn valid_icon_name(name: &str) -> bool {
@@ -179,21 +193,7 @@ fn supplied_icon(value: &str) -> Option<widget::icon::Handle> {
         None
     };
     if let Some(path) = path {
-        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-        return (matches!(extension.as_str(), "svg" | "png" | "jpg" | "jpeg") && path.is_file())
-            .then(|| {
-                if extension == "svg" {
-                    widget::icon::Handle {
-                        symbolic: path
-                            .file_stem()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.ends_with("-symbolic")),
-                        data: widget::icon::Data::Svg(widget::svg::Handle::from_path(path)),
-                    }
-                } else {
-                    widget::icon::from_path(path)
-                }
-            });
+        return normalize::from_path(&path);
     }
     // No remote image fetches; only local images and installed theme icons.
     theme_icon(value)
@@ -261,7 +261,11 @@ mod tests {
                     .path()
             });
             println!("{app:?}: {path:?}");
-            assert!(path.is_some(), "missing icon for {app:?}");
+            let path = path.expect(&format!("missing icon for {app:?}"));
+            assert!(
+                normalize::from_path(&path).is_some(),
+                "cannot normalize {app:?}"
+            );
         }
     }
 }

@@ -2,7 +2,7 @@
 
 //! Durable, credential-bound quota snapshots. Access tokens are never persisted.
 
-use super::{UsageSnapshot, UsageStatus};
+use super::{UsageSnapshot, UsageSource, UsageStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -62,6 +62,7 @@ fn valid(record: &CacheRecord, key: &str, now: i64) -> bool {
         || !key.bytes().all(|byte| byte.is_ascii_hexdigit())
         || record.next_request_at < 0
         || record.snapshot.windows.len() > 6
+        || record.snapshot.source == Some(UsageSource::ClaudeDesktop)
     {
         return false;
     }
@@ -210,6 +211,7 @@ mod tests {
                 }],
                 updated_at: Some(NOW - 60),
                 status: UsageStatus::Stale,
+                source: Some(UsageSource::ClaudeCode),
             },
             next_request_at: NOW + 900,
             failures: 2,
@@ -235,6 +237,23 @@ mod tests {
             credential_key("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn old_code_caches_load_but_desktop_reports_cannot_enter_the_oauth_cache() {
+        let directory = CacheDirectory::new();
+        let record = report();
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy["snapshot"].as_object_mut().unwrap().remove("source");
+        fs::write(directory.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let restored = load(&directory.path(), &record.credential_key, NOW).unwrap();
+        assert_eq!(restored.snapshot.source, None);
+        assert_eq!(restored.snapshot.windows, record.snapshot.windows);
+
+        let mut desktop = record;
+        desktop.snapshot.source = Some(UsageSource::ClaudeDesktop);
+        save(&directory.path(), &desktop).unwrap();
+        assert!(load(&directory.path(), &desktop.credential_key, NOW).is_none());
     }
 
     #[test]

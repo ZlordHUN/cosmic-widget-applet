@@ -199,6 +199,15 @@ pub(super) fn notification_group_size(snapshot: &SystemSnapshot, source: &str) -
         .count()
 }
 
+pub(super) fn notification_group_children_height(snapshot: &SystemSnapshot, source: &str) -> f32 {
+    snapshot
+        .notifications
+        .iter()
+        .filter(|notification| notification_source(notification) == source)
+        .map(|notification| notification_base_height(notification) as f32)
+        .sum()
+}
+
 pub(super) fn notification_base_height(
     notification: &crate::monitors::notifications::Notification,
 ) -> u32 {
@@ -252,7 +261,7 @@ fn notification_display_rows(snapshot: &SystemSnapshot, expanded_group: Option<&
 }
 
 /// Fraction of a group's children that can affect the current viewport.
-/// Rows below its bottom can be skipped when reversing or starting a collapse.
+/// Rows below its bottom can be revealed or collapsed immediately.
 pub(super) fn notification_group_visible_fraction(
     snapshot: &SystemSnapshot,
     source: &str,
@@ -329,14 +338,7 @@ pub(super) fn notification_viewport_height_with_animation(
     let compact_height = NOTIFICATION_ITEM_HEIGHT as f32 * compact_rows
         + FILE_TRANSFER_PROGRESS_EXTRA_HEIGHT as f32 * active_compact_groups;
     let group_height = expanded_group
-        .map(|source| {
-            snapshot
-                .notifications
-                .iter()
-                .filter(|notification| notification_source(notification) == source)
-                .map(notification_base_height)
-                .sum::<u32>() as f32
-        })
+        .map(|source| notification_group_children_height(snapshot, source))
         .unwrap_or(0.0)
         * group_progress.clamp(0.0, 1.0);
     let selected_group_progress = expanded_notification

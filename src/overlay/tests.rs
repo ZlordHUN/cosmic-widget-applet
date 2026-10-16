@@ -281,22 +281,19 @@ fn notification_group_expansion_reverses_from_its_current_progress() {
 }
 
 #[test]
-fn notification_groups_collapse_at_opening_speed_without_waiting_for_the_tail() {
-    for count in [3, 15, 30, 100] {
+fn different_notification_group_sizes_share_visible_speed_without_hidden_animation() {
+    // Cider has four children; Instagram has 43. Both must move at the
+    // reference 188 px / 540 ms, rather than finishing all children together.
+    for count in [3, 4, 43, 100] {
         let snapshot = SystemSnapshot {
             notifications: vec![notification(); count],
             ..Default::default()
         };
         let source = notification_source(&snapshot.notifications[0]);
+        let children_height = notification_group_children_height(&snapshot, source);
         let started = Instant::now();
-        let duration = NOTIFICATION_GROUP_EXPANSION_DURATION;
-        let mut animation = ExpansionAnimation::with_duration(duration);
-        animation.transition_to(1.0, started);
-        let closed_at = started + duration;
-        animation.advance(closed_at);
-        let visible =
-            notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
-        animation.collapse_visible(visible, closed_at);
+        let mut animation = ExpansionAnimation::default();
+        let visible = notification_group_visible_fraction(&snapshot, source, 0.0, 0.0);
         let height = |progress| {
             notification_viewport_height_with_animation(
                 &snapshot,
@@ -306,63 +303,81 @@ fn notification_groups_collapse_at_opening_speed_without_waiting_for_the_tail() 
                 progress,
             )
         };
+        animation.transition_group(true, children_height, visible, started);
+        animation.advance(started + Duration::from_millis(100));
+        let expected_height = 47.0 + 188.0 * 100.0 / 540.0;
+        assert!((height(animation.progress) - expected_height).abs() < 0.01);
+
+        // Three children fill the viewport beneath the header in 405 ms.
+        // The remaining children become available without spending seconds
+        // animating offscreen or changing what is already visible.
+        animation.advance(started + Duration::from_millis(404));
+        assert!(animation.is_animating());
+        assert!((height(animation.progress) - (47.0 + 188.0 * 404.0 / 540.0)).abs() < 0.01);
+        animation.advance(started + Duration::from_millis(406));
+        assert_eq!(animation.progress, 1.0);
+        assert!(!animation.is_animating());
         assert_eq!(height(animation.progress), 188.0);
-        let visible_duration = duration.mul_f32(visible);
-        let mut opening = ExpansionAnimation::with_duration(duration);
-        opening.transition_to(1.0, started);
-        opening.advance(started + visible_duration / 2);
-        animation.advance(closed_at + visible_duration / 2);
-        assert!((height(animation.progress) - 117.5).abs() < 0.01);
-        assert!(
-            (height(animation.progress) - height(opening.progress)).abs() < 0.01,
-            "{count} rows must open and close at the same speed"
-        );
-        animation.advance(closed_at + visible_duration);
+
+        let closed_at = started + Duration::from_secs(1);
+        let visible =
+            notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
+        animation.transition_group(false, children_height, visible, closed_at);
+        assert_eq!(height(animation.progress), 188.0);
+        animation.advance(closed_at + Duration::from_millis(100));
+        assert!((height(animation.progress) - (188.0 - 188.0 * 100.0 / 540.0)).abs() < 0.01);
+        animation.advance(closed_at + Duration::from_millis(406));
         assert!(animation.is_collapsed());
         assert_eq!(height(animation.progress), 47.0);
     }
 }
 
 #[test]
-fn notification_group_quick_reversals_preserve_visible_height() {
+fn notification_group_quick_reversals_preserve_visible_height_and_speed() {
     let snapshot = SystemSnapshot {
-        notifications: vec![notification(); 30],
+        notifications: vec![notification(); 43],
         ..Default::default()
     };
     let source = notification_source(&snapshot.notifications[0]);
+    let children_height = notification_group_children_height(&snapshot, source);
     let height = |progress| {
         notification_viewport_height_with_animation(&snapshot, None, Some(source), 0.0, progress)
     };
-    // Reverse both before reaching the viewport limit and after filling it.
-    for open_time in [16, 80] {
+    // Reverse during opening and after its clipped tail has been revealed.
+    for open_time in [16, 200, 420] {
         let started = Instant::now();
-        let mut animation =
-            ExpansionAnimation::with_duration(NOTIFICATION_GROUP_EXPANSION_DURATION);
-        animation.transition_to(1.0, started);
+        let mut animation = ExpansionAnimation::default();
+        let visible = notification_group_visible_fraction(&snapshot, source, 0.0, 0.0);
+        animation.transition_group(true, children_height, visible, started);
         let closed_at = started + Duration::from_millis(open_time);
         animation.advance(closed_at);
         let before = height(animation.progress);
         let visible =
             notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
-        animation.collapse_visible(visible, closed_at);
+        animation.transition_group(false, children_height, visible, closed_at);
         assert_eq!(height(animation.progress), before);
         let before_closing = animation.progress;
         let reopened_at = closed_at + Duration::from_millis(4);
         animation.advance(reopened_at);
         let partially_closed = animation.progress;
         assert!(height(partially_closed) < before);
-        animation.transition_to(1.0, reopened_at);
+        let visible =
+            notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
+        animation.transition_group(true, children_height, visible, reopened_at);
         assert_eq!(animation.progress, partially_closed);
-        animation.advance(reopened_at + Duration::from_millis(4));
-        let closing_distance = before_closing - partially_closed;
-        let opening_distance = animation.progress - partially_closed;
-        assert!(opening_distance > 0.0);
-        assert!((opening_distance - closing_distance).abs() < 0.0001);
+        animation.advance(reopened_at + Duration::from_millis(2));
+        let closing_distance = (before_closing - partially_closed) * children_height;
+        let opening_distance = (animation.progress - partially_closed) * children_height;
+        assert!((closing_distance - 188.0 * 4.0 / 540.0).abs() < 0.001);
+        assert!((opening_distance - closing_distance / 2.0).abs() < 0.001);
+        animation.advance(reopened_at + Duration::from_millis(406));
+        assert_eq!(animation.progress, 1.0);
+        assert!(!animation.is_animating());
     }
 }
 
 #[test]
-fn notification_group_collapse_accounts_for_preceding_transfer_headers_and_scroll() {
+fn notification_group_animation_accounts_for_transfer_headers_and_visible_header_scroll() {
     let mut earlier = notification();
     earlier.app_name = "COSMIC Files".to_string();
     earlier.file_transfer = Some(FileTransfer {
@@ -370,23 +385,50 @@ fn notification_group_collapse_accounts_for_preceding_transfer_headers_and_scrol
         state: FileTransferState::Running,
     });
     let mut notifications = vec![earlier];
-    notifications.extend(vec![notification(); 30]);
+    notifications.extend(vec![notification(); 43]);
+    // Additional compact rows make a 71 px scroll offset valid even while the
+    // selected group is closed. Its header stays visible throughout opening.
+    for index in 0..3 {
+        let mut other = notification();
+        other.app_name = format!("Following app {index}");
+        notifications.push(other);
+    }
     let snapshot = SystemSnapshot {
         notifications,
         ..Default::default()
     };
     let source = notification_source(&snapshot.notifications[1]);
-    let children_height = 30.0 * NOTIFICATION_ITEM_HEIGHT as f32;
-    // The 71 px transfer header and 47 px group header leave 70 px visible.
-    let at_top = notification_group_visible_fraction(&snapshot, source, 1.0, 0.0);
-    assert!((at_top * children_height - 70.0).abs() < 0.01);
-    // Scrolling the transfer header away exposes three complete child rows.
-    let scrolled = notification_group_visible_fraction(&snapshot, source, 1.0, 71.0);
-    assert!((scrolled * children_height - 141.0).abs() < 0.01);
+    let children_height = notification_group_children_height(&snapshot, source);
+    for (scroll_offset, expected_visible_height) in [(0.0, 70.0), (71.0, 141.0)] {
+        let started = Instant::now();
+        let visible = notification_group_visible_fraction(&snapshot, source, 0.0, scroll_offset);
+        assert!((visible * children_height - expected_visible_height).abs() < 0.01);
+        let visible_duration = Duration::from_secs_f32(expected_visible_height * 0.540 / 188.0);
+        let mut animation = ExpansionAnimation::default();
+        animation.transition_group(true, children_height, visible, started);
+        animation.advance(started + visible_duration / 2);
+        assert!(
+            (animation.progress * children_height - expected_visible_height / 2.0).abs() < 0.01
+        );
+        animation.advance(started + visible_duration + Duration::from_millis(1));
+        assert_eq!(animation.progress, 1.0);
+        assert!(!animation.is_animating());
+        assert!(visible_duration <= Duration::from_millis(406));
+
+        let closed_at = started + Duration::from_secs(1);
+        let visible = notification_group_visible_fraction(&snapshot, source, 1.0, scroll_offset);
+        animation.transition_group(false, children_height, visible, closed_at);
+        animation.advance(closed_at + visible_duration / 2);
+        assert!(
+            (animation.progress * children_height - expected_visible_height / 2.0).abs() < 0.01
+        );
+        animation.advance(closed_at + visible_duration + Duration::from_millis(1));
+        assert!(animation.is_collapsed());
+    }
 }
 
 #[test]
-fn notification_group_collapse_clamps_stale_scroll_offsets() {
+fn notification_group_animation_clamps_stale_scroll_offsets() {
     let snapshot = SystemSnapshot {
         notifications: vec![notification(); 30],
         ..Default::default()
@@ -404,23 +446,53 @@ fn notification_group_collapse_clamps_stale_scroll_offsets() {
 }
 
 #[test]
-fn small_notification_groups_keep_their_existing_collapse_timing() {
-    let snapshot = SystemSnapshot {
-        notifications: vec![notification(); 2],
-        ..Default::default()
-    };
-    let source = notification_source(&snapshot.notifications[0]);
+fn small_and_tall_notification_groups_use_the_same_pixel_speed() {
+    for transfer in [
+        None,
+        Some(FileTransfer {
+            progress: 30,
+            state: FileTransferState::Running,
+        }),
+    ] {
+        let mut item = notification();
+        item.file_transfer = transfer;
+        let snapshot = SystemSnapshot {
+            notifications: vec![item; 2],
+            ..Default::default()
+        };
+        let source = notification_source(&snapshot.notifications[0]);
+        let started = Instant::now();
+        let children_height = notification_group_children_height(&snapshot, source);
+        let visible = notification_group_visible_fraction(&snapshot, source, 0.0, 0.0);
+        let visible_height = visible * children_height;
+        let visible_duration = Duration::from_secs_f32(visible_height * 0.540 / 188.0);
+        let mut animation = ExpansionAnimation::default();
+        animation.transition_group(true, children_height, visible, started);
+        animation.advance(started + Duration::from_millis(100));
+        assert!((animation.progress * children_height - 188.0 * 100.0 / 540.0).abs() < 0.01);
+        animation.advance(started + visible_duration + Duration::from_millis(1));
+        assert_eq!(animation.progress, 1.0);
+        assert!(!animation.is_animating());
+        let closed_at = started + Duration::from_secs(1);
+        animation.transition_group(false, children_height, visible, closed_at);
+        animation.advance(closed_at + Duration::from_millis(100));
+        assert!(
+            (animation.progress * children_height - (visible_height - 188.0 * 100.0 / 540.0)).abs()
+                < 0.01
+        );
+        animation.advance(closed_at + visible_duration + Duration::from_millis(1));
+        assert!(animation.is_collapsed());
+    }
+}
+
+#[test]
+fn fully_offscreen_notification_groups_do_not_animate() {
     let started = Instant::now();
-    let duration = NOTIFICATION_GROUP_EXPANSION_DURATION;
-    let mut animation = ExpansionAnimation::with_duration(duration);
-    animation.transition_to(1.0, started);
-    animation.advance(started + duration);
-    let visible = notification_group_visible_fraction(&snapshot, source, animation.progress, 0.0);
-    assert_eq!(visible, 1.0);
-    animation.collapse_visible(visible, started + duration);
-    animation.advance(started + duration + duration / 2);
-    assert!((animation.progress - 0.5).abs() < 0.01);
-    animation.advance(started + duration * 2);
+    let mut animation = ExpansionAnimation::default();
+    animation.transition_group(true, 43.0 * 47.0, 0.0, started);
+    assert_eq!(animation.progress, 1.0);
+    assert!(!animation.is_animating());
+    animation.transition_group(false, 43.0 * 47.0, 0.0, started);
     assert!(animation.is_collapsed());
 }
 
@@ -740,7 +812,7 @@ fn ai_usage_reserves_space_for_both_providers_and_honors_toggle() {
     let window = snapshot.codex_usage.windows[0].clone();
     snapshot.claude_usage.windows = vec![window.clone(), window.clone()];
     let one_row = desired_surface_height(&config, &snapshot);
-    // The usual Codex weekly + Claude five-hour/weekly limits share one row.
+    // Provider cards reserve two quota rows even while a report is unavailable.
     assert_eq!(one_row, empty);
 
     snapshot.claude_usage.windows.push(window.clone());
@@ -748,7 +820,7 @@ fn ai_usage_reserves_space_for_both_providers_and_honors_toggle() {
     assert!(two_rows > one_row);
     snapshot.codex_usage.windows.push(window);
     snapshot.claude_usage.windows.pop();
-    assert_eq!(desired_surface_height(&config, &snapshot), two_rows);
+    assert_eq!(desired_surface_height(&config, &snapshot), one_row);
 
     snapshot.codex_usage = Default::default();
     assert_eq!(desired_surface_height(&config, &snapshot), one_row);

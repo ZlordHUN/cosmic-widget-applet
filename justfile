@@ -69,9 +69,9 @@ run-settings *args:
 run-iced-widget *args:
     env RUST_BACKTRACE=full cargo run --release --bin cosmic-widget-iced {{args}}
 
-# Check installation inputs and build missing binaries without running Cargo as root.
+# Check all packaged resources before building or copying installation files.
 [private]
-_prepare-install:
+_check-install-resources:
     #!/usr/bin/env bash
     set -euo pipefail
     for source in resources/app.desktop resources/widget.desktop resources/settings.desktop resources/app.metainfo.xml resources/icon.svg resources/70-cosmic-widget-headsets.rules assets/weather/meteocons/LICENSE assets/icons/material-design/LICENSE; do
@@ -80,41 +80,47 @@ _prepare-install:
             exit 1
         fi
     done
+
+# Refresh all installed binaries without ever running Cargo as root.
+[private]
+_prepare-install: _check-install-resources
+    #!/usr/bin/env bash
+    set -euo pipefail
     target_dir={{ quote(cargo-target-dir) }}
-    binaries=({{ quote(name) }} {{ quote(widget-source-name) }} {{ quote(settings-name) }})
-    missing=false
-    for binary in "${binaries[@]}"; do
-        if [[ ! -x "$target_dir/release/$binary" ]]; then
-            printf 'Missing release binary: %s\n' "$target_dir/release/$binary" >&2
-            missing=true
-        fi
-    done
-    if [[ "$missing" == false ]]; then
-        exit 0
-    fi
-    build=(build --locked --release --target-dir "$target_dir")
-    for binary in "${binaries[@]}"; do
-        build+=(--bin "$binary")
-    done
+    build=(build --locked --release --target-dir "$target_dir" --bin {{ quote(name) }} --bin {{ quote(widget-source-name) }} --bin {{ quote(settings-name) }})
     if [[ "$EUID" == 0 ]]; then
-        if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == root ]]; then
-            printf 'Run just build-release as your normal user, then run the installation again.\n' >&2
+        build_user="${SUDO_USER:-}"
+        if [[ -z "$build_user" && "${PKEXEC_UID:-}" =~ ^[0-9]+$ ]]; then
+            build_user="$(id -nu -- "$PKEXEC_UID" 2>/dev/null || true)"
+        fi
+        if [[ -z "$build_user" ]] || ! build_uid="$(id -u -- "$build_user" 2>/dev/null)" || [[ "$build_uid" == 0 ]]; then
+            printf 'Cannot identify a non-root build user. Run sudo just install from your normal account, or build as that user and run just install-prebuilt.\n' >&2
             exit 1
         fi
-        printf 'Building missing release binaries as %s...\n' "$SUDO_USER"
-        sudo -H -u "$SUDO_USER" -- sh -c 'PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec cargo "$@"' sh "${build[@]}"
+        printf 'Refreshing release binaries as %s...\n' "$build_user"
+        sudo -H -u "$build_user" -- sh -c 'PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec cargo "$@"' sh "${build[@]}"
     else
         cargo "${build[@]}"
     fi
-    for binary in "${binaries[@]}"; do
+
+# Validate every binary before copying any installation files.
+[private]
+_check-install-binaries:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target_dir={{ quote(cargo-target-dir) }}
+    for binary in {{ quote(name) }} {{ quote(widget-source-name) }} {{ quote(settings-name) }}; do
         if [[ ! -x "$target_dir/release/$binary" ]]; then
-            printf 'Build did not produce %s\n' "$target_dir/release/$binary" >&2
+            printf 'Missing release binary: %s. Run just build-release first.\n' "$target_dir/release/$binary" >&2
             exit 1
         fi
     done
 
-# Installs prebuilt files, building any missing release binaries first.
-install: _prepare-install
+# Build current sources as the invoking user, then install all production files.
+install: _prepare-install install-prebuilt
+
+# Install already-built release files (for packaging or a direct root session).
+install-prebuilt: _check-install-resources _check-install-binaries
     install -Dm0755 {{ quote(cargo-target-dir / 'release' / name) }} {{ quote(bin-dst) }}
     install -Dm0755 {{ quote(cargo-target-dir / 'release' / widget-source-name) }} {{ quote(widget-bin-dst) }}
     install -Dm0755 {{ quote(cargo-target-dir / 'release' / settings-name) }} {{ quote(settings-bin-dst) }}

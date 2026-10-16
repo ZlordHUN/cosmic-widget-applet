@@ -3,7 +3,7 @@
 use crate::monitors::notifications::{FileTransfer, Notification};
 use crate::overlay::Message;
 use crate::overlay::components::{
-    notification_icon,
+    button_style, notification_icon,
     section::{compact_single_line, embedded_symbolic_icon},
     shrink, slide, translate,
 };
@@ -49,7 +49,7 @@ pub(in crate::overlay) fn notifications_view<'a>(
                 .center_x(Length::Fill)
                 .center_y(Length::Fill),
         )
-        .class(clear_all_button_class())
+        .class(button_style::accent_hover(clear_all_button_class))
         .width(Length::Fixed(CLEAR_ALL_BUTTON_WIDTH))
         .height(Length::Fixed(28.0))
         .padding(0)
@@ -364,12 +364,21 @@ fn notification_group_item<'a>(
                 cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             )),
         );
-    let chevron = widget::icon::from_name(if expanded {
-        "go-down-symbolic"
-    } else {
-        "go-next-symbolic"
-    })
-    .size(16);
+    let chevron = widget::button::custom(
+        widget::icon::from_name(if expanded {
+            "go-down-symbolic"
+        } else {
+            "go-next-symbolic"
+        })
+        .size(16),
+    )
+    .width(Length::Fixed(28.0))
+    .height(Length::Fixed(28.0))
+    .padding(6)
+    .class(button_style::accent_hover(|| theme::Button::Icon))
+    .on_press_down(Message::ToggleNotificationGroup {
+        source: group.source.to_string(),
+    });
     let content = widget::row::with_capacity(3)
         .width(Length::Fill)
         .align_y(Alignment::Center)
@@ -563,12 +572,9 @@ fn file_transfer_progress(transfer: &FileTransfer) -> Element<'static, Message> 
         .height(Length::Fixed(18.0))
         .align_y(Alignment::Center)
         .spacing(8)
-        .push(
-            widget::progress_bar::linear::Linear::new()
-                .girth(3)
-                .progress(f32::from(progress) / 100.0)
-                .width(Length::Fill),
-        )
+        .push(crate::overlay::components::gauge::progress_bar(f32::from(
+            progress,
+        )))
         .push(
             widget::container(widget::text::caption(format!("{progress}%")))
                 .width(Length::Fixed(36.0))

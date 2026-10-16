@@ -5,15 +5,17 @@ use cosmic::iced::advanced::widget::tree::{self, Tree};
 use cosmic::iced::advanced::{self, Clipboard, Layout, Shell, Widget, layout, renderer};
 use cosmic::iced::widget::{Stack, canvas};
 use cosmic::iced::{
-    Alignment, Border, Color, Event, Length, Point, Radians, Rectangle, Size, Vector, mouse, window,
+    Alignment, Background, Border, Color, Event, Length, Radians, Rectangle, Size, Vector, mouse,
+    window,
 };
 use cosmic::{Element, Renderer, Theme, widget};
+use std::cell::Cell;
 use std::f32::consts::PI;
 use std::time::Duration;
 
 const GAUGE_SIZE: f32 = 112.0;
 const TRACK_WIDTH: f32 = 8.0;
-const BAR_HEIGHT: f32 = 8.0;
+pub(in crate::overlay) const BAR_HEIGHT: f32 = 8.0;
 const START_ANGLE: f32 = 3.0 * PI / 4.0;
 const SWEEP_ANGLE: f32 = 3.0 * PI / 2.0;
 const ANIMATION_LAG: Duration = Duration::from_millis(280);
@@ -72,7 +74,49 @@ pub(in crate::overlay) fn remaining_gauge(
 }
 
 pub fn indicator_bar(value: f32) -> Element<'static, crate::overlay::Message> {
-    UtilizationBar::new(value / 100.0).into()
+    MeterBar::new(Some(value), BarKind::Utilization, false).into()
+}
+
+pub(in crate::overlay) fn remaining_bar(
+    value: Option<f32>,
+    stale: bool,
+) -> Element<'static, crate::overlay::Message> {
+    MeterBar::new(value, BarKind::Remaining, stale).into()
+}
+
+pub(in crate::overlay) fn progress_bar(value: f32) -> Element<'static, crate::overlay::Message> {
+    MeterBar::new(Some(value), BarKind::Progress, false).into()
+}
+
+// Share the same rail with the media slider while retaining its interaction.
+pub(in crate::overlay) fn progress_bar_style(
+    theme: &Theme,
+) -> cosmic::iced::widget::progress_bar::Style {
+    bar_style(theme, meter_style(theme).bar_color, false)
+}
+
+fn bar_style(
+    theme: &Theme,
+    color: Color,
+    muted: bool,
+) -> cosmic::iced::widget::progress_bar::Style {
+    let meter = meter_style(theme);
+    cosmic::iced::widget::progress_bar::Style {
+        background: Background::Color(meter.track_color),
+        bar: Background::Color(Color {
+            a: color.a * if muted { 0.65 } else { 1.0 },
+            ..color
+        }),
+        border: Border {
+            radius: (BAR_HEIGHT / 2.0).into(),
+            width: if meter.border_color.is_some() {
+                1.0
+            } else {
+                0.0
+            },
+            color: meter.border_color.unwrap_or(Color::TRANSPARENT),
+        },
+    }
 }
 
 fn format_temperature(value: f32) -> String {
@@ -135,6 +179,7 @@ struct GaugeState {
     progress: State,
     cache: canvas::Cache<Renderer>,
     appearance: Option<GaugeAppearance>,
+    colors: Cell<Option<(Color, Color)>>,
 }
 
 impl State {
@@ -157,19 +202,33 @@ impl State {
     }
 }
 
-struct UtilizationBar {
-    target: f32,
+#[derive(Clone, Copy)]
+enum BarKind {
+    Utilization,
+    Remaining,
+    Progress,
 }
 
-impl UtilizationBar {
-    fn new(target: f32) -> Self {
+struct MeterBar {
+    target: f32,
+    available: bool,
+    kind: BarKind,
+    muted: bool,
+}
+
+impl MeterBar {
+    fn new(value: Option<f32>, kind: BarKind, muted: bool) -> Self {
+        let value = value.filter(|value| value.is_finite());
         Self {
-            target: target.clamp(0.0, 1.0),
+            target: value.map_or(0.0, |value| value.clamp(0.0, 100.0) / 100.0),
+            available: value.is_some(),
+            kind,
+            muted,
         }
     }
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for UtilizationBar
+impl<Message> Widget<Message, Theme, Renderer> for MeterBar
 where
     Message: Clone,
 {
@@ -205,10 +264,15 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        if let Event::Window(window::Event::RedrawRequested(now)) = event
-            && tree.state.downcast_mut::<State>().update(self.target, *now)
-        {
-            shell.request_redraw_at(*now + ANIMATION_FRAME_INTERVAL);
+        if let Event::Window(window::Event::RedrawRequested(now)) = event {
+            let state = tree.state.downcast_mut::<State>();
+            if !self.available {
+                // An expired or missing quota must immediately lose its fill,
+                // rather than briefly animate the last known report down to zero.
+                *state = State::default();
+            } else if state.update(self.target, *now) {
+                shell.request_redraw_at(*now + ANIMATION_FRAME_INTERVAL);
+            }
         }
     }
 
@@ -225,42 +289,56 @@ where
         use advanced::Renderer as _;
 
         let bounds = layout.bounds();
-        let current = tree.state.downcast_ref::<State>().current;
-        let meter_style = meter_style(theme);
-        let active = indicator_color(theme, self.target * 100.0, meter_style.bar_color);
-        let border = Border {
-            width: meter_style.border_color.map_or(0.0, |_| 1.0),
-            color: meter_style.border_color.unwrap_or(meter_style.bar_color),
-            radius: meter_style.border_radius.into(),
+        let current = if self.available {
+            tree.state.downcast_ref::<State>().current
+        } else {
+            0.0
         };
-        let draw_quad = |renderer: &mut Renderer, color| {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds,
-                    border,
-                    snap: true,
-                    ..renderer::Quad::default()
-                },
-                color,
-            );
+        let normal = meter_style(theme).bar_color;
+        let color = match self.kind {
+            BarKind::Utilization => indicator_color(theme, self.target * 100.0, normal),
+            // The fill is remaining allowance; severity follows consumed quota.
+            BarKind::Remaining => indicator_color(theme, (1.0 - self.target) * 100.0, normal),
+            BarKind::Progress => normal,
         };
-
-        draw_quad(renderer, meter_style.track_color);
+        let style = bar_style(theme, color, self.muted);
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: style.border,
+                snap: true,
+                ..Default::default()
+            },
+            style.background,
+        );
         if current > SNAP_THRESHOLD {
             let fill = Rectangle {
                 width: bounds.width * current,
                 ..bounds
             };
-            renderer.with_layer(fill, |renderer| draw_quad(renderer, active));
+            // Draw the actual fill rectangle: clipping a full-width rounded
+            // track would leave the advancing end square.
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: fill,
+                    border: Border {
+                        radius: (fill.height.min(fill.width) / 2.0).into(),
+                        ..Default::default()
+                    },
+                    snap: true,
+                    ..Default::default()
+                },
+                style.bar,
+            );
         }
     }
 }
 
-impl<'a, Message> From<UtilizationBar> for cosmic::iced::Element<'a, Message, Theme, Renderer>
+impl<'a, Message> From<MeterBar> for cosmic::iced::Element<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
 {
-    fn from(bar: UtilizationBar) -> Self {
+    fn from(bar: MeterBar) -> Self {
         Self::new(bar)
     }
 }
@@ -355,22 +433,25 @@ where
                 _ => meter_style.bar_color,
             },
         };
+        let colors = (track, active);
+        if state.colors.replace(Some(colors)) != Some(colors) {
+            state.cache.clear();
+        }
         let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
             let track_width = TRACK_WIDTH * self.appearance.size / GAUGE_SIZE;
             let radius = (self.appearance.size - track_width) / 2.0;
 
             match self.appearance.style {
-                TemperatureGaugeStyle::Arc => {
+                TemperatureGaugeStyle::Arc | TemperatureGaugeStyle::Text => {
                     stroke_arc(
                         frame,
                         radius,
                         START_ANGLE,
                         START_ANGLE + SWEEP_ANGLE,
-                        track,
-                        canvas::LineCap::Butt,
+                        canvas::Style::Solid(track),
+                        canvas::LineCap::Round,
                         track_width,
                     );
-                    fill_arc_cap(frame, radius, START_ANGLE + SWEEP_ANGLE, track, track_width);
                 }
                 TemperatureGaugeStyle::Circular => {
                     frame.stroke(
@@ -380,44 +461,31 @@ where
                             .with_width(track_width),
                     );
                 }
-                TemperatureGaugeStyle::Text => {
-                    stroke_arc(
-                        frame,
-                        radius,
-                        START_ANGLE,
-                        START_ANGLE + SWEEP_ANGLE,
-                        track,
-                        canvas::LineCap::Butt,
-                        track_width,
-                    );
-                    fill_arc_cap(frame, radius, START_ANGLE + SWEEP_ANGLE, track, track_width);
-                }
             }
 
             if current > SNAP_THRESHOLD {
                 let (start, sweep) = gauge_angles(self.appearance.style);
-                if self.appearance.style == TemperatureGaugeStyle::Circular
+                let path = if self.appearance.style == TemperatureGaugeStyle::Circular
                     && current >= 1.0 - SNAP_THRESHOLD
                 {
-                    frame.stroke(
-                        &canvas::Path::circle(frame.center(), radius),
-                        canvas::Stroke::default()
-                            .with_color(active)
-                            .with_width(track_width),
-                    );
+                    canvas::Path::circle(frame.center(), radius)
                 } else {
-                    stroke_arc(
-                        frame,
-                        radius,
-                        start,
-                        start + sweep * current,
-                        active,
-                        canvas::LineCap::Round,
-                        track_width,
-                    );
-                }
-            } else if self.appearance.style == TemperatureGaugeStyle::Arc {
-                fill_arc_cap(frame, radius, START_ANGLE, track, track_width);
+                    canvas::Path::new(|builder| {
+                        builder.arc(canvas::path::Arc {
+                            center: frame.center(),
+                            radius,
+                            start_angle: Radians(start),
+                            end_angle: Radians(start + sweep * current),
+                        });
+                    })
+                };
+                frame.stroke(
+                    &path,
+                    canvas::Stroke::default()
+                        .with_color(active)
+                        .with_width(track_width)
+                        .with_line_cap(canvas::LineCap::Round),
+                );
             }
         });
 
@@ -443,7 +511,7 @@ fn stroke_arc(
     radius: f32,
     start_angle: f32,
     end_angle: f32,
-    color: Color,
+    style: canvas::Style,
     line_cap: canvas::LineCap,
     track_width: f32,
 ) {
@@ -456,26 +524,13 @@ fn stroke_arc(
     });
     frame.stroke(
         &builder.build(),
-        canvas::Stroke::default()
-            .with_color(color)
-            .with_width(track_width)
-            .with_line_cap(line_cap),
+        canvas::Stroke {
+            style,
+            ..Default::default()
+        }
+        .with_width(track_width)
+        .with_line_cap(line_cap),
     );
-}
-
-fn fill_arc_cap(
-    frame: &mut canvas::Frame<Renderer>,
-    radius: f32,
-    angle: f32,
-    color: Color,
-    track_width: f32,
-) {
-    let center = frame.center();
-    let cap_center = Point::new(
-        center.x + radius * angle.cos(),
-        center.y + radius * angle.sin(),
-    );
-    frame.fill(&canvas::Path::circle(cap_center, track_width / 2.0), color);
 }
 
 fn meter_style(theme: &Theme) -> cosmic::widget::progress_bar::style::Appearance {

@@ -105,7 +105,7 @@ thread, D-Bus connection, or HTTP client for each update.
 | Weather | Open-Meteo through a persistent `reqwest` client |
 | Notifications | Native `zbus` monitoring and COSMIC history reconciliation |
 | Media | MPRIS over `zbus`, Cider HTTP, and Emby discovery/API access |
-| AI Usage | Local Codex quota reports and the Claude Code account usage endpoint |
+| AI Usage | Local Codex quota reports, Claude Code account usage, and saved Claude Desktop reports |
 
 ### Devices
 
@@ -173,14 +173,29 @@ refreshes, replacements, and the on-disk cache. The overlay resolves installed
 icons using that identity (including Discord conversation notifications), keeps
 Instagram's embedded icon, and uses a bell for unknown sources. Icon handles are
 cached with a fixed entry limit; resolution uses local files and icon themes only.
+Transparent margins are removed once per asset so app icons share the same visible
+size as Instagram, while rectangular logos keep their proportions.
 
-When a notification group collapses, the overlay skips children below the
-visible viewport before starting the transition. The visible rows collapse at
-the same speed as opening, including quick reversals. Clipping accounts for
-partial expansion, preceding groups, taller transfer rows and the current scroll
-offset, so large groups close without an offscreen delay.
+Notification groups open and close at a fixed pixel speed (188 px per 540 ms),
+independent of the number of children. Opening finishes the clipped tail as soon
+as the visible segment is revealed; collapsing skips that tail before animating.
+Quick reversals preserve the current visible height and speed. Clipping accounts
+for partial expansion, preceding groups, taller transfer rows and the current
+scroll offset, so large groups close without an offscreen delay.
+
+Media controls and source selectors share the OS accent hover and pressed
+colors. In notifications, that accent feedback is limited to Clear all and the
+group expand/collapse arrow buttons. Notification bodies remain unhighlighted,
+while dismiss/Open controls keep their neutral theme styling. Clear all retains
+its frosted resting surface.
 
 ### Media
+
+Media thumbnails are center-cropped before their rounded corners are applied,
+with small cached textures reused across redraws. Source badges include the app
+icon, and transport controls follow the shared OS accent interaction style.
+MPRIS application identity distinguishes Zen from its Firefox-compatible bus name;
+resolved names are cached until the bus owner changes.
 
 The media monitor merges several sources into a stable player list:
 
@@ -243,11 +258,24 @@ request failures retry from 30 seconds with backoff, rate limits honor `Retry-Af
 and authentication rejection retries periodically instead of remaining latched for
 the entire widget session.
 
-`src/overlay/sections/ai_usage.rs` displays remaining allowance in compact arches
-shared with the temperature gauge component. Provider icons, quota labels, and
-reset times remain visible; hover details include the age of the report. Stale
-reports stay marked, and expired windows wait for a fresh report instead of
-assuming the allowance has refilled.
+When no available Claude Code report can be loaded, Claude also checks the local
+Desktop usage report every 30 seconds. The fallback selects the latest complete
+five-hour and seven-day record from a signed-in Desktop session, preserving its
+original timestamp. Desktop normally saves usage every 5–15 minutes; rereading
+that record does not make it newer. Reports older than 20 minutes are marked
+stale, and logged-out sessions are rejected. Desktop reports omit reset timestamps,
+so the UI shows “Desktop report” and the report age instead of a reset estimate.
+Both sources describe the same account-wide Claude allowance. The monitor prefers
+Code account reports when available because they include reset times.
+
+`src/overlay/sections/ai_usage.rs` displays remaining allowance in equal-width
+Codex and Claude cards with horizontal meters. Both cards reserve two quota rows
+while loading and grow together for additional reported windows. Their rounded
+meters share styling with utilization, storage, media, and transfer progress.
+Provider icons, quota labels, and reset times (or Desktop report age) remain
+visible; hover details explain the source, update cadence, and original age of
+the report. Stale reports stay marked, and expired windows clear their fill while
+waiting for a fresh report instead of assuming the allowance has refilled.
 
 ### Animated Weather Icons
 

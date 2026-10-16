@@ -4,6 +4,7 @@
 
 pub mod claude;
 mod claude_cache;
+mod claude_desktop;
 pub mod codex;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -29,10 +30,19 @@ pub struct UsageWindow {
     pub is_stale: bool,
 }
 
+/// Claude report sources have different metadata and update schedules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UsageSource {
+    ClaudeCode,
+    ClaudeDesktop,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSnapshot {
     pub windows: Vec<UsageWindow>,
     /// Latest report represented here; individual windows retain their own age.
     pub updated_at: Option<i64>,
     pub status: UsageStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<UsageSource>,
 }

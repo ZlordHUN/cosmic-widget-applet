@@ -2,7 +2,9 @@
 
 //! Read Claude's account quota using the same read-only endpoint as Claude Code.
 //!
-//! Only the existing Claude Code access token is read. This monitor never
+//! Claude Desktop's saved usage report is a local fallback when the Code login
+//! is unavailable. Only the existing Claude Code access token is read; desktop
+//! credentials are never decrypted or used. This monitor never
 //! refreshes credentials, starts an inference request, or writes a login file.
 //! Requests are restricted to Anthropic's fixed HTTPS endpoint, with redirects
 //! disabled. Tokens and response bodies must never be logged.
@@ -20,7 +22,8 @@ use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
 use serde::Deserialize;
 
 use super::claude_cache::{self, CacheRecord};
-use super::{UsageSnapshot, UsageStatus, UsageWindow};
+use super::claude_desktop::DesktopUsageReader;
+use super::{UsageSnapshot, UsageSource, UsageStatus, UsageWindow};
 
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -61,16 +64,21 @@ impl ClaudeUsageMonitor {
                     cache_path: claude_cache::cache_path(),
                     ..UsageReader::default()
                 };
+                let mut desktop = DesktopUsageReader::default();
                 loop {
                     if worker_enabled.load(Ordering::Relaxed) {
+                        let now = chrono::Utc::now().timestamp();
+                        let desktop_snapshot = desktop.snapshot(now);
                         let value = match (credentials.as_ref(), client.as_ref()) {
                             (Some(path), Some(client)) => {
-                                let now = chrono::Utc::now().timestamp();
                                 let credentials = reader.prepare_refresh(path, now);
                                 // Publish the saved report before a network request
                                 // can block. Its original age and reset times remain.
                                 if let Ok(mut snapshot) = worker_snapshot.lock() {
-                                    *snapshot = reader.snapshot.clone();
+                                    *snapshot = preferred_snapshot(
+                                        reader.snapshot.clone(),
+                                        desktop_snapshot.clone(),
+                                    );
                                 }
                                 if let Some(credentials) = credentials {
                                     reader.refresh_prepared(path, now, credentials, |token, now| {
@@ -84,7 +92,7 @@ impl ClaudeUsageMonitor {
                             _ => UsageSnapshot::default(),
                         };
                         if let Ok(mut snapshot) = worker_snapshot.lock() {
-                            *snapshot = value;
+                            *snapshot = preferred_snapshot(value, desktop_snapshot);
                         }
                     }
                     if worker_enabled.load(Ordering::Relaxed) {
@@ -311,7 +319,23 @@ fn parse_usage(bytes: &[u8], now: i64) -> Option<UsageSnapshot> {
         windows,
         updated_at: Some(now),
         status,
+        source: Some(UsageSource::ClaudeCode),
     })
+}
+
+/// Keep each source's windows together. Never borrow reset times or percentages
+/// from another login, organization, or report. A current OAuth report includes
+/// reset times and takes priority; otherwise use the newer available report.
+fn preferred_snapshot(code: UsageSnapshot, desktop: Option<UsageSnapshot>) -> UsageSnapshot {
+    if code.status == UsageStatus::Available && !code.windows.is_empty() {
+        return code;
+    }
+    if let Some(desktop) = desktop.filter(|report| !report.windows.is_empty()) {
+        if code.windows.is_empty() || desktop.updated_at > code.updated_at {
+            return desktop;
+        }
+    }
+    code
 }
 
 #[derive(Default)]
@@ -372,6 +396,7 @@ impl UsageReader {
                 .and_then(|path| claude_cache::load(path, &key, now))
             {
                 self.snapshot = record.snapshot;
+                self.snapshot.source = Some(UsageSource::ClaudeCode);
                 self.next_request_at = record.next_request_at;
                 self.failures = record.failures;
             } else {
@@ -508,6 +533,49 @@ mod tests {
             NOW,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn desktop_report_works_without_code_login_and_never_borrows_code_resets() {
+        let mut desktop = report();
+        desktop.source = Some(UsageSource::ClaudeDesktop);
+        desktop.updated_at = Some(NOW + 60);
+        for window in &mut desktop.windows {
+            window.updated_at = NOW + 60;
+            window.resets_at = None;
+        }
+        assert_eq!(
+            preferred_snapshot(sign_in_required(), Some(desktop.clone())),
+            desktop
+        );
+        let mut code = report();
+        assert_eq!(
+            preferred_snapshot(code.clone(), Some(desktop.clone())),
+            code
+        );
+        code.status = UsageStatus::Stale;
+        assert_eq!(
+            preferred_snapshot(code.clone(), Some(desktop.clone())),
+            desktop
+        );
+        code.updated_at = Some(NOW + 120);
+        assert_eq!(preferred_snapshot(code.clone(), Some(desktop)), code);
+    }
+
+    #[test]
+    fn expired_code_login_falls_back_to_desktop_report_without_network_request() {
+        let file = CredentialFile::new();
+        file.write("expired-token", NOW - 1);
+        let mut reader = UsageReader::default();
+        let code = reader.refresh(&file.0, NOW, |_, _| {
+            panic!("expired token must not be sent")
+        });
+        let mut desktop = report();
+        desktop.source = Some(UsageSource::ClaudeDesktop);
+        for window in &mut desktop.windows {
+            window.resets_at = None;
+        }
+        assert_eq!(preferred_snapshot(code, Some(desktop.clone())), desktop);
     }
 
     struct CredentialFile(PathBuf);

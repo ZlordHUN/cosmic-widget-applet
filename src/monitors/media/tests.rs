@@ -244,6 +244,33 @@ fn decoded_artwork_uses_an_encoded_iced_handle() {
 }
 
 #[test]
+fn svg_app_icon_fallback_preserves_aspect_ratio_and_transparency() {
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="512"><rect width="1024" height="512" fill="#ff0000" opacity="0.5"/></svg>"##;
+    let artwork = MediaMonitor::decode_svg_icon(svg).unwrap();
+    assert_eq!((artwork.source_width, artwork.source_height), (256, 128));
+    let cosmic::iced::widget::image::Handle::Bytes(_, bytes) = &artwork.iced_handle else {
+        panic!("SVG icon fallback should use an encoded Iced handle");
+    };
+    let image = image::load_from_memory(bytes).unwrap().to_rgba8();
+    let pixel = image.get_pixel(128, 64);
+    assert_eq!(pixel[0], 255, "partly transparent red must not be darkened");
+    assert!((127..=128).contains(&pixel[3]));
+    assert!(MediaMonitor::decode_svg_icon(b"not an SVG").is_none());
+}
+
+#[test]
+#[ignore = "requires the installed Zen browser icon"]
+fn loads_installed_zen_fallback_icon_despite_firefox_bus_name() {
+    let bus = "org.mpris.MediaPlayer2.firefox.instance_1";
+    let path = MediaMonitor::get_player_icon_path(bus, "Zen").unwrap();
+    assert!(path.contains("zen"));
+    assert!(!path.contains("firefox"));
+    let artwork = MediaMonitor::load_app_icon(bus, "Zen").unwrap();
+    assert!(artwork.source_width > 0 && artwork.source_width <= 256);
+    assert!(artwork.source_height > 0 && artwork.source_height <= 256);
+}
+
+#[test]
 fn completed_artwork_is_cached_but_only_applied_to_its_original_track() {
     let player_id = PlayerId::Mpris("org.mpris.MediaPlayer2.firefox".to_string());
     let old_track = TrackSignature::from(&media(PlaybackStatus::Playing, 0, "Previous video"));

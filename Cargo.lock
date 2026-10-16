@@ -1174,6 +1174,7 @@ dependencies = [
  "pango",
  "pangocairo",
  "reqwest",
+ "resvg",
  "rust-embed",
  "scraper",
  "serde",

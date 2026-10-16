@@ -44,6 +44,8 @@ env_logger = "0.11"
 dirs = "5.0"
 zbus = "4.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Reuse Iced's SVG renderer to normalize transparent application-icon margins.
+resvg = { version = "0.45.1", default-features = false }
 nvml-wrapper = "0.12.1"
 
 # Wayland layer-shell dependencies for widget

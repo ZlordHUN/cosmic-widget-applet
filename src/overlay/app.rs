@@ -6,7 +6,8 @@ use super::animation::{
     ExpansionAnimation, NOTIFICATION_GROUP_EXPANSION_DURATION, ScrollAnimation,
 };
 use super::layout::{
-    desired_surface_height, notification_group_size, notification_group_visible_fraction,
+    desired_surface_height, notification_group_children_height, notification_group_size,
+    notification_group_visible_fraction,
 };
 use super::media_state::{
     DismissingMedia, MEDIA_CONTROL_GRACE, PendingPlayback, advance_media_dismissal,
@@ -414,27 +415,27 @@ impl App {
                 let now = Instant::now();
                 let current_scroll_offset = self.notification_scroll.target;
                 self.notification_scroll.snap_to(current_scroll_offset);
-                if self.expanded_notification_group.as_deref() == Some(&source) {
-                    if self.notification_group_expansion.target > 0.0 {
-                        self.notification_group_expansion.advance(now);
-                        let visible_fraction = notification_group_visible_fraction(
-                            &self.snapshot,
-                            &source,
-                            self.notification_group_expansion.progress,
-                            current_scroll_offset,
-                        );
-                        self.notification_group_expansion
-                            .collapse_visible(visible_fraction, now);
-                        if self.notification_group_expansion.is_collapsed() {
-                            self.expanded_notification_group = None;
-                        }
-                    } else {
-                        self.notification_group_expansion.transition_to(1.0, now);
-                    }
-                } else {
-                    self.expanded_notification_group = Some(source);
+                let same_group = self.expanded_notification_group.as_deref() == Some(&source);
+                let expanded = !same_group || self.notification_group_expansion.target == 0.0;
+                if !same_group {
+                    self.expanded_notification_group = Some(source.clone());
                     self.notification_group_expansion.reset();
-                    self.notification_group_expansion.transition_to(1.0, now);
+                }
+                self.notification_group_expansion.advance(now);
+                let visible_fraction = notification_group_visible_fraction(
+                    &self.snapshot,
+                    &source,
+                    self.notification_group_expansion.progress,
+                    current_scroll_offset,
+                );
+                self.notification_group_expansion.transition_group(
+                    expanded,
+                    notification_group_children_height(&self.snapshot, &source),
+                    visible_fraction,
+                    now,
+                );
+                if self.notification_group_expansion.is_collapsed() {
+                    self.expanded_notification_group = None;
                 }
                 self.expanded_notification = None;
                 self.notification_expansion.reset();
