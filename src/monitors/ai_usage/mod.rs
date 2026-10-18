@@ -6,6 +6,8 @@ pub mod claude;
 mod claude_cache;
 mod claude_desktop;
 pub mod codex;
+mod codex_desktop;
+mod http_cache;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UsageStatus {

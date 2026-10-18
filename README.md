@@ -25,6 +25,7 @@ and a frosted-glass desktop overlay.
 - YouTube thumbnails and Bandcamp album covers for browser playback
 - Local video thumbnails and readable COSMIC Player episode titles
 - Ten-second backward/forward controls for seekable media
+- Emby Theater subtitle toggle and track selector for compatible active sessions
 - Bandcamp track titles in Zen/Firefox when the playing duration uniquely
   identifies a track, without a browser extension
 - AI Usage below Now Playing, with Codex and Claude remaining allowances,
@@ -89,19 +90,19 @@ Only one overlay instance can run at a time.
 - [COSMIC Files transfer progress](integrations/cosmic-files/README.md) shows copy
   and move progress, then updates the same notification when the operation ends.
   This requires the included COSMIC Files companion and notification timeout patches.
-- Codex usage reads the quota snapshots recorded by your local Codex installation
-  in `$CODEX_HOME/sessions` (default `~/.codex/sessions`). It checks for updates
-  every 30 seconds while enabled and shows each reported quota window, including
-  weekly or five-hour limits when available. These are the remaining allowances
-  reported by Codex, not estimates from token counts. Usage updates after Codex
-  responses; older readings are marked as last known, and elapsed reset times
-  wait for a new report.
+- Codex usage reads local session reports and the desktop app's saved HTTP usage
+  response every 30 seconds. Desktop reports must match the current account;
+  newer desktop resets can update the card without new session log entries.
+  Only reported percentages and reset times are shown. Old reports stay marked
+  as last known, and elapsed resets wait for a new report rather than assuming
+  the allowance has refilled. Desktop reads use bounded local cache files and
+  account-ID metadata only, with no credentials used or extra network polling.
 - ChatGPT credits appear below the allowance cards as the reported remaining
   balance (or Unlimited). These credits are shared by Codex and ChatGPT Work;
   they are separate from the subscription's percentage allowances. The widget
-  reads them from the same local Codex reports, with no extra network requests.
-  Zero is shown only when reported; missing balances remain unavailable. Credit
-  reports older than 15 minutes are marked stale, and hovering shows their age.
+  uses the newer validated balance from the same local reports. Zero is shown
+  only when reported; missing balances remain unavailable. Credit reports older
+  than 15 minutes are marked stale, and hovering shows their age.
 - Claude usage shows the five-hour and weekly allowances shared across Claude
   Desktop, web, and Claude Code. An available Claude Code sign-in provides account
   reports with reset times every five minutes, with backoff on request failures.

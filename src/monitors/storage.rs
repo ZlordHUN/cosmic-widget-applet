@@ -39,10 +39,11 @@
 //! - Shared state: `disk_models` HashMap protected by Arc<Mutex>
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use sysinfo::Disks;
@@ -93,6 +94,8 @@ pub struct DiskInfo {
 pub struct StorageMonitor {
     /// sysinfo's disk list (refreshed on update)
     disks: Disks,
+    /// One representative mount per local filesystem, rebuilt with the disk list.
+    display_disk_indices: Vec<usize>,
     /// List of filtered disk information for display
     pub disk_info: Vec<DiskInfo>,
     /// Map of device name → model name (e.g., "nvme0n1" → "Samsung 970 EVO")
@@ -120,6 +123,8 @@ impl StorageMonitor {
     /// hardware rarely changes during runtime.
     pub fn new() -> Self {
         let disk_models = Arc::new(Mutex::new(HashMap::new()));
+        let disks = Disks::new_with_refreshed_list();
+        let display_disk_indices = display_disk_indices(&disks);
 
         // Load cached disk info to show immediately
         // This provides instant display while real data loads
@@ -127,6 +132,14 @@ impl StorageMonitor {
         let disk_info: Vec<DiskInfo> = cache
             .disks
             .iter()
+            // Discard cached duplicate bind mounts before the first live update.
+            // GVFS connections are discovered separately in the background.
+            .filter(|d| {
+                d.mount_point.contains("/gvfs/")
+                    || display_disk_indices.iter().any(|&index| {
+                        disks.list()[index].mount_point() == Path::new(&d.mount_point)
+                    })
+            })
             .map(|d| DiskInfo {
                 name: d.name.clone(),
                 mount_point: d.mount_point.clone(),
@@ -160,7 +173,8 @@ impl StorageMonitor {
         });
 
         Self {
-            disks: Disks::new_with_refreshed_list(),
+            disks,
+            display_disk_indices,
             disk_info,
             disk_models,
             remote_disks,
@@ -293,6 +307,7 @@ impl StorageMonitor {
         if self.update_counter >= 30 {
             self.update_counter = 0;
             self.disks = Disks::new_with_refreshed_list();
+            self.display_disk_indices = display_disk_indices(&self.disks);
         } else {
             // Normal update: just refresh existing disk data (fast, no FD leak)
             self.disks.refresh();
@@ -303,36 +318,9 @@ impl StorageMonitor {
         // Get disk models from cache (updated by background thread)
         let disk_models = self.disk_models.lock().unwrap().clone();
 
-        for disk in &self.disks {
+        for &index in &self.display_disk_indices {
+            let disk = &self.disks.list()[index];
             let mount_point = disk.mount_point().to_string_lossy().to_string();
-
-            // ================================================================
-            // Mount Point Filtering
-            // ================================================================
-            // Skip non-meaningful mount points
-            // Only show root, /home, and top-level /mnt or /media mounts
-            let is_root = mount_point == "/";
-            let is_home = mount_point == "/home";
-            let is_top_level_mount =
-                mount_point.starts_with("/mnt/") || mount_point.starts_with("/media/");
-
-            // Skip boot partitions, snap mounts, and other system partitions
-            if mount_point.starts_with("/boot")
-                || mount_point.starts_with("/snap")
-                || mount_point.starts_with("/run")
-                || mount_point.starts_with("/sys")
-                || mount_point.starts_with("/proc")
-                || mount_point.starts_with("/dev")
-                || mount_point.starts_with("/tmp")
-                || mount_point.starts_with("/var/snap")
-            {
-                continue;
-            }
-
-            // Only include root, /home, or external mounts
-            if !is_root && !is_home && !is_top_level_mount {
-                continue;
-            }
 
             // ================================================================
             // Space Calculation
@@ -422,6 +410,76 @@ impl StorageMonitor {
             self.is_first_update = false;
         }
     }
+}
+
+/// Resolve only local device nodes, never mount paths that might be remote.
+/// rdev identifies the partition even through /dev/root or /dev/disk/by-* aliases.
+fn block_device_id(source: &OsStr) -> Option<u64> {
+    if !Path::new(source).starts_with("/dev") {
+        return None;
+    }
+    let metadata = fs::metadata(source).ok()?;
+    metadata
+        .file_type()
+        .is_block_device()
+        .then(|| metadata.rdev())
+}
+
+fn is_display_mount(path: &Path) -> bool {
+    path == Path::new("/")
+        || path == Path::new("/home")
+        || ["/mnt", "/media"]
+            .iter()
+            .any(|root| path.starts_with(root) && path != Path::new(root))
+}
+
+fn mount_preference(path: &Path) -> (u8, usize, &Path) {
+    let priority = if path == Path::new("/") {
+        0
+    } else if path == Path::new("/home") {
+        1
+    } else {
+        2
+    };
+    (priority, path.components().count(), path)
+}
+
+/// Preserve disk order, replacing a bind mount with the main mount if necessary.
+/// Different partitions and same-model drives have distinct device IDs. Unknown
+/// identities and non-block sources remain separate rather than hiding storage.
+fn select_display_mounts<'a>(
+    mounts: impl IntoIterator<Item = (&'a Path, Option<u64>)>,
+) -> Vec<usize> {
+    let mut selected: Vec<(usize, &Path)> = Vec::new();
+    let mut filesystems: HashMap<u64, usize> = HashMap::new();
+    for (index, (path, device_id)) in mounts.into_iter().enumerate() {
+        if !is_display_mount(path) {
+            continue;
+        }
+        if let Some(previous) = device_id.and_then(|id| filesystems.get(&id).copied()) {
+            if mount_preference(path) < mount_preference(selected[previous].1) {
+                selected[previous] = (index, path);
+            }
+            continue;
+        }
+        if let Some(id) = device_id {
+            filesystems.insert(id, selected.len());
+        }
+        selected.push((index, path));
+    }
+    selected.into_iter().map(|(index, _)| index).collect()
+}
+
+fn display_disk_indices(disks: &Disks) -> Vec<usize> {
+    // Device lookups happen only at startup and the existing 30-update rescan,
+    // not on each space refresh. No additional polling or worker is needed.
+    select_display_mounts(disks.list().iter().map(|disk| {
+        let mount = disk.mount_point();
+        let device_id = is_display_mount(mount)
+            .then(|| block_device_id(disk.name()))
+            .flatten();
+        (mount, device_id)
+    }))
 }
 
 fn read_sysfs_text(path: &Path) -> Option<String> {
@@ -514,8 +572,82 @@ fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StorageMonitor, is_gvfs_remote_mount, remote_display_name};
+    use super::{StorageMonitor, is_gvfs_remote_mount, remote_display_name, select_display_mounts};
     use std::fs;
+    use std::path::Path;
+
+    fn displayed_mounts<'a>(mounts: &[(&'a str, Option<u64>)]) -> Vec<&'a str> {
+        select_display_mounts(mounts.iter().map(|(path, id)| (Path::new(path), *id)))
+            .into_iter()
+            .map(|index| mounts[index].0)
+            .collect()
+    }
+
+    #[test]
+    fn steam_bind_mount_shares_the_system_filesystem() {
+        let bind = "/mnt/Games/SteamLibrary/steamapps/compatdata";
+        assert_eq!(
+            displayed_mounts(&[("/", Some(1)), ("/mnt/Games", Some(2)), (bind, Some(1))]),
+            ["/", "/mnt/Games"]
+        );
+        // Enumeration order must not replace the system disk with its bind mount.
+        assert_eq!(
+            displayed_mounts(&[(bind, Some(1)), ("/mnt/Games", Some(2)), ("/", Some(1))]),
+            ["/", "/mnt/Games"]
+        );
+    }
+
+    #[test]
+    fn prefers_home_then_shallow_stable_mounts_for_duplicate_filesystems() {
+        assert_eq!(
+            displayed_mounts(&[
+                ("/mnt/backup/home", Some(1)),
+                ("/home", Some(1)),
+                ("/mnt/z-drive/folder", Some(2)),
+                ("/media/z-drive", Some(2)),
+                ("/media/a-drive", Some(2)),
+            ]),
+            ["/home", "/media/a-drive"]
+        );
+    }
+
+    #[test]
+    fn distinct_partitions_and_unresolved_sources_stay_visible() {
+        // Identity comes from the full partition device, never the model name
+        // or parent disk. Remote and unresolved sources are not conflated.
+        assert_eq!(
+            displayed_mounts(&[
+                ("/", Some(1)),
+                ("/home", Some(2)),
+                ("/mnt/second-kingston", Some(3)),
+                ("/mnt/network-a", None),
+                ("/mnt/network-b", None),
+                ("/media/unknown", None),
+            ]),
+            [
+                "/",
+                "/home",
+                "/mnt/second-kingston",
+                "/mnt/network-a",
+                "/mnt/network-b",
+                "/media/unknown"
+            ]
+        );
+    }
+
+    #[test]
+    fn excluded_mounts_do_not_hide_visible_filesystems() {
+        assert_eq!(
+            displayed_mounts(&[
+                ("/boot/efi", Some(1)),
+                ("/mnt/visible", Some(1)),
+                ("/mnt", Some(2)),
+                ("/mnt-other", Some(3)),
+                ("/run/media/hidden", Some(4)),
+            ]),
+            ["/mnt/visible"]
+        );
+    }
 
     #[test]
     fn recognizes_supported_gvfs_network_mounts() {

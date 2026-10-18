@@ -1127,3 +1127,132 @@ fn manual_source_selection_persists_without_playback_transition() {
         Some(firefox)
     );
 }
+
+fn subtitle_monitor() -> (
+    MediaMonitor,
+    std::sync::mpsc::Receiver<super::MediaControlCommand>,
+    super::SubtitleTarget,
+) {
+    let (monitor, receiver) = seek_monitor(20_000, 90_000);
+    let target = super::SubtitleTarget {
+        session_id: "session-1".into(),
+        item_id: "episode-1".into(),
+        media_source_id: Some("source-1".into()),
+    };
+    {
+        let mut state = monitor.player_state.lock().unwrap();
+        state.players[1].0 = PlayerId::Emby(target.session_id.clone());
+        state.players[1].1.subtitles = Some(super::SubtitleState {
+            target: target.clone(),
+            tracks: vec![
+                super::SubtitleTrack {
+                    index: 4,
+                    label: "English".into(),
+                },
+                super::SubtitleTrack {
+                    index: 9,
+                    label: "Slovak".into(),
+                },
+            ],
+            selected_index: Some(4),
+        });
+    }
+    *monitor.emby_control.lock().unwrap() = Some(super::EmbyControl {
+        server_url: "http://test.invalid".into(),
+        access_token: "fixture-token".into(),
+        session_id: target.session_id.clone(),
+        subtitle_target: Some(target.clone()),
+    });
+    (monitor, receiver, target)
+}
+
+#[test]
+fn subtitle_actions_use_stream_indices_and_preserve_reported_state_until_confirmed() {
+    let (monitor, receiver, target) = subtitle_monitor();
+    for index in [9, -1] {
+        assert!(monitor.set_subtitle_track(&target, index));
+        match receiver.try_recv().unwrap() {
+            super::MediaControlCommand::EmbySubtitle {
+                control,
+                target: queued,
+                index: selected,
+            } => {
+                assert_eq!(control.session_id, "session-1");
+                assert_eq!(queued, target);
+                assert_eq!(selected, index);
+            }
+            _ => panic!("subtitle selection must use Emby's general-command queue"),
+        }
+        assert_eq!(
+            monitor.get_media_info().subtitles.unwrap().selected_index,
+            Some(4)
+        );
+    }
+}
+
+#[test]
+fn subtitle_actions_reject_old_item_source_session_and_non_selected_players() {
+    let (monitor, receiver, target) = subtitle_monitor();
+    for index in [-2, 0, 1, 99] {
+        assert!(!monitor.set_subtitle_track(&target, index));
+    }
+    let mut stale = target.clone();
+    stale.item_id = "old-episode".into();
+    assert!(!monitor.set_subtitle_track(&stale, 4));
+    stale = target.clone();
+    stale.media_source_id = Some("old-source".into());
+    assert!(!monitor.set_subtitle_track(&stale, 4));
+    stale = target.clone();
+    stale.session_id = "old-session".into();
+    assert!(!monitor.set_subtitle_track(&stale, 4));
+    monitor.player_state.lock().unwrap().current_index = 0;
+    assert!(!monitor.set_subtitle_track(&target, 4));
+    monitor.player_state.lock().unwrap().current_index = 1;
+    monitor
+        .emby_control
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .subtitle_target = Some(stale);
+    assert!(!monitor.set_subtitle_track(&target, 4));
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn queued_subtitle_selection_becomes_invalid_after_source_change_or_selection_change() {
+    let (monitor, receiver, target) = subtitle_monitor();
+    assert!(monitor.set_subtitle_track(&target, 9));
+    let super::MediaControlCommand::EmbySubtitle {
+        control,
+        target,
+        index,
+    } = receiver.try_recv().unwrap()
+    else {
+        panic!("expected queued subtitle selection")
+    };
+    let mut state = monitor.player_state.lock().unwrap();
+    assert!(super::emby_subtitles::valid_request(
+        &state, &control, &target, index
+    ));
+    state.players[1]
+        .1
+        .subtitles
+        .as_mut()
+        .unwrap()
+        .target
+        .media_source_id = Some("next-version".into());
+    assert!(!super::emby_subtitles::valid_request(
+        &state, &control, &target, index
+    ));
+    state.players[1].1.subtitles.as_mut().unwrap().target = target.clone();
+    state.current_index = 0;
+    assert!(!super::emby_subtitles::valid_request(
+        &state, &control, &target, index
+    ));
+    state.current_index = 1;
+    state.players[1].1.status = PlaybackStatus::Stopped;
+    assert!(!super::emby_subtitles::valid_request(
+        &state, &control, &target, index
+    ));
+}

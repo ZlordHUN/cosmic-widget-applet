@@ -2,31 +2,52 @@
 
 use crate::monitors::battery::BatteryDevice;
 use crate::overlay::Message;
-use crate::overlay::components::battery_icon;
 use crate::overlay::components::section::{METRIC_ICON_SIZE, section};
-use crate::overlay::stats::SystemSnapshot;
-use cosmic::iced::{Alignment, Color, Length};
+use crate::overlay::components::{battery_icon, reveal};
+use crate::overlay::device_state::DeviceList;
+use cosmic::iced::{Alignment, Color, Length, Padding};
 use cosmic::{Element, Theme, theme, widget};
 
+// COSMIC body text defines the 21-pixel row; icons and monospace labels fit inside.
+const DEVICE_ROW_HEIGHT: f32 = 21.0;
+
+pub(in crate::overlay) fn reveal_row_height(section_spacing: u16) -> f32 {
+    DEVICE_ROW_HEIGHT + f32::from(section_spacing)
+}
+
 pub(in crate::overlay) fn devices_view<'a>(
-    stats: &'a SystemSnapshot,
+    state: &'a DeviceList,
     section_spacing: u16,
     row_spacing: u16,
 ) -> Element<'a, Message> {
-    let mut devices = section(
-        "preferences-input-devices-symbolic",
-        "Devices",
-        section_spacing,
-    );
-
-    if stats.devices.is_empty() {
-        devices = devices.push(widget::text::caption("No battery devices found"));
-    } else {
-        for device in &stats.devices {
-            devices = devices.push(device_item(device, row_spacing));
-        }
+    // The gap belongs to the revealed row so removing it leaves no empty space.
+    let mut devices = section("preferences-input-devices-symbolic", "Devices", 0);
+    let padding = Padding {
+        top: f32::from(section_spacing),
+        ..Padding::ZERO
+    };
+    for row in state.rows() {
+        devices = devices.push(reveal::vertical(
+            widget::container(device_item(&row.device, row_spacing))
+                .width(Length::Fill)
+                .padding(padding)
+                .into(),
+            row.animation.progress,
+        ));
     }
-
+    if state.empty_progress() > 0.0 {
+        devices = devices.push(reveal::vertical(
+            widget::container(
+                widget::container(widget::text::caption("No battery devices found"))
+                    .height(Length::Fixed(DEVICE_ROW_HEIGHT))
+                    .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(padding)
+            .into(),
+            state.empty_progress(),
+        ));
+    }
     devices.into()
 }
 
@@ -35,7 +56,16 @@ fn device_item<'a>(device: &'a BatteryDevice, spacing: u16) -> Element<'a, Messa
         .align_y(Alignment::Center)
         .spacing(spacing)
         .push(device_icon(device.kind.as_deref()))
-        .push(widget::text::body(&device.name).width(Length::Fill))
+        .push(widget::tooltip(
+            widget::text::body(&device.name)
+                .width(Length::Fill)
+                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                    cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                )),
+            widget::text::caption(&device.name),
+            widget::tooltip::Position::Top,
+        ))
         .push(battery_status(device, spacing))
         .into()
 }
@@ -206,6 +236,111 @@ fn is_charging(status: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn device_card_height_tracks_reveal_and_collapse_without_row_gaps() {
+        use crate::overlay::animation::NOTIFICATION_GROUP_EXPANSION_DURATION;
+        use crate::overlay::components::section::{CARD_VERTICAL_PADDING, section_card};
+        use crate::overlay::layout::{MAX_VISIBLE_NOTIFICATION_ROWS, NOTIFICATION_ITEM_HEIGHT};
+        use cosmic::iced::advanced::renderer::Headless as _;
+        use cosmic::iced::advanced::{Layout, Renderer as _, layout, renderer, widget::Tree};
+        use cosmic::iced::{Font, Pixels, Rectangle, Size, mouse};
+        use std::time::Instant;
+
+        let mut renderer = <cosmic::Renderer as renderer::Headless>::new(
+            Font::default(),
+            Pixels(14.0),
+            Some("tiny-skia"),
+        )
+        .await
+        .expect("software renderer for device animation validation");
+        let devices: Vec<_> = [
+            ("G309 LIGHTSPEED", "mouse"),
+            ("MX Mechanical Mini", "keyboard"),
+            ("Audeze Maxwell", "headset"),
+            ("Razer Wolverine V3 Pro 8K PC", "controller"),
+        ]
+        .into_iter()
+        .map(|(name, kind)| BatteryDevice {
+            name: name.into(),
+            kind: Some(kind.into()),
+            level: Some(75),
+            status: Some("discharging".into()),
+            codename: None,
+            is_loading: false,
+            is_connected: true,
+        })
+        .collect();
+        let row_height = reveal_row_height(8);
+        let duration = NOTIFICATION_GROUP_EXPANSION_DURATION.mul_f32(
+            row_height / (NOTIFICATION_ITEM_HEIGHT * MAX_VISIBLE_NOTIFICATION_ROWS) as f32,
+        );
+        let started = Instant::now();
+        let theme = Theme::dark();
+        let mut gallery = image::RgbaImage::new(346 * 5, 200 * 2);
+        for (direction, connecting) in [true, false].into_iter().enumerate() {
+            for frame in 0..=4 {
+                let progress = frame as f32 / 4.0;
+                let mut state = DeviceList::default();
+                let (before, after) = if connecting {
+                    (&devices[..3], &devices[..])
+                } else {
+                    (&devices[..], &devices[..3])
+                };
+                state.reconcile(before, started, row_height);
+                state.reconcile(after, started, row_height);
+                state.advance(started + duration.mul_f32(progress));
+                let visible = if connecting { progress } else { 1.0 - progress };
+                let expected =
+                    21.0 + 2.0 * f32::from(CARD_VERTICAL_PADDING) + (3.0 + visible) * row_height;
+                let mut element = section_card(devices_view(&state, 8, 8), 12);
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(346.0, 200.0)),
+                );
+                assert!(
+                    (node.size().height - expected).abs() < 0.1,
+                    "connecting={connecting} frame={frame}: {} != {expected}",
+                    node.size().height
+                );
+                // Optional preview uses the same real renderer and state as the widget.
+                if std::env::var_os("COSMIC_DEVICE_REVEAL_PREVIEW").is_some() {
+                    let viewport = Rectangle::with_size(Size::new(346.0, 200.0));
+                    renderer.reset(viewport);
+                    element.as_widget().draw(
+                        &tree,
+                        &mut renderer,
+                        &theme,
+                        &renderer::Style {
+                            text_color: Color::WHITE,
+                            icon_color: Color::WHITE,
+                            scale_factor: 1.0,
+                        },
+                        Layout::new(&node),
+                        mouse::Cursor::Unavailable,
+                        &viewport,
+                    );
+                    let pixels = renderer.screenshot(
+                        Size::new(346, 200),
+                        1.0,
+                        theme.cosmic().background(false).base.into(),
+                    );
+                    let frame_image = image::RgbaImage::from_raw(346, 200, pixels).unwrap();
+                    image::imageops::replace(
+                        &mut gallery,
+                        &frame_image,
+                        i64::from(frame * 346),
+                        direction as i64 * 200,
+                    );
+                }
+            }
+        }
+        if let Some(path) = std::env::var_os("COSMIC_DEVICE_REVEAL_PREVIEW") {
+            gallery.save(path).unwrap();
+        }
+    }
 
     #[test]
     fn battery_visuals_follow_level_and_charging_state() {

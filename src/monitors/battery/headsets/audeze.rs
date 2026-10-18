@@ -81,23 +81,39 @@ pub(crate) fn connection_state() -> Result<Option<ConnectionState>, String> {
 
 fn connection_from_devices(
     devices: &[HidrawDevice],
-    sound_present: impl FnOnce(u16, u16) -> io::Result<bool>,
+    mut sound_present: impl FnMut(u16, u16) -> io::Result<bool>,
 ) -> Result<Option<(&HidrawDevice, ConnectionState)>, String> {
     let Some(dongle) = devices.iter().find(|device| {
         device.vendor_id == VENDOR_ID && DONGLE_PRODUCT_IDS.contains(&device.product_id)
     }) else {
         return Ok(None);
     };
-    let wired_headset_present = devices.iter().any(|device| {
-        device.vendor_id == VENDOR_ID && WIRED_PRODUCT_IDS.contains(&device.product_id)
-    });
-    let audio_interface_present = sound_present(VENDOR_ID, dongle.product_id)
+    let wired_headsets: Vec<_> = devices
+        .iter()
+        .filter(|device| {
+            device.vendor_id == VENDOR_ID && WIRED_PRODUCT_IDS.contains(&device.product_id)
+        })
+        .collect();
+    let mut audio_interface_present = sound_present(VENDOR_ID, dongle.product_id)
         .map_err(|error| format!("failed to inspect Maxwell audio interfaces: {error}"))?;
+    if !audio_interface_present {
+        for headset in &wired_headsets {
+            if sound_present(VENDOR_ID, headset.product_id)
+                .map_err(|error| format!("failed to inspect Maxwell audio interfaces: {error}"))?
+            {
+                audio_interface_present = true;
+                break;
+            }
+        }
+    }
+    // Charging leaves the wired HID interface present even after power-off.
+    // Require an audio interface from the receiver or the wired headset before
+    // exposing a connected device; USB power alone must not restore a stale row.
     Ok(Some((
         dongle,
         ConnectionState {
-            connected: audio_interface_present || wired_headset_present,
-            charging: wired_headset_present,
+            connected: audio_interface_present,
+            charging: audio_interface_present && !wired_headsets.is_empty(),
         },
     )))
 }
@@ -396,12 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn connection_check_detects_each_wired_maxwell_without_hid_requests() {
+    fn charging_cable_does_not_keep_a_powered_off_maxwell_connected() {
         for dongle in DONGLE_PRODUCT_IDS {
             for wired in WIRED_PRODUCT_IDS {
                 let devices = [device(VENDOR_ID, dongle), device(VENDOR_ID, wired)];
                 let (_, connection) = connection_from_devices(&devices, |vendor, product| {
-                    assert_eq!((vendor, product), (VENDOR_ID, dongle));
+                    assert_eq!(vendor, VENDOR_ID);
+                    assert!(product == dongle || product == wired);
                     Ok(false)
                 })
                 .unwrap()
@@ -409,10 +426,34 @@ mod tests {
                 assert_eq!(
                     connection,
                     ConnectionState {
-                        connected: true,
-                        charging: true,
+                        connected: false,
+                        charging: false,
                     }
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn charging_maxwell_stays_visible_with_wireless_or_wired_audio() {
+        for dongle in DONGLE_PRODUCT_IDS {
+            for wired in WIRED_PRODUCT_IDS {
+                let devices = [device(VENDOR_ID, dongle), device(VENDOR_ID, wired)];
+                for audio_product in [dongle, wired] {
+                    let (_, connection) = connection_from_devices(&devices, |vendor, product| {
+                        assert_eq!(vendor, VENDOR_ID);
+                        Ok(product == audio_product)
+                    })
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(
+                        connection,
+                        ConnectionState {
+                            connected: true,
+                            charging: true,
+                        }
+                    );
+                }
             }
         }
     }

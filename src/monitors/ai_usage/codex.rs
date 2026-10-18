@@ -3,11 +3,13 @@
 //! Read the account quota snapshots that Codex records after server responses.
 //!
 //! Quota percentages and purchased credit balances come from
-//! `token_count.rate_limits`, not token estimates.
+//! `token_count.rate_limits` and Desktop's saved account response, not token estimates.
 //! Session files stay local and read-only; credentials and conversation content
 //! are never sent anywhere. Only a bounded tail of recently modified files is
 //! read, and unchanged files are skipped. An old snapshot remains explicitly
 //! stale, including after its reported reset time, until Codex records an update.
+//! Desktop HTTP reports are matched to the current account using only account
+//! metadata; the reader never uses credentials or makes network requests.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
@@ -18,6 +20,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use super::codex_desktop::DesktopUsageReader;
 use super::{CreditBalance, UsageCredits, UsageSnapshot, UsageStatus, UsageWindow};
 use serde::Deserialize;
 
@@ -50,18 +53,25 @@ impl CodexUsageMonitor {
         let (wake, receiver) = channel();
         let worker_snapshot = snapshot.clone();
         let worker_enabled = enabled.clone();
-        let sessions = codex_home().map(|home| home.join("sessions"));
+        let home = codex_home();
+        let sessions = home.as_ref().map(|home| home.join("sessions"));
         let worker = std::thread::Builder::new()
             .name("codex-usage".into())
             .spawn(move || {
                 let mut reader = SessionReader::default();
+                let mut desktop = DesktopUsageReader::new(home);
                 loop {
                     if worker_enabled.load(Ordering::Relaxed) {
+                        let now = chrono::Utc::now().timestamp();
                         let value = sessions
                             .as_ref()
-                            .map_or_else(UsageSnapshot::default, |path| {
-                                reader.refresh(path, chrono::Utc::now().timestamp())
-                            });
+                            .map_or_else(UsageSnapshot::default, |path| reader.refresh(path, now));
+                        let credit_report_time = reader
+                            .latest_credits
+                            .get("codex")
+                            .map(|record| record.updated_at);
+                        let value =
+                            preferred_snapshot(value, desktop.snapshot(now), credit_report_time);
                         if let Ok(mut snapshot) = worker_snapshot.lock() {
                             *snapshot = value;
                         }
@@ -110,6 +120,51 @@ impl CodexUsageMonitor {
             .map(|snapshot| snapshot.clone())
             .unwrap_or_default()
     }
+}
+
+/// Desktop can publish a reset even when there are no new local thread events.
+/// Replace only its account bucket, keeping independently metered model quotas.
+fn preferred_snapshot(
+    mut session: UsageSnapshot,
+    desktop: Option<UsageSnapshot>,
+    credit_report_time: Option<i64>,
+) -> UsageSnapshot {
+    let Some(desktop) = desktop else {
+        return session;
+    };
+    let Some(reported_at) = desktop.updated_at else {
+        return session;
+    };
+    let session_account_time = session
+        .windows
+        .iter()
+        .filter(|window| window.limit_id == "codex")
+        .map(|window| window.updated_at)
+        .max();
+    // The latest session observation can explicitly clear a balance and thus
+    // have no UsageCredits value. Retain its timestamp when choosing a source.
+    let session_credit_time = credit_report_time
+        .or_else(|| session.credits.as_ref().map(|credits| credits.updated_at))
+        .or(session_account_time);
+    if !desktop.windows.is_empty()
+        && session_account_time.is_none_or(|timestamp| reported_at >= timestamp)
+    {
+        session.windows.retain(|window| window.limit_id != "codex");
+        session.windows.splice(0..0, desktop.windows);
+    }
+    // A newer unavailable balance must clear the old balance, not become zero.
+    if session_credit_time.is_none_or(|timestamp| reported_at >= timestamp) {
+        session.credits = desktop.credits;
+    }
+    session.updated_at = session.windows.iter().map(|window| window.updated_at).max();
+    if !session.windows.is_empty() {
+        session.status = if session.windows.iter().any(|window| window.is_stale) {
+            UsageStatus::Stale
+        } else {
+            UsageStatus::Available
+        };
+    }
+    session
 }
 
 fn codex_home() -> Option<PathBuf> {
@@ -195,7 +250,7 @@ where
     })
 }
 
-fn parse_credit_balance(value: &serde_json::Value) -> Option<CreditBalance> {
+pub(super) fn parse_credit_balance(value: &serde_json::Value) -> Option<CreditBalance> {
     let has_credits = value.get("has_credits")?.as_bool()?;
     if value.get("unlimited")?.as_bool()? {
         return Some(CreditBalance::Unlimited);
@@ -404,7 +459,7 @@ fn with_credits(
     snapshot
 }
 
-fn window_label(minutes: Option<i64>, fallback: &str) -> String {
+pub(super) fn window_label(minutes: Option<i64>, fallback: &str) -> String {
     match minutes {
         Some(10080) => "Weekly".into(),
         Some(1440) => "Daily".into(),
@@ -497,6 +552,79 @@ mod tests {
             "credits": { "has_credits": false, "unlimited": false, "balance": "0" },
             "plan_type": "pro"
         })
+    }
+
+    #[test]
+    fn desktop_reset_updates_allowance_without_a_new_session_report() {
+        let mut expired = weekly(100.0);
+        expired["primary"]["resets_at"] = json!(NOW - 1);
+        let old = snapshot_from_records(records_from_tail(&event(NOW - 60, expired)).iter(), NOW);
+        let fresh = snapshot_from_records(records_from_tail(&event(NOW, weekly(3.0))).iter(), NOW);
+        let merged = preferred_snapshot(old.clone(), Some(fresh.clone()), None);
+        assert_eq!(merged.windows[0].remaining_percent, 97.0);
+        assert_eq!(merged.windows[0].resets_at, Some(NOW + 86400));
+        assert_eq!(merged.status, UsageStatus::Available);
+        // An old desktop cache cannot undo a newer thread response.
+        assert_eq!(preferred_snapshot(fresh.clone(), Some(old), None), fresh);
+    }
+
+    #[test]
+    fn desktop_account_updates_preserve_model_quotas_and_clear_unavailable_credits() {
+        let mut model = weekly(20.0);
+        model["limit_id"] = json!("codex_model_specific");
+        let mut tail = event(NOW - 60, weekly(100.0));
+        tail.extend(event(NOW - 60, model));
+        let records = records_from_tail(&tail);
+        let mut old = snapshot_from_records(records.iter(), NOW);
+        old.credits = Some(UsageCredits {
+            balance: CreditBalance::Amount("10.5".into()),
+            updated_at: NOW - 60,
+            is_stale: false,
+        });
+        let fresh = snapshot_from_records(records_from_tail(&event(NOW, weekly(5.0))).iter(), NOW);
+        let merged = preferred_snapshot(old, Some(fresh), None);
+        assert_eq!(merged.windows.len(), 2);
+        assert_eq!(merged.windows[0].remaining_percent, 95.0);
+        assert_eq!(merged.windows[1].limit_id, "codex_model_specific");
+        assert_eq!(merged.windows[1].remaining_percent, 80.0);
+        assert!(merged.credits.is_none());
+        assert_eq!(preferred_snapshot(merged.clone(), None, None), merged);
+    }
+
+    #[test]
+    fn newer_credit_only_unavailable_report_blocks_an_older_desktop_balance() {
+        let mut tail = event(NOW - 120, weekly(30.0));
+        tail.extend(event(NOW, json!({ "limit_id": "codex", "credits": null })));
+        let mut reader = SessionReader::default();
+        for record in records_from_tail(&tail) {
+            merge_credit_record(&mut reader.latest_credits, &record);
+            merge_record(&mut reader.latest, record);
+        }
+        let session = with_credits(
+            snapshot_from_records(reader.latest.values(), NOW),
+            &reader.latest_credits,
+            NOW,
+        );
+        assert!(session.credits.is_none());
+        let mut desktop = snapshot_from_records(
+            records_from_tail(&event(NOW - 60, weekly(25.0))).iter(),
+            NOW,
+        );
+        desktop.credits = Some(UsageCredits {
+            balance: CreditBalance::Amount("50".into()),
+            updated_at: NOW - 60,
+            is_stale: false,
+        });
+        let merged = preferred_snapshot(
+            session,
+            Some(desktop),
+            reader
+                .latest_credits
+                .get("codex")
+                .map(|record| record.updated_at),
+        );
+        assert!(merged.credits.is_none());
+        assert_eq!(merged.windows[0].remaining_percent, 75.0);
     }
 
     #[test]

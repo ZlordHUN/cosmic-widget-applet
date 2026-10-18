@@ -75,6 +75,9 @@ USB IDs are the authoritative match criteria.
 
 For the first-generation Maxwell, `3329:4b1a` and `3329:4b1e` are also observed
 to determine whether a connected headset is charging over USB-C.
+A charging-only USB HID interface does not count as connected; a matching live
+audio interface is required. Native first-generation battery queries still
+require the receiver.
 
 ### Corsair
 
@@ -166,7 +169,10 @@ coverage without changing the native registry.
 | Razer Wolverine V3 Pro 8K PC, wireless dongle | `1532:0a59` |
 
 The controller is shown only after a valid battery response. This prevents an
-idle USB dongle from making a powered-off controller appear connected.
+idle USB dongle from making a powered-off controller appear connected. Matching
+USB/HID connection events trigger a prompt native charging-state query, with a
+short settling retry. Normal polling remains every five seconds, independently
+of headset and external-backend checks; USB presence alone never implies charging.
 
 ## Connection and Cache Behavior
 

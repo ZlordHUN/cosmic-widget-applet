@@ -5,13 +5,15 @@
 use super::animation::{
     ExpansionAnimation, NOTIFICATION_GROUP_EXPANSION_DURATION, ScrollAnimation,
 };
+use super::device_state::DeviceList;
 use super::layout::{
     desired_surface_height, notification_group_children_height, notification_group_size,
     notification_group_visible_fraction,
 };
 use super::media_state::{
-    DismissingMedia, MEDIA_CONTROL_GRACE, PendingPlayback, advance_media_dismissal,
-    reconcile_media_dismissal, reconcile_media_state,
+    DismissingMedia, MEDIA_CONTROL_GRACE, PendingPlayback, PendingSubtitle,
+    advance_media_dismissal, reconcile_media_dismissal, reconcile_media_state,
+    reconcile_subtitle_state, subtitle_toggle_index,
 };
 use super::notification_state::{
     DismissingNotification, NotificationKey, open_notification_folder,
@@ -25,7 +27,7 @@ use super::surface::{
 use super::ticks::aligned_tick_stream;
 use super::view;
 use crate::config::{Config, UPDATE_INTERVAL_MS};
-use crate::monitors::media::{MultiPlayerState, PlaybackStatus, PlayerId};
+use crate::monitors::media::{MultiPlayerState, PlaybackStatus, PlayerId, SubtitleTarget};
 use chrono::{DateTime, Local};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::platform_specific::runtime::wayland::CornerRadius;
@@ -76,10 +78,13 @@ struct App {
     clearing_notifications: bool,
     clear_button_animation: ExpansionAnimation,
     notification_scroll: ScrollAnimation,
+    device_list: DeviceList,
     dismissing_media: Option<DismissingMedia>,
     media_seek_preview: Option<f64>,
     media_timeline_hovered: bool,
     pending_playback: Option<PendingPlayback>,
+    pending_subtitle: Option<PendingSubtitle>,
+    last_subtitle: Option<(SubtitleTarget, i32)>,
     overlay_cursor: Point,
     overlay_drag_cursor: Option<Point>,
     surface_recovery_generation: u64,
@@ -105,6 +110,8 @@ pub(super) enum Message {
     MediaSeekChanged(f64),
     CommitMediaSeek,
     SeekMediaRelative(i64),
+    ToggleMediaSubtitles(SubtitleTarget),
+    SelectMediaSubtitle(SubtitleTarget, i32),
     NotificationScrolled(f32),
     OverlayMeasured(u32),
     OverlayPointerMoved(Point),
@@ -167,10 +174,13 @@ impl App {
                 clearing_notifications: false,
                 clear_button_animation: ExpansionAnimation::default(),
                 notification_scroll: ScrollAnimation::default(),
+                device_list: DeviceList::default(),
                 dismissing_media: None,
                 media_seek_preview: None,
                 media_timeline_hovered: false,
                 pending_playback: None,
+                pending_subtitle: None,
+                last_subtitle: None,
                 overlay_cursor: Point::ORIGIN,
                 overlay_drag_cursor: None,
                 surface_recovery_generation: 0,
@@ -209,6 +219,8 @@ impl App {
                     | Message::CommitMediaSeek
                     | Message::SeekMediaRelative(_)
                     | Message::MediaTimelineHoverChanged(_)
+                    | Message::ToggleMediaSubtitles(_)
+                    | Message::SelectMediaSubtitle(_, _)
             )
         {
             return Task::none();
@@ -220,6 +232,13 @@ impl App {
                 self.now = Local::now();
                 let had_notifications = !self.snapshot.notifications.is_empty();
                 let mut snapshot = self.sampler.snapshot();
+                self.device_list.reconcile(
+                    &snapshot.devices,
+                    Instant::now(),
+                    super::sections::devices::reveal_row_height(
+                        cosmic::theme::system_preference().cosmic().spacing.space_xs,
+                    ),
+                );
                 snapshot.media = self.prepare_media_state(snapshot.media, Instant::now());
                 self.snapshot = snapshot;
                 let has_notifications = !self.snapshot.notifications.is_empty();
@@ -322,6 +341,7 @@ impl App {
             }
             Message::AnimationTick => {
                 let now = Instant::now();
+                self.device_list.advance(now);
                 self.notification_expansion.advance(now);
                 self.notification_group_expansion.advance(now);
                 self.clear_button_animation.advance(now);
@@ -551,6 +571,19 @@ impl App {
                 self.snapshot.media =
                     self.prepare_media_state(self.sampler.media_state(), Instant::now());
             }
+            Message::ToggleMediaSubtitles(target) => {
+                let index = self.snapshot.media.current_player()
+                    .filter(|(id, _)| matches!(id, PlayerId::Emby(session) if session == &target.session_id))
+                    .and_then(|(_, info)| info.subtitles.as_ref())
+                    .filter(|subtitles| subtitles.target == target)
+                    .and_then(|subtitles| subtitle_toggle_index(subtitles, self.last_subtitle.as_ref()));
+                if let Some(index) = index {
+                    self.select_media_subtitle(target, index);
+                }
+            }
+            Message::SelectMediaSubtitle(target, index) => {
+                self.select_media_subtitle(target, index);
+            }
             Message::MediaTimelineHoverChanged(hovered) => {
                 self.media_timeline_hovered = hovered;
             }
@@ -639,6 +672,7 @@ impl App {
             &self.config,
             self.now,
             &self.snapshot,
+            &self.device_list,
             self.expanded_notification_group.as_deref(),
             self.expanded_notification.as_ref(),
             self.hovered_notification.as_ref(),
@@ -695,7 +729,13 @@ impl App {
     }
 
     fn animations_active(&self) -> bool {
-        self.notification_expansion.is_animating()
+        (self.config.show_battery
+            && self
+                .config
+                .section_order
+                .contains(&crate::config::WidgetSection::Battery)
+            && self.device_list.is_animating())
+            || self.notification_expansion.is_animating()
             || self.notification_group_expansion.is_animating()
             || self
                 .dismissing_notifications
@@ -709,12 +749,48 @@ impl App {
                 .is_some_and(|media| media.animation.is_animating())
     }
 
+    fn select_media_subtitle(&mut self, target: SubtitleTarget, index: i32) {
+        let Some(subtitles) = self
+            .snapshot
+            .media
+            .current_player()
+            .filter(
+                |(id, _)| matches!(id, PlayerId::Emby(session) if session == &target.session_id),
+            )
+            .and_then(|(_, info)| info.subtitles.as_ref())
+            .filter(|subtitles| subtitles.target == target)
+        else {
+            return;
+        };
+        if index != -1 && !subtitles.tracks.iter().any(|track| track.index == index) {
+            return;
+        }
+        let previous_index = subtitles.selected_index;
+        if !self.sampler.set_media_subtitle_track(&target, index) {
+            return;
+        }
+        if let Some(enabled_index) = (index >= 0)
+            .then_some(index)
+            .or_else(|| previous_index.filter(|previous| *previous >= 0))
+        {
+            self.last_subtitle = Some((target.clone(), enabled_index));
+        }
+        let now = Instant::now();
+        self.pending_subtitle = Some(PendingSubtitle {
+            target,
+            index,
+            expires_at: now + MEDIA_CONTROL_GRACE,
+        });
+        self.snapshot.media = self.prepare_media_state(self.sampler.media_state(), now);
+    }
+
     fn prepare_media_state(
         &mut self,
         mut current: MultiPlayerState,
         now: Instant,
     ) -> MultiPlayerState {
         reconcile_media_state(&mut current, &mut self.pending_playback, now);
+        reconcile_subtitle_state(&mut current, &mut self.pending_subtitle, now);
         reconcile_media_dismissal(
             &mut self.dismissing_media,
             &self.snapshot.media,
@@ -725,6 +801,7 @@ impl App {
             self.media_seek_preview = None;
             self.media_timeline_hovered = false;
             self.pending_playback = None;
+            self.pending_subtitle = None;
         }
         current
     }

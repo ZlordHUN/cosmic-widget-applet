@@ -30,6 +30,7 @@ fn monitor_with_snapshot(devices: Vec<BatteryDevice>) -> BatteryMonitor {
         logitech_devices: Arc::new(Mutex::new(Vec::new())),
         native_headset_coverage: Arc::new(Mutex::new(Vec::new())),
         maxwell_connection: Arc::new(Mutex::new(None)),
+        wolverine_monitor: super::controllers::wolverine_monitor::Monitor::with_snapshot(None),
         cached_devices: Vec::new(),
         initial_probe_started: Instant::now(),
         last_update: Instant::now(),
@@ -79,6 +80,44 @@ fn charging_updates_do_not_wait_for_slow_backend_snapshots() {
         is_connected: false,
         ..discharging
     }];
+    assert_eq!(monitor.devices(), vec![headset]);
+}
+
+#[test]
+fn controller_charging_and_removal_override_slow_backend_snapshots() {
+    let discharging = BatteryDevice {
+        level: Some(60),
+        status: Some("discharging".to_string()),
+        kind: Some("controller".to_string()),
+        is_connected: true,
+        ..battery_device(WOLVERINE_DEVICE_NAME, false)
+    };
+    let headset = BatteryDevice {
+        level: Some(80),
+        is_connected: true,
+        ..battery_device("Audeze Maxwell", false)
+    };
+    let slow_snapshot = vec![discharging.clone(), headset.clone()];
+    let monitor = monitor_with_snapshot(slow_snapshot.clone());
+    // An uninitialized independent reader does not erase provisional state.
+    assert_eq!(monitor.devices(), slow_snapshot);
+    let charging = BatteryDevice {
+        status: Some("charging".to_string()),
+        ..discharging.clone()
+    };
+    monitor
+        .wolverine_monitor
+        .replace_snapshot(Some(Some(charging.clone())));
+    assert_eq!(monitor.devices(), vec![charging.clone(), headset.clone()]);
+    // A delayed coordinator publication cannot undo a cable transition.
+    *monitor.devices.lock().unwrap() = slow_snapshot.clone();
+    assert_eq!(monitor.devices(), vec![charging, headset.clone()]);
+    monitor
+        .wolverine_monitor
+        .replace_snapshot(Some(Some(discharging)));
+    assert_eq!(monitor.devices(), slow_snapshot);
+    // Confirmed absence takes precedence even if the slow snapshot still has it.
+    monitor.wolverine_monitor.replace_snapshot(Some(None));
     assert_eq!(monitor.devices(), vec![headset]);
 }
 
@@ -822,4 +861,44 @@ fn maxwell_connected_event_restores_reading_removed_by_an_older_native_probe() {
     assert_eq!(devices[0].level, Some(80));
     assert_eq!(devices[0].status.as_deref(), Some("charging"));
     assert!(devices[0].is_loading);
+}
+
+#[test]
+fn maxwell_power_off_removes_charging_row_despite_late_native_or_cached_updates() {
+    let headset = BatteryDevice {
+        level: Some(82),
+        status: Some("charging".into()),
+        is_connected: true,
+        ..battery_device(super::MAXWELL_DEVICE_NAME, false)
+    };
+    let other = BatteryDevice {
+        level: Some(60),
+        is_connected: true,
+        ..battery_device("Other headset", false)
+    };
+    let monitor = monitor_with_snapshot(vec![headset.clone(), other.clone()]);
+    let before_power_off = Instant::now();
+    let after_power_off = before_power_off + Duration::from_millis(10);
+    super::publish_maxwell_connection(
+        &monitor.maxwell_connection,
+        after_power_off,
+        Some(headsets::MaxwellConnection {
+            connected: false,
+            charging: false,
+        }),
+    );
+    assert_eq!(monitor.devices(), vec![other.clone()]);
+
+    // An earlier battery query or CLI fallback may still report the plugged-in
+    // headset as charging. It cannot override the newer audio disconnect.
+    super::publish_maxwell_connection(
+        &monitor.maxwell_connection,
+        before_power_off,
+        Some(headsets::MaxwellConnection {
+            connected: true,
+            charging: true,
+        }),
+    );
+    *monitor.devices.lock().unwrap() = vec![headset, other.clone()];
+    assert_eq!(monitor.devices(), vec![other]);
 }

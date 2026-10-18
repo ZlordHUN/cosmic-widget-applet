@@ -4,6 +4,7 @@
 
 use super::Message;
 use super::components::section::{CARD_SPACING, section_card};
+use super::device_state::DeviceList;
 use super::media_state::DismissingMedia;
 use super::notification_state::{DismissingNotification, NotificationKey};
 use super::sections::{ai_usage, clock, devices, media, notifications, storage, system, weather};
@@ -18,6 +19,7 @@ pub(super) fn widget_view<'a>(
     config: &Config,
     now: DateTime<Local>,
     stats: &'a SystemSnapshot,
+    device_list: &'a DeviceList,
     expanded_notification_group: Option<&'a str>,
     expanded_notification: Option<&'a NotificationKey>,
     hovered_notification: Option<&'a NotificationKey>,
@@ -75,7 +77,7 @@ pub(super) fn widget_view<'a>(
                 spacing.space_xxs,
             )),
             WidgetSection::Battery if config.show_battery => Some(devices::devices_view(
-                stats,
+                device_list,
                 spacing.space_xs,
                 spacing.space_xs,
             )),

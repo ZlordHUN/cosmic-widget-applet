@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use super::track;
 use crate::config::TemperatureGaugeStyle;
 use cosmic::iced::advanced::widget::tree::{self, Tree};
 use cosmic::iced::advanced::{self, Clipboard, Layout, Shell, Widget, layout, renderer};
@@ -15,7 +16,8 @@ use std::time::Duration;
 
 const GAUGE_SIZE: f32 = 112.0;
 const TRACK_WIDTH: f32 = 8.0;
-pub(in crate::overlay) const BAR_HEIGHT: f32 = 8.0;
+pub(in crate::overlay) const BAR_HEIGHT: f32 = track::HEIGHT;
+const BAR_SLOT_HEIGHT: f32 = 8.0;
 const START_ANGLE: f32 = 3.0 * PI / 4.0;
 const SWEEP_ANGLE: f32 = 3.0 * PI / 2.0;
 const ANIMATION_LAG: Duration = Duration::from_millis(280);
@@ -241,7 +243,7 @@ where
     }
 
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fixed(BAR_HEIGHT))
+        Size::new(Length::Fill, Length::Fixed(BAR_SLOT_HEIGHT))
     }
 
     fn layout(
@@ -250,7 +252,7 @@ where
         _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        layout::atomic(limits, Length::Fill, Length::Fixed(BAR_HEIGHT))
+        layout::atomic(limits, Length::Fill, Length::Fixed(BAR_SLOT_HEIGHT))
     }
 
     fn update(
@@ -286,9 +288,13 @@ where
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
-        use advanced::Renderer as _;
-
-        let bounds = layout.bounds();
+        let slot = layout.bounds();
+        let height = BAR_HEIGHT.min(slot.height);
+        let bounds = Rectangle {
+            y: slot.y + (slot.height - height) / 2.0,
+            height,
+            ..slot
+        };
         let current = if self.available {
             tree.state.downcast_ref::<State>().current
         } else {
@@ -302,35 +308,7 @@ where
             BarKind::Progress => normal,
         };
         let style = bar_style(theme, color, self.muted);
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                border: style.border,
-                snap: true,
-                ..Default::default()
-            },
-            style.background,
-        );
-        if current > SNAP_THRESHOLD {
-            let fill = Rectangle {
-                width: bounds.width * current,
-                ..bounds
-            };
-            // Draw the actual fill rectangle: clipping a full-width rounded
-            // track would leave the advancing end square.
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: fill,
-                    border: Border {
-                        radius: (fill.height.min(fill.width) / 2.0).into(),
-                        ..Default::default()
-                    },
-                    snap: true,
-                    ..Default::default()
-                },
-                style.bar,
-            );
-        }
+        track::draw(renderer, bounds, current, style);
     }
 }
 

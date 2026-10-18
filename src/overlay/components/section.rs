@@ -17,24 +17,31 @@ pub(in crate::overlay) fn section_card<'a>(
         .width(Length::Fill)
         .padding([CARD_VERTICAL_PADDING, horizontal_padding])
         .class(theme::Container::custom(|theme| {
-            let foreground: Color = theme.current_container().on.into();
-            cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.045,
-                    ..foreground
-                })),
-                border: Border {
-                    color: Color {
-                        a: 0.10,
-                        ..foreground
-                    },
-                    width: 1.0,
-                    radius: 16.0.into(),
-                },
-                ..Default::default()
-            }
+            section_card_style(theme, 16.0)
         }))
         .into()
+}
+
+pub(in crate::overlay) fn section_card_style(
+    theme: &cosmic::Theme,
+    radius: f32,
+) -> cosmic::iced::widget::container::Style {
+    let foreground: Color = theme.current_container().on.into();
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(Color {
+            a: 0.045,
+            ..foreground
+        })),
+        border: Border {
+            color: Color {
+                a: 0.10,
+                ..foreground
+            },
+            width: 1.0,
+            radius: radius.into(),
+        },
+        ..Default::default()
+    }
 }
 
 pub(in crate::overlay) fn section<'a>(

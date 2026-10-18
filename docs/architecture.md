@@ -69,6 +69,11 @@ Reusable controls in `src/overlay/components/` provide gauges, marquee text,
 sliding transitions, and translated content. A device with a live charging
 reading shows a vector copy of the COSMIC battery icon whose charge repeatedly
 sweeps to full and fades back; cached readings keep the static icon.
+Device rows remain fully laid out while a vertical clipping edge reveals or
+covers them. The Devices card and following sections resize with the reveal,
+using the notification group's pixel speed in both directions. Outgoing rows
+remain mounted until hidden, and reconnecting reverses from the current height.
+Frame subscriptions stop once the device transitions finish.
 
 System readings are sampled once per second. The UI interpolates utilization
 bars and temperature gauges between samples so animation cadence is independent
@@ -105,7 +110,7 @@ thread, D-Bus connection, or HTTP client for each update.
 | Weather | Open-Meteo through a persistent `reqwest` client |
 | Notifications | Native `zbus` monitoring and COSMIC history reconciliation |
 | Media | MPRIS over `zbus`, Cider HTTP, and Emby discovery/API access |
-| AI Usage | Local Codex quota reports, Claude Code account usage, and saved Claude Desktop reports |
+| AI Usage | Local Codex session/Desktop quota reports, Claude Code account usage, and saved Claude Desktop reports |
 
 ### Devices
 
@@ -122,8 +127,8 @@ native readers, deduplication, and optional external fallbacks.
   Sysfs readings and queued charging reports are published before querying the
   remaining devices, so one slow HID request does not delay other devices.
 - `battery/events.rs` listens passively for kernel USB/HID/audio changes during
-  the existing workers' sleep periods. Hotplug invalidates device discovery;
-  idle polling intervals, worker count, and dependencies are unchanged.
+  workers' sleep periods. Hotplug invalidates device discovery; idle polling
+  intervals and dependencies are unchanged.
   Events are coalesced and polling deadlines remain bounded. Unsupported event
   sockets fall back to the usual polling schedule.
 - Maxwell USB charging/connection state is read from sysfs independently of its
@@ -131,9 +136,16 @@ native readers, deduplication, and optional external fallbacks.
   prevent an older in-flight query from undoing a cable transition. The UI reads
   the latest battery snapshot directly instead of waiting for the general system
   sampler's next iteration.
+  USB charging alone does not imply a powered-on headset: connection requires a
+  matching receiver or wired audio interface, so powered-off charging devices
+  disappear from the list.
 - `battery/headsets/mod.rs` contains the explicit native headset registry and
   dispatches to vendor protocol modules.
-- `battery/controllers/` contains model-specific controller readers.
+- `battery/controllers/` contains model-specific controller readers. Wolverine
+  uses an independent five-second worker with immediate queries on matching
+  USB/HID events and one bounded settling retry. Charging comes from the native
+  protocol, not USB presence. The UI merges its latest confirmed snapshot so
+  slow headset/CLI checks cannot delay or overwrite controller updates.
 - Solaar and HeadsetControl are discovery/fallback paths, not primary polling
   dependencies.
 
@@ -221,6 +233,16 @@ COSMIC Player versions that leave MPRIS seeking unimplemented need the
 [`integrations/cosmic-player`](../integrations/cosmic-player/README.md) companion
 patch; the widget respects each player's advertised seeking capability.
 
+Emby Theater sessions that advertise `SetSubtitleStreamIndex` and report available
+subtitle tracks also show a CC toggle and compact track selector in the transport
+row. The monitor reads active-source streams from session metadata, with a bounded
+item/source cache for missing detail, and sends general commands through the
+existing asynchronous worker. Both enqueue and dispatch validate the selected
+session, item, and media source. The CC toggle restores the last chosen track
+for that exact target; a short presentation-only pending state gives immediate
+feedback while server reports remain authoritative. Unknown subtitle state stays
+unknown, and players without this capability retain their existing controls.
+
 When the displayed source disappears or clears its track metadata, the overlay
 retains its card for the same 220 ms left slide used by notification dismissal.
 The heading and layout height stay fixed until the slide finishes. The outgoing
@@ -244,7 +266,14 @@ are preserved. No browser extension is required.
 ### AI Usage
 
 `src/monitors/ai_usage/` groups the shared quota snapshot types and both providers.
-Codex reads bounded tails of local session logs every 30 seconds. Claude checks
+Codex reads bounded tails of local session logs and exact Desktop HTTP cache
+entries every 30 seconds. Desktop's saved `/backend-api/wham/usage` response is
+accepted only when its account ID matches the current local account metadata.
+Newer Desktop reports replace the general account bucket and credit balance;
+model-specific session buckets retain their own reports. The Desktop parser
+never accesses cookies or uses credentials, and validates cache keys, checksums,
+response dates, and bounded decompression through a shared Chromium cache reader.
+Missing/mismatched account metadata invalidates Desktop readings. Claude checks
 its account usage endpoint every five minutes using the existing Claude Code
 sign-in, with bounded reads, request timeouts, and retry backoff. Neither monitor
 makes inference requests or estimates allowance from token counts.
@@ -285,7 +314,11 @@ available Code account reports, then the current Desktop report.
 `src/overlay/sections/ai_usage.rs` displays remaining allowance in equal-width
 Codex and Claude cards with horizontal meters. Both cards reserve two quota rows
 while loading and grow together for additional reported windows. Their rounded
-meters share styling with utilization, storage, media, and transfer progress.
+meters use the same pixel-snapped rail/fill drawing as utilization, storage,
+media, and transfer progress. Straight tracks are six logical pixels thick;
+media grows to eight on hover or drag while retaining its fixed interaction area.
+The media slider forwards native input and accessibility behavior, with its
+handle and filled track using the same seek position.
 Provider icons, quota labels, and reset times (or their unavailable state) remain
 visible; hover details explain the source, update cadence, and original age of
 the report. Stale reports stay marked, and expired windows clear their fill while

@@ -360,7 +360,9 @@ fn usage_window_details(
     use_24hour_time: bool,
 ) -> UsageWindowDetails {
     let expired = reset_time(window).is_some_and(|reset| reset <= now);
-    let stale = expired || usage.status == UsageStatus::Stale || window.is_stale;
+    // Sources timestamp each allowance independently. An older model bucket
+    // must not mark a freshly refreshed account allowance as stale.
+    let stale = expired || window.is_stale;
     let value = (!expired && window.remaining_percent.is_finite())
         .then(|| window.remaining_percent.clamp(0.0, 100.0));
     let desktop_report = usage.source == Some(UsageSource::ClaudeDesktop);
@@ -739,6 +741,12 @@ mod tests {
                         is_connected: true,
                     });
             }
+            let mut meter_devices = crate::overlay::device_state::DeviceList::default();
+            meter_devices.reconcile(
+                &meter_stats.devices,
+                std::time::Instant::now(),
+                crate::overlay::sections::devices::reveal_row_height(12),
+            );
             let content: Element<'_, Message> = if case.starts_with("meters") {
                 widget::column::with_capacity(5)
                     .spacing(12)
@@ -757,7 +765,7 @@ mod tests {
                         8,
                     ))
                     .push(crate::overlay::sections::devices::devices_view(
-                        &meter_stats,
+                        &meter_devices,
                         12,
                         8,
                     ))
@@ -959,6 +967,55 @@ mod tests {
             is_stale: false,
         };
         (usage, window, now)
+    }
+
+    #[test]
+    fn fresh_codex_allowance_is_not_stale_when_an_unrelated_model_bucket_is_old() {
+        let now = DateTime::from_timestamp(2_000_000_000, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let fresh = UsageWindow {
+            limit_id: "codex".into(),
+            label: "Weekly".into(),
+            remaining_percent: 98.0,
+            resets_at: Some(now.timestamp() + 604800),
+            updated_at: now.timestamp(),
+            is_stale: false,
+        };
+        let old = UsageWindow {
+            limit_id: "codex_model_specific".into(),
+            label: "Other model · Weekly".into(),
+            updated_at: now.timestamp() - 1800,
+            is_stale: true,
+            ..fresh.clone()
+        };
+        let usage = UsageSnapshot {
+            windows: vec![fresh, old],
+            status: UsageStatus::Stale,
+            updated_at: Some(now.timestamp()),
+            ..Default::default()
+        };
+        let fresh = usage_window_details(Provider::Codex, &usage, &usage.windows[0], now, true);
+        assert!(!fresh.stale);
+        assert_eq!(fresh.remaining_percent, Some(98.0));
+        assert!(fresh.tooltip.contains("Remaining usage"));
+        assert!(!fresh.tooltip.contains("Last known usage"));
+
+        let old = usage_window_details(Provider::Codex, &usage, &usage.windows[1], now, true);
+        assert!(old.stale);
+        assert!(old.tooltip.contains("Last known usage"));
+    }
+
+    #[test]
+    fn claude_desktop_reports_keep_their_individual_stale_flag() {
+        let (usage, mut window, now) = desktop_window();
+        window.is_stale = true;
+        window.resets_at = Some(now.timestamp() + 3600);
+        let details = usage_window_details(Provider::Claude, &usage, &window, now, true);
+        assert!(details.stale);
+        assert_eq!(details.remaining_percent, Some(70.0));
+        assert!(details.tooltip.contains("Last known usage"));
+        assert!(details.tooltip.contains("Reported 15m ago"));
     }
 
     #[test]

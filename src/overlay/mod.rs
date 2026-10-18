@@ -8,6 +8,7 @@
 mod animation;
 mod app;
 mod components;
+mod device_state;
 mod layout;
 mod media_state;
 mod notification_state;

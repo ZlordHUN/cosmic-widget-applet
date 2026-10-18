@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::monitors::media::{AlbumArt, MediaInfo, PlaybackStatus};
+use crate::monitors::media::{AlbumArt, MediaInfo, PlaybackStatus, SubtitleState};
 use crate::overlay::Message;
 use crate::overlay::components::{
-    button_style, marquee, media_artwork as rounded_artwork,
+    button_style, marquee, media_artwork as rounded_artwork, media_slider,
     section::{compact_single_line, section},
     slide,
 };
@@ -12,8 +12,10 @@ use crate::overlay::stats::SystemSnapshot;
 use cosmic::iced::{Alignment, Background, Border, Color, ContentFit, Length};
 use cosmic::{Element, theme, widget};
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
+
+mod subtitle_labels;
+mod subtitle_theme;
 
 const MEDIA_ACTIVE_SECTION_HEIGHT: f32 = 232.0;
 const MEDIA_CONTENT_HEIGHT: f32 = 204.0;
@@ -31,6 +33,10 @@ const MEDIA_SEEK_ICON_SIZE: u16 = 24;
 const MEDIA_CONTROL_PADDING: u16 = 6;
 const MEDIA_CONTROL_SPACING: u16 = 8;
 const MEDIA_SEEK_INTERVAL_MS: i64 = 10_000;
+const MEDIA_SUBTITLE_CONTROL_SIZE: f32 = 28.0;
+const MEDIA_SUBTITLE_DROPDOWN_WIDTH: f32 = 112.0;
+// Reserve both horizontal insets, the 12px arrow, and a 4px text/arrow gap.
+const MEDIA_SUBTITLE_TEXT_WIDTH: f32 = MEDIA_SUBTITLE_DROPDOWN_WIDTH - 12.0 - 12.0 - 4.0;
 const MEDIA_TIMELINE_FOOTER_GAP: f32 = 4.0;
 
 pub(in crate::overlay) fn media_view<'a>(
@@ -161,10 +167,26 @@ fn media_content<'a>(
     } else {
         info.position
     };
+    let subtitles = emby_subtitles(info);
+    let control_icon_size = if subtitles.is_some() {
+        18
+    } else {
+        MEDIA_CONTROL_ICON_SIZE
+    };
+    let seek_icon_size = if subtitles.is_some() {
+        20
+    } else {
+        MEDIA_SEEK_ICON_SIZE
+    };
+    let control_spacing = if subtitles.is_some() {
+        4
+    } else {
+        MEDIA_CONTROL_SPACING
+    };
     let previous = widget::button::icon(
-        widget::icon::from_name("media-skip-backward-symbolic").size(MEDIA_CONTROL_ICON_SIZE),
+        widget::icon::from_name("media-skip-backward-symbolic").size(control_icon_size),
     )
-    .icon_size(MEDIA_CONTROL_ICON_SIZE)
+    .icon_size(control_icon_size)
     .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Previous track")
     .padding(MEDIA_CONTROL_PADDING)
@@ -173,21 +195,20 @@ fn media_content<'a>(
         PlaybackStatus::Playing => "media-playback-pause-symbolic",
         PlaybackStatus::Paused | PlaybackStatus::Stopped => "media-playback-start-symbolic",
     };
-    let play_pause = widget::button::icon(
-        widget::icon::from_name(play_pause_icon).size(MEDIA_CONTROL_ICON_SIZE),
-    )
-    .icon_size(MEDIA_CONTROL_ICON_SIZE)
-    .class(button_style::accent_hover(|| theme::Button::Icon))
-    .tooltip(match info.status {
-        PlaybackStatus::Playing => "Pause",
-        PlaybackStatus::Paused | PlaybackStatus::Stopped => "Play",
-    })
-    .padding(MEDIA_CONTROL_PADDING)
-    .on_press_maybe((info.can_play || info.can_pause).then_some(Message::PlayPauseMedia));
+    let play_pause =
+        widget::button::icon(widget::icon::from_name(play_pause_icon).size(control_icon_size))
+            .icon_size(control_icon_size)
+            .class(button_style::accent_hover(|| theme::Button::Icon))
+            .tooltip(match info.status {
+                PlaybackStatus::Playing => "Pause",
+                PlaybackStatus::Paused | PlaybackStatus::Stopped => "Play",
+            })
+            .padding(MEDIA_CONTROL_PADDING)
+            .on_press_maybe((info.can_play || info.can_pause).then_some(Message::PlayPauseMedia));
     let next = widget::button::icon(
-        widget::icon::from_name("media-skip-forward-symbolic").size(MEDIA_CONTROL_ICON_SIZE),
+        widget::icon::from_name("media-skip-forward-symbolic").size(control_icon_size),
     )
-    .icon_size(MEDIA_CONTROL_ICON_SIZE)
+    .icon_size(control_icon_size)
     .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Next track")
     .padding(MEDIA_CONTROL_PADDING)
@@ -199,7 +220,7 @@ fn media_content<'a>(
         )))
         .symbolic(true),
     )
-    .icon_size(MEDIA_SEEK_ICON_SIZE)
+    .icon_size(seek_icon_size)
     .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Back 10 seconds")
     .padding(MEDIA_CONTROL_PADDING)
@@ -214,7 +235,7 @@ fn media_content<'a>(
         )))
         .symbolic(true),
     )
-    .icon_size(MEDIA_SEEK_ICON_SIZE)
+    .icon_size(seek_icon_size)
     .class(button_style::accent_hover(|| theme::Button::Icon))
     .tooltip("Forward 10 seconds")
     .padding(MEDIA_CONTROL_PADDING)
@@ -222,14 +243,19 @@ fn media_content<'a>(
         info.can_seek
             .then_some(Message::SeekMediaRelative(MEDIA_SEEK_INTERVAL_MS)),
     );
-    let controls = widget::row::with_capacity(5)
+    let mut controls = widget::row::with_capacity(7)
         .align_y(Alignment::Center)
-        .spacing(MEDIA_CONTROL_SPACING)
+        .spacing(control_spacing)
         .push(previous)
         .push(back)
         .push(play_pause)
         .push(forward)
         .push(next);
+    if let Some(subtitles) = subtitles {
+        controls = controls
+            .push(subtitle_toggle(subtitles))
+            .push(subtitle_dropdown(subtitles));
+    }
     let subtitle = media_subtitle(info);
     let mut metadata = widget::column::with_capacity(3)
         .width(Length::Fill)
@@ -245,25 +271,12 @@ fn media_content<'a>(
         .push(media_artwork(info.album_art.as_ref()))
         .push(metadata);
     let progress_control: Element<'a, Message> = if info.can_seek && info.duration > 0 {
-        let slider = widget::slider(0.0..=1.0, progress, Message::MediaSeekChanged)
-            .step(0.001)
-            .height(20)
-            .class(theme::style::iced::Slider::Custom {
-                active: Rc::new(move |theme| {
-                    media_seek_style(
-                        theme,
-                        cosmic::iced::widget::slider::Status::Active,
-                        timeline_hovered,
-                    )
-                }),
-                hovered: Rc::new(|theme| {
-                    media_seek_style(theme, cosmic::iced::widget::slider::Status::Hovered, true)
-                }),
-                dragging: Rc::new(|theme| {
-                    media_seek_style(theme, cosmic::iced::widget::slider::Status::Dragged, true)
-                }),
-            })
-            .on_release(Message::CommitMediaSeek);
+        let slider = media_slider::view(
+            progress,
+            timeline_hovered,
+            Message::MediaSeekChanged,
+            Message::CommitMediaSeek,
+        );
 
         widget::mouse_area(slider)
             .on_enter(Message::MediaTimelineHoverChanged(true))
@@ -300,24 +313,344 @@ fn media_content<'a>(
         .into()
 }
 
-fn media_seek_style(
-    theme: &cosmic::Theme,
-    status: cosmic::iced::widget::slider::Status,
-    show_handle: bool,
-) -> cosmic::iced::widget::slider::Style {
-    use cosmic::iced::widget::slider::{Catalog as _, HandleShape};
+fn emby_subtitles(info: &MediaInfo) -> Option<&SubtitleState> {
+    info.subtitles.as_ref().filter(|subtitles| {
+        info.player_name.eq_ignore_ascii_case("emby") && !subtitles.tracks.is_empty()
+    })
+}
 
-    let mut style = theme.style(&theme::style::iced::Slider::Standard, status);
-    let meter = crate::overlay::components::gauge::progress_bar_style(theme);
-    style.rail.backgrounds = (meter.bar, meter.background);
-    style.rail.width = crate::overlay::components::gauge::BAR_HEIGHT;
-    style.rail.border = meter.border;
-    if !show_handle {
-        style.handle.shape = HandleShape::Circle { radius: 0.0 };
-        style.handle.background = Background::Color(Color::TRANSPARENT);
-        style.handle.border_width = 0.0;
+fn subtitle_toggle(subtitles: &SubtitleState) -> Element<'static, Message> {
+    let enabled = subtitles.selected_index.is_some_and(|index| index >= 0);
+    let label = widget::container(widget::text::body("CC").size(12).font(cosmic::font::bold()))
+        .center_x(Length::Fixed(MEDIA_SUBTITLE_CONTROL_SIZE))
+        .center_y(Length::Fixed(MEDIA_SUBTITLE_CONTROL_SIZE));
+    let button = widget::button::custom(label)
+        .padding(0)
+        .class(if enabled {
+            button_style::accent_hover(|| theme::Button::Suggested)
+        } else {
+            button_style::accent_hover(|| theme::Button::Icon)
+        })
+        .on_press_maybe(
+            subtitles
+                .selected_index
+                .map(|_| Message::ToggleMediaSubtitles(subtitles.target.clone())),
+        );
+    widget::tooltip(
+        button,
+        widget::text::caption(match subtitles.selected_index {
+            None => "Choose a subtitle track",
+            Some(_) if enabled => "Turn subtitles off",
+            Some(_) => "Turn subtitles on",
+        }),
+        widget::tooltip::Position::Top,
+    )
+    .into()
+}
+
+fn subtitle_options(subtitles: &SubtitleState) -> (Vec<String>, Vec<i32>, Option<usize>) {
+    let mut labels = vec!["Off".to_string()];
+    let mut indices = vec![-1];
+    for track in &subtitles.tracks {
+        labels.push(subtitle_labels::compact(
+            &track.label,
+            MEDIA_SUBTITLE_TEXT_WIDTH,
+        ));
+        indices.push(track.index);
     }
-    style
+    // Preserve distinct choices when track names differ only past the compact
+    // caption (for example multiple English subtitle formats).
+    let original_labels = labels.clone();
+    for (position, label) in labels.iter_mut().enumerate().skip(1) {
+        if original_labels
+            .iter()
+            .filter(|other| other.as_str() == label.as_str())
+            .count()
+            > 1
+        {
+            *label = subtitle_labels::fit_with_suffix(
+                label,
+                &format!(" {}", indices[position]),
+                MEDIA_SUBTITLE_TEXT_WIDTH,
+            );
+        }
+    }
+    let selected = subtitles
+        .selected_index
+        .and_then(|index| indices.iter().position(|candidate| *candidate == index));
+    (labels, indices, selected)
+}
+
+fn subtitle_dropdown_key(subtitles: &SubtitleState) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        &subtitles.target.session_id,
+        &subtitles.target.item_id,
+        &subtitles.target.media_source_id,
+    )
+        .hash(&mut hasher);
+    subtitles.tracks.len().hash(&mut hasher);
+    for track in &subtitles.tracks {
+        (&track.index, &track.label).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtitleChoice {
+    index: i32,
+    label: String,
+}
+
+impl std::fmt::Display for SubtitleChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
+fn subtitle_dropdown(subtitles: &SubtitleState) -> Element<'static, Message> {
+    let (labels, indices, selected) = subtitle_options(subtitles);
+    let selected_label = match subtitles.selected_index {
+        Some(-1) => "Off",
+        Some(index) => subtitles
+            .tracks
+            .iter()
+            .find(|track| track.index == index)
+            .map_or("Select subtitle track", |track| track.label.as_str()),
+        None => "Select subtitle track",
+    };
+    let tooltip = format!(
+        "Subtitles: {}",
+        compact_single_line(selected_label, usize::MAX)
+    );
+    let target = subtitles.target.clone();
+    let choices: Vec<_> = labels
+        .into_iter()
+        .zip(indices)
+        .map(|(label, index)| SubtitleChoice { index, label })
+        .collect();
+    let selected = selected.and_then(|position| choices.get(position)).cloned();
+    // Style the menu separately from the selector so both use the same glass.
+    let dropdown: cosmic::iced::Element<
+        'static,
+        Message,
+        subtitle_theme::SubtitleTheme,
+        cosmic::Renderer,
+    > = cosmic::iced::widget::pick_list(choices, selected, move |choice: SubtitleChoice| {
+        Message::SelectMediaSubtitle(target.clone(), choice.index)
+    })
+    .width(Length::Fixed(MEDIA_SUBTITLE_DROPDOWN_WIDTH))
+    .padding([6, 6])
+    .text_size(12.0)
+    .font(cosmic::font::default())
+    .text_wrap(cosmic::iced::widget::text::Wrapping::None)
+    .handle(cosmic::iced::widget::pick_list::Handle::Arrow {
+        size: Some(12.0.into()),
+    })
+    .text_line_height(cosmic::iced::widget::text::LineHeight::Relative(1.2))
+    .placeholder("Select")
+    .into();
+    let dropdown = cosmic::iced::widget::themer(
+        Some(subtitle_theme::SubtitleTheme(
+            crate::overlay::surface::system_theme(),
+        )),
+        dropdown,
+    );
+    let selector_card =
+        widget::container(dropdown).class(theme::Container::custom(subtitle_theme::card_style));
+    let dropdown: Element<'static, Message> = widget::tooltip(
+        selector_card,
+        widget::text::caption(tooltip),
+        widget::tooltip::Position::Top,
+    )
+    .into();
+    // Polls preserve an open menu, but a new item/session or changed stream
+    // mapping must discard it instead of retargeting an already open choice.
+    subtitle_dropdown_scope::view(subtitle_dropdown_key(subtitles), dropdown)
+}
+
+// This Iced version's keyed column preserves equal-length children even when
+// their keys differ. Explicitly reset this native menu subtree on identity
+// changes; ordinary polling still preserves its open/hover state.
+mod subtitle_dropdown_scope {
+    use super::Message;
+    use cosmic::iced::advanced::widget::Operation;
+    use cosmic::iced::advanced::widget::tree::{self, Tree};
+    use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, overlay, renderer};
+    use cosmic::iced::{Event, Length, Rectangle, Size, Vector, mouse};
+    use cosmic::{Element, Renderer, Theme};
+
+    pub(super) fn view(key: u64, content: Element<'static, Message>) -> Element<'static, Message> {
+        Element::new(ScopedDropdown { key, content })
+    }
+
+    struct ScopedDropdown {
+        key: u64,
+        content: Element<'static, Message>,
+    }
+
+    struct ScopeState(u64);
+
+    impl Widget<Message, Theme, Renderer> for ScopedDropdown {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<ScopeState>()
+        }
+        fn state(&self) -> tree::State {
+            tree::State::new(ScopeState(self.key))
+        }
+        fn children(&self) -> Vec<Tree> {
+            vec![Tree::new(self.content.as_widget())]
+        }
+
+        fn diff(&mut self, tree: &mut Tree) {
+            let state = tree.state.downcast_mut::<ScopeState>();
+            if state.0 != self.key {
+                state.0 = self.key;
+                tree.children = self.children();
+            }
+            tree.children[0].diff(self.content.as_widget_mut());
+        }
+
+        fn size(&self) -> Size<Length> {
+            self.content.as_widget().size()
+        }
+        fn size_hint(&self) -> Size<Length> {
+            self.content.as_widget().size_hint()
+        }
+
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            self.content
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits)
+        }
+
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                operation,
+            );
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Message>,
+            viewport: &Rectangle,
+        ) {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+
+        fn mouse_interaction(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            self.content.as_widget().mouse_interaction(
+                &tree.children[0],
+                layout,
+                cursor,
+                viewport,
+                renderer,
+            )
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            self.content.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                viewport,
+            );
+        }
+
+        fn overlay<'a>(
+            &'a mut self,
+            tree: &'a mut Tree,
+            layout: Layout<'a>,
+            renderer: &Renderer,
+            viewport: &Rectangle,
+            translation: Vector,
+        ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+            self.content.as_widget_mut().overlay(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                viewport,
+                translation,
+            )
+        }
+        fn a11y_nodes(
+            &self,
+            layout: Layout<'_>,
+            state: &Tree,
+            cursor: mouse::Cursor,
+        ) -> iced_accessibility::A11yTree {
+            self.content
+                .as_widget()
+                .a11y_nodes(layout, &state.children[0], cursor)
+        }
+
+        // IDs belong to the native child tree. Keep this structural wrapper
+        // anonymous to avoid duplicating them in the accessibility tree.
+        fn drag_destinations(
+            &self,
+            state: &Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+        ) {
+            self.content.as_widget().drag_destinations(
+                &state.children[0],
+                layout,
+                renderer,
+                destinations,
+            );
+        }
+    }
 }
 
 fn media_source_selector<'a>(
@@ -460,8 +793,9 @@ mod tests {
 
     #[tokio::test]
     async fn transport_controls_fit_the_compact_media_card() {
-        use cosmic::iced::advanced::{Layout, layout, renderer, widget::Tree};
-        use cosmic::iced::{Font, Pixels, Rectangle, Size};
+        use cosmic::iced::advanced::renderer::Headless as _;
+        use cosmic::iced::advanced::{Layout, Renderer as _, layout, renderer, widget::Tree};
+        use cosmic::iced::{Font, Pixels, Rectangle, Size, mouse};
 
         fn assert_contained(layout: Layout<'_>, card: Rectangle) {
             let bounds = layout.bounds();
@@ -477,7 +811,7 @@ mod tests {
             }
         }
 
-        let renderer = <cosmic::Renderer as renderer::Headless>::new(
+        let mut renderer = <cosmic::Renderer as renderer::Headless>::new(
             Font::default(),
             Pixels(14.0),
             Some("tiny-skia"),
@@ -493,16 +827,286 @@ mod tests {
             can_seek: true,
             ..Default::default()
         };
+        let mut examples = vec![info.clone()];
+        for selected in [Some(2), Some(-1), None, Some(9), Some(12)] {
+            let mut emby = info.clone();
+            emby.player_name = "Emby".into();
+            emby.status = PlaybackStatus::Playing;
+            emby.can_play = true;
+            emby.can_pause = true;
+            emby.can_go_previous = true;
+            emby.can_go_next = true;
+            emby.subtitles = Some(sample_subtitles(selected));
+            examples.push(emby);
+        }
         let players = crate::monitors::media::MultiPlayerState::default();
         let card = Rectangle::with_size(Size::new(322.0, MEDIA_CONTENT_HEIGHT));
-        let mut content = media_content(&info, &players, None, 12, 4, false);
-        let mut tree = Tree::new(content.as_widget());
-        let node = content.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, card.size()),
-        );
-        assert_contained(Layout::new(&node), card);
+        let preview = std::env::var_os("COSMIC_MEDIA_SUBTITLE_PREVIEW");
+        let mut gallery = preview.as_ref().map(|_| {
+            image::RgbaImage::new(322 * examples.len() as u32, MEDIA_CONTENT_HEIGHT as u32)
+        });
+        let theme = cosmic::Theme::dark();
+        for (index, info) in examples.iter().enumerate() {
+            let mut content = media_content(info, &players, None, 12, 4, false);
+            let mut tree = Tree::new(content.as_widget());
+            let node = content.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, card.size()),
+            );
+            assert_contained(Layout::new(&node), card);
+            if let Some(gallery) = &mut gallery {
+                renderer.reset(card);
+                content.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &theme,
+                    &renderer::Style {
+                        text_color: Color::WHITE,
+                        icon_color: Color::WHITE,
+                        scale_factor: 1.0,
+                    },
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &card,
+                );
+                let pixels = renderer.screenshot(
+                    Size::new(322, MEDIA_CONTENT_HEIGHT as u32),
+                    1.0,
+                    theme.cosmic().background(false).base.into(),
+                );
+                let frame =
+                    image::RgbaImage::from_raw(322, MEDIA_CONTENT_HEIGHT as u32, pixels).unwrap();
+                image::imageops::replace(gallery, &frame, index as i64 * 322, 0);
+            }
+        }
+        if let Some((gallery, path)) = gallery.zip(preview) {
+            gallery.save(path).unwrap();
+        }
+    }
+
+    fn sample_subtitles(selected_index: Option<i32>) -> SubtitleState {
+        use crate::monitors::media::{SubtitleTarget, SubtitleTrack};
+        SubtitleState {
+            target: SubtitleTarget {
+                session_id: "test-session".into(),
+                item_id: "test-item".into(),
+                media_source_id: Some("test-source".into()),
+            },
+            tracks: vec![
+                SubtitleTrack {
+                    index: 2,
+                    label: "English".into(),
+                },
+                SubtitleTrack {
+                    index: 5,
+                    label: "English · Forced".into(),
+                },
+                SubtitleTrack {
+                    index: 9,
+                    label: "English · SDH · An exceptionally long subtitle track name".into(),
+                },
+                SubtitleTrack {
+                    index: 12,
+                    label: "English - SRT".into(),
+                },
+            ],
+            selected_index,
+        }
+    }
+
+    #[tokio::test]
+    async fn subtitle_menu_survives_polls_but_closes_when_its_target_or_tracks_change() {
+        use cosmic::iced::advanced::renderer::Headless as _;
+        use cosmic::iced::advanced::{
+            Layout, Renderer as _, Shell, layout, renderer, widget::Tree,
+        };
+        use cosmic::iced::{Event, Font, Pixels, Rectangle, Size, Vector, mouse};
+
+        let mut renderer = <cosmic::Renderer as renderer::Headless>::new(
+            Font::default(),
+            Pixels(14.0),
+            Some("tiny-skia"),
+        )
+        .await
+        .expect("software renderer for subtitle menu lifecycle validation");
+        let baseline = sample_subtitles(Some(2));
+        let viewport = Rectangle::with_size(Size::new(322.0, 250.0));
+        let mut updates = vec![(baseline.clone(), true)];
+        let mut selected = baseline.clone();
+        selected.selected_index = Some(-1);
+        updates.push((selected, true));
+        let mut session = baseline.clone();
+        session.target.session_id = "new-session".into();
+        updates.push((session, false));
+        let mut item = baseline.clone();
+        item.target.item_id = "new-item".into();
+        updates.push((item, false));
+        let mut source = baseline.clone();
+        source.target.media_source_id = Some("new-source".into());
+        updates.push((source, false));
+        let mut stream = baseline.clone();
+        stream.tracks[0].index = 42;
+        updates.push((stream, false));
+        let mut label = baseline.clone();
+        label.tracks[0].label = "Japanese".into();
+        updates.push((label, false));
+
+        for (updated, remains_open) in updates {
+            let mut dropdown = subtitle_dropdown(&baseline);
+            let mut tree = Tree::new(dropdown.as_widget());
+            let node = dropdown.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut messages = Vec::new();
+            dropdown.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(node.bounds().center()),
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            // Remove the tooltip before checking whether the actual dropdown
+            // menu survives the view rebuild. Leaving does not close the menu.
+            dropdown.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorLeft),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert!(
+                dropdown
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .is_some()
+            );
+            assert!(messages.is_empty());
+            if updated == baseline
+                && let Some(path) = std::env::var_os("COSMIC_SUBTITLE_MENU_PREVIEW")
+            {
+                let mut theme = cosmic::Theme::dark();
+                theme.transparent = true;
+                renderer.reset(viewport);
+                let backdrop = cosmic::iced::gradient::Linear::new(cosmic::iced::Radians(0.0))
+                    .add_stop(0.0, Color::from_rgb(0.16, 0.22, 0.36))
+                    .add_stop(1.0, Color::from_rgb(0.36, 0.21, 0.30));
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: viewport,
+                        ..Default::default()
+                    },
+                    Background::Gradient(backdrop.into()),
+                );
+                let style = renderer::Style {
+                    text_color: Color::WHITE,
+                    icon_color: Color::WHITE,
+                    scale_factor: 1.0,
+                };
+                dropdown.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &theme,
+                    &style,
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let mut menu = dropdown
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .unwrap();
+                let menu_node = menu.as_overlay_mut().layout(&renderer, viewport.size());
+                menu.as_overlay().draw(
+                    &mut renderer,
+                    &theme,
+                    &style,
+                    Layout::new(&menu_node),
+                    mouse::Cursor::Unavailable,
+                );
+                let pixels = renderer.screenshot(Size::new(322, 250), 1.0, Color::TRANSPARENT);
+                image::RgbaImage::from_raw(322, 250, pixels)
+                    .unwrap()
+                    .save(path)
+                    .unwrap();
+            }
+
+            let mut rebuilt = subtitle_dropdown(&updated);
+            tree.diff(rebuilt.as_widget_mut());
+            let node = rebuilt.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            assert_eq!(
+                rebuilt
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .is_some(),
+                remains_open,
+                "updated state: {updated:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subtitle_choices_keep_stream_indices_and_unknown_state_distinct_from_off() {
+        let (labels, indices, selected) = subtitle_options(&sample_subtitles(Some(9)));
+        assert_eq!(indices, [-1, 2, 5, 9, 12]);
+        assert_eq!(selected, Some(3));
+        assert_eq!(labels[0], "Off");
+        assert_eq!(labels[1], "English");
+        assert!(labels[2].contains("Forced"));
+        assert!(labels[3].contains("SDH"));
+        assert_eq!(subtitle_options(&sample_subtitles(Some(-1))).2, Some(0));
+        assert_eq!(subtitle_options(&sample_subtitles(None)).2, None);
+        assert_eq!(subtitle_options(&sample_subtitles(Some(99))).2, None);
+
+        let mut duplicates = sample_subtitles(Some(2));
+        duplicates.tracks[0].label = "English alternative one".into();
+        duplicates.tracks[3].label = "English alternative two".into();
+        let (labels, _, _) = subtitle_options(&duplicates);
+        assert_ne!(labels[1], labels[4]);
+    }
+
+    #[test]
+    fn subtitle_controls_only_appear_for_emby_with_actual_tracks() {
+        let mut info = MediaInfo {
+            player_name: "COSMIC Player".into(),
+            subtitles: Some(sample_subtitles(Some(2))),
+            ..Default::default()
+        };
+        assert!(emby_subtitles(&info).is_none());
+        info.player_name = "Emby".into();
+        assert!(emby_subtitles(&info).is_some());
+        info.subtitles.as_mut().unwrap().tracks.clear();
+        assert!(emby_subtitles(&info).is_none());
     }
 
     #[test]

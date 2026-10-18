@@ -530,6 +530,7 @@ fn media_info_from_properties(
         can_go_next: can_control && property_bool(properties, "CanGoNext").unwrap_or(true),
         can_go_previous: can_control && property_bool(properties, "CanGoPrevious").unwrap_or(true),
         can_seek: can_control && property_bool(properties, "CanSeek").unwrap_or(false),
+        subtitles: None,
     })
 }
 

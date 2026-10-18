@@ -169,6 +169,7 @@ impl ExternalProbePlan {
 /// - `update_requested`: Flag to trigger background refresh
 /// - Background thread retries unresolved startup readings every second
 /// - An independent worker queries Logitech devices every second
+/// - Wolverine has its own five-second worker, woken by matching USB/HID events
 /// - Other native devices return to a five-second interval after startup resolves
 /// - Main thread calls `update()` every 30 seconds to refresh active fallbacks
 ///
@@ -184,6 +185,7 @@ pub struct BatteryMonitor {
     /// Names owned by dedicated headset readers, published with `devices`.
     native_headset_coverage: Arc<Mutex<Vec<String>>>,
     maxwell_connection: SharedMaxwellConnection,
+    wolverine_monitor: controllers::wolverine_monitor::Monitor,
     cached_devices: Vec<BatteryDevice>,
     initial_probe_started: Instant,
     /// Last time `update()` was called (for rate limiting)
@@ -261,6 +263,7 @@ impl BatteryMonitor {
         let logitech_devices = Arc::new(Mutex::new(Vec::new()));
         let native_headset_coverage = Arc::new(Mutex::new(Vec::new()));
         let maxwell_connection: SharedMaxwellConnection = Arc::new(Mutex::new(None));
+        let wolverine_monitor = controllers::wolverine_monitor::Monitor::new();
         let initial_probe_started = Instant::now();
         let update_requested = Arc::new(Mutex::new(true)); // Request initial update immediately
         let solaar_enabled = Arc::new(AtomicBool::new(enable_solaar));
@@ -343,6 +346,7 @@ impl BatteryMonitor {
         let logitech_devices_clone = Arc::clone(&logitech_devices);
         let headset_coverage_clone = Arc::clone(&native_headset_coverage);
         let native_maxwell_connection = Arc::clone(&maxwell_connection);
+        let native_wolverine_monitor = wolverine_monitor.clone();
         let startup_cache = cached_devices.clone();
 
         std::thread::spawn(move || {
@@ -350,7 +354,6 @@ impl BatteryMonitor {
             let mut last_cache_snapshot = None;
             let mut native_maxwell_authoritative = false;
             let mut native_maxwell = None;
-            let mut native_wolverine = None;
             let mut active_solaar = solaar_enabled_clone.load(Ordering::Relaxed);
 
             // Resolve Maxwell first and publish it immediately. External fallback
@@ -411,24 +414,8 @@ impl BatteryMonitor {
                     native_headsets.states.len()
                 );
             }
-            match query_native_wolverine(false) {
-                Ok(state) => {
-                    if state.is_some() {
-                        log::info!("Using native HID monitoring for Razer Wolverine V3 Pro 8K PC");
-                    }
-                    native_wolverine = state;
-                    let mut devices = devices_clone.lock().unwrap();
-                    merge_native_wolverine(&mut devices, native_wolverine.clone());
-                    prepare_detected_devices(
-                        &mut devices,
-                        &cached_devices,
-                        initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
-                    );
-                }
-                Err(error) => {
-                    log::warn!("Native Razer Wolverine V3 Pro 8K PC query failed: {error}");
-                }
-            }
+            // The controller's independent worker owns all of its HID I/O.
+            native_wolverine_monitor.apply(&mut devices_clone.lock().unwrap());
 
             // Probe both external backends once for devices that are not covered
             // by the native readers. Inactive backends are only rediscovered
@@ -464,7 +451,6 @@ impl BatteryMonitor {
                 native_maxwell_authoritative,
                 native_maxwell.clone(),
                 &native_logitech,
-                native_wolverine.clone(),
                 &native_headsets.states,
                 &native_headset_coverage,
             );
@@ -473,6 +459,7 @@ impl BatteryMonitor {
                 &cached_devices,
                 initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
             );
+            native_wolverine_monitor.apply(&mut new_devices);
             *devices_clone.lock().unwrap() = new_devices.clone();
 
             apply_maxwell_connection(
@@ -488,7 +475,7 @@ impl BatteryMonitor {
             // Retry unresolved cached devices quickly during startup, then use the
             // normal native polling interval. The timeout prevents a broken HID
             // permission or backend from causing permanent one-second polling.
-            loop {
+            while Arc::strong_count(&devices_clone) > 1 {
                 let (poll_interval, fast_initial_poll) = {
                     let mut devices = devices_clone.lock().unwrap();
                     let elapsed = initial_probe_started.elapsed();
@@ -498,6 +485,14 @@ impl BatteryMonitor {
                     (
                         native_poll_interval(&devices, elapsed, !native_logitech.is_empty()),
                         fast_initial_poll,
+                    )
+                };
+                // Early hotplug wakeups must not restart the five-second wait.
+                let poll_interval = if fast_initial_poll {
+                    poll_interval
+                } else {
+                    poll_interval.min(
+                        NATIVE_POLL_INTERVAL.saturating_sub(last_standard_native_poll.elapsed()),
                     )
                 };
                 let changes = wait_for_device_changes(&mut events, poll_interval);
@@ -529,17 +524,6 @@ impl BatteryMonitor {
                         merge_native_maxwell(
                             &mut devices_clone.lock().unwrap(),
                             native_maxwell.clone(),
-                        );
-                    }
-
-                    let was_wolverine_connected = native_wolverine
-                        .as_ref()
-                        .is_some_and(|device| device.is_connected);
-                    if let Ok(state) = query_native_wolverine(was_wolverine_connected) {
-                        native_wolverine = state;
-                        merge_native_wolverine(
-                            &mut devices_clone.lock().unwrap(),
-                            native_wolverine.clone(),
                         );
                     }
                 }
@@ -627,7 +611,6 @@ impl BatteryMonitor {
                         native_maxwell_authoritative,
                         native_maxwell.clone(),
                         &native_logitech,
-                        native_wolverine.clone(),
                         &native_headsets.states,
                         &native_headset_coverage,
                     );
@@ -636,10 +619,12 @@ impl BatteryMonitor {
                         &cached_devices,
                         initial_probe_started.elapsed() < INITIAL_PROBE_TIMEOUT,
                     );
+                    native_wolverine_monitor.apply(&mut new_devices);
                     *devices_clone.lock().unwrap() = new_devices.clone();
                 }
 
                 let mut current_devices = devices_clone.lock().unwrap().clone();
+                native_wolverine_monitor.apply(&mut current_devices);
                 apply_maxwell_connection(
                     &mut current_devices,
                     native_maxwell_connection.lock().unwrap().as_ref(),
@@ -653,6 +638,7 @@ impl BatteryMonitor {
             logitech_devices,
             native_headset_coverage,
             maxwell_connection,
+            wolverine_monitor,
             cached_devices: startup_cache,
             initial_probe_started,
             last_update,
@@ -691,6 +677,7 @@ impl BatteryMonitor {
             &mut devices,
             self.maxwell_connection.lock().unwrap().as_ref(),
         );
+        self.wolverine_monitor.apply(&mut devices);
         devices
     }
 
@@ -1256,7 +1243,6 @@ fn combined_battery_devices(
     native_maxwell_authoritative: bool,
     native_maxwell: Option<BatteryDevice>,
     native_logitech: &[BatteryDevice],
-    native_wolverine: Option<BatteryDevice>,
     native_headsets: &[headsets::BatteryState],
     native_headset_coverage: &[String],
 ) -> Vec<BatteryDevice> {
@@ -1273,7 +1259,6 @@ fn combined_battery_devices(
         merge_native_maxwell(&mut devices, native_maxwell);
     }
     merge_native_logitech(&mut devices, native_logitech);
-    merge_native_wolverine(&mut devices, native_wolverine);
     merge_native_headsets(&mut devices, native_headsets, native_headset_coverage);
     devices
 }

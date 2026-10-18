@@ -4,22 +4,12 @@
 //! Chromium's keys identify the organization, and its checksums detect partial
 //! writes. No cookies, credentials, or other cached requests are accessed.
 
-use super::super::{UsageSnapshot, UsageSource, UsageStatus, claude};
+use super::super::{UsageSnapshot, UsageSource, UsageStatus, claude, http_cache};
 use super::{FRESH_SECONDS, FileStamp, MAX_AGE_SECONDS, read_bounded};
-use sha1::Digest as _;
-use sha2::Digest as _;
-use std::io::Read;
+#[cfg(test)]
+use http_cache::{HEADER_SIZE, MAX_BODY_BYTES, decode_body};
+use http_cache::{MAX_ENTRY_BYTES, cache_filename};
 use std::path::{Path, PathBuf};
-
-const MAX_ENTRY_BYTES: u64 = 256 * 1024;
-const MAX_BODY_BYTES: u64 = 512 * 1024;
-const MAX_METADATA_BYTES: usize = 64 * 1024;
-const HEADER_SIZE: usize = 24;
-const TRAILER_SIZE: usize = 24;
-const HEADER_MAGIC: u64 = 0xfcfb_6d1b_a772_5c30;
-const TRAILER_MAGIC: u64 = 0xf4fa_6f45_970d_41d8;
-const HAS_CRC: u32 = 1;
-const HAS_KEY_SHA256: u32 = 2;
 
 #[derive(Default)]
 pub(super) struct UsageCacheReader {
@@ -109,79 +99,9 @@ fn usage_key(organization: &str, suffix: &str) -> String {
     format!("1/0/https://claude.ai/api/organizations/{organization}/usage{suffix}")
 }
 
-fn cache_filename(key: &str) -> String {
-    let digest = sha1::Sha1::digest(key.as_bytes());
-    let hash = u64::from_le_bytes(digest[..8].try_into().expect("SHA-1 has eight bytes"));
-    format!("{hash:016x}_0")
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
-    ))
-}
-
-fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
-    ))
-}
-
 fn parse_entry(bytes: &[u8], key: &str, now: i64) -> Option<UsageSnapshot> {
-    if bytes.len() as u64 > MAX_ENTRY_BYTES
-        || u64_at(bytes, 0)? != HEADER_MAGIC
-        || u32_at(bytes, 8)? != 5
-    {
-        return None;
-    }
-    let key_size = u32_at(bytes, 12)? as usize;
-    if key_size != key.len() || key_size > 512 {
-        return None;
-    }
-    let body_start = HEADER_SIZE.checked_add(key_size)?;
-    if bytes.get(HEADER_SIZE..body_start)? != key.as_bytes() {
-        return None;
-    }
-
-    // The last trailer describes stream 0 (HTTP response metadata). Its key
-    // digest immediately precedes it. Stream 1 (body) comes before metadata.
-    let metadata_trailer = bytes.len().checked_sub(TRAILER_SIZE)?;
-    if u64_at(bytes, metadata_trailer)? != TRAILER_MAGIC
-        || u32_at(bytes, metadata_trailer + 8)? != (HAS_CRC | HAS_KEY_SHA256)
-    {
-        return None;
-    }
-    let metadata_size = u32_at(bytes, metadata_trailer + 16)? as usize;
-    if metadata_size > MAX_METADATA_BYTES {
-        return None;
-    }
-    let digest_start = metadata_trailer.checked_sub(32)?;
-    if bytes.get(digest_start..metadata_trailer)? != sha2::Sha256::digest(key.as_bytes()).as_slice()
-    {
-        return None;
-    }
-    let metadata_start = digest_start.checked_sub(metadata_size)?;
-    let body_end = metadata_start.checked_sub(TRAILER_SIZE)?;
-    if body_end < body_start
-        || u64_at(bytes, body_end)? != TRAILER_MAGIC
-        || u32_at(bytes, body_end + 8)? != HAS_CRC
-    {
-        return None;
-    }
-    let body = bytes.get(body_start..body_end)?;
-    let metadata = bytes.get(metadata_start..digest_start)?;
-    if crc32fast::hash(body) != u32_at(bytes, body_end + 12)?
-        || crc32fast::hash(metadata) != u32_at(bytes, metadata_trailer + 12)?
-    {
-        return None;
-    }
-    let (updated_at, encoding) = response_headers(metadata)?;
-    let age = now.checked_sub(updated_at)?;
-    if updated_at <= 0 || !(0..=MAX_AGE_SECONDS).contains(&age) {
-        return None;
-    }
-    let body = decode_body(body, encoding)?;
-    let mut snapshot = claude::parse_usage(&body, updated_at)?;
+    let response = http_cache::parse_entry(bytes, key, now, MAX_AGE_SECONDS)?;
+    let mut snapshot = claude::parse_usage(&response.body, response.updated_at)?;
     // Both main windows must belong to this response; partial responses do not
     // borrow a percentage or a reset timestamp from a different report.
     if !["five_hour", "seven_day"]
@@ -192,85 +112,6 @@ fn parse_entry(bytes: &[u8], key: &str, now: i64) -> Option<UsageSnapshot> {
     }
     snapshot.source = Some(UsageSource::ClaudeDesktop);
     present(snapshot, now)
-}
-
-fn response_headers(metadata: &[u8]) -> Option<(i64, &str)> {
-    // Chromium serializes the response header block as NUL-delimited strings
-    // inside a Pickle. Locate that block without deserializing unrelated fields.
-    let start = metadata
-        .windows(9)
-        .position(|bytes| bytes == b"HTTP/1.1 ")?;
-    let mut lines = metadata.get(start..)?.split(|byte| *byte == 0);
-    let status = std::str::from_utf8(lines.next()?).ok()?;
-    if status.split_ascii_whitespace().nth(1)? != "200" {
-        return None;
-    }
-    let mut date = None;
-    let mut encoding = None;
-    let mut content_type = None;
-    let mut terminated = false;
-    for line in lines {
-        if line.is_empty() {
-            terminated = true;
-            break;
-        }
-        let line = std::str::from_utf8(line).ok()?;
-        let (name, value) = line.split_once(':')?;
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("date") {
-            if date.is_some() {
-                return None;
-            }
-            date = Some(
-                chrono::DateTime::parse_from_rfc2822(value)
-                    .ok()?
-                    .timestamp(),
-            );
-        } else if name.eq_ignore_ascii_case("content-encoding") {
-            if encoding.is_some() {
-                return None;
-            }
-            encoding = Some(value);
-        } else if name.eq_ignore_ascii_case("content-type") {
-            if content_type.is_some() {
-                return None;
-            }
-            content_type = Some(value);
-        }
-    }
-    if !terminated
-        || !content_type?
-            .split(';')
-            .next()?
-            .trim()
-            .eq_ignore_ascii_case("application/json")
-    {
-        return None;
-    }
-    Some((date?, encoding.unwrap_or("identity")))
-}
-
-fn decode_body(body: &[u8], encoding: &str) -> Option<Vec<u8>> {
-    let reader: Box<dyn Read + '_> = if encoding.eq_ignore_ascii_case("identity") {
-        Box::new(body)
-    } else if encoding.eq_ignore_ascii_case("zstd") {
-        let mut decoder = zstd::stream::read::Decoder::new(body).ok()?;
-        // Prevent small compressed files from requesting unbounded decoder RAM.
-        // Desktop's HTTP compressor advertises a 2 MiB streaming window
-        // even for its small usage payloads. Allow that with a 4 MiB ceiling.
-        decoder.window_log_max(22).ok()?;
-        Box::new(decoder)
-    } else if encoding.eq_ignore_ascii_case("gzip") {
-        Box::new(flate2::read::MultiGzDecoder::new(body))
-    } else {
-        return None;
-    };
-    let mut decoded = Vec::new();
-    reader
-        .take(MAX_BODY_BYTES + 1)
-        .read_to_end(&mut decoded)
-        .ok()?;
-    (decoded.len() as u64 <= MAX_BODY_BYTES).then_some(decoded)
 }
 
 fn present(mut snapshot: UsageSnapshot, now: i64) -> Option<UsageSnapshot> {
@@ -303,12 +144,17 @@ pub(super) fn write_test_report(
         .join(cache_filename(&key));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let body = tests::usage_body(used, resets);
-    std::fs::write(path, tests::entry(&key, timestamp, "identity", &body)).unwrap();
+    std::fs::write(
+        path,
+        http_cache::test_entry(&key, timestamp, "identity", &body),
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_cache::{test_assemble as assemble, test_entry as entry};
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -331,46 +177,6 @@ mod tests {
 
     fn body() -> Vec<u8> {
         usage_body([12.0, 34.0], [NOW + 3600, NOW + 86_400])
-    }
-
-    fn trailer(output: &mut Vec<u8>, flags: u32, crc: u32, size: u32) {
-        output.extend_from_slice(&TRAILER_MAGIC.to_le_bytes());
-        output.extend_from_slice(&flags.to_le_bytes());
-        output.extend_from_slice(&crc.to_le_bytes());
-        output.extend_from_slice(&size.to_le_bytes());
-        output.extend_from_slice(&0u32.to_le_bytes());
-    }
-
-    pub(super) fn entry(key: &str, timestamp: i64, encoding: &str, body: &[u8]) -> Vec<u8> {
-        let date = chrono::DateTime::from_timestamp(timestamp, 0)
-            .unwrap()
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string();
-        let mut metadata = vec![0; 40];
-        metadata.extend_from_slice(format!(
-            "HTTP/1.1 200\0date:{date}\0content-type:application/json\0content-encoding:{encoding}\0\0"
-        ).as_bytes());
-        assemble(key, &metadata, body)
-    }
-
-    fn assemble(key: &str, metadata: &[u8], body: &[u8]) -> Vec<u8> {
-        let mut output = Vec::new();
-        output.extend_from_slice(&HEADER_MAGIC.to_le_bytes());
-        output.extend_from_slice(&5u32.to_le_bytes());
-        output.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        output.extend_from_slice(&[0; 8]);
-        output.extend_from_slice(key.as_bytes());
-        output.extend_from_slice(body);
-        trailer(&mut output, HAS_CRC, crc32fast::hash(body), 0);
-        output.extend_from_slice(metadata);
-        output.extend_from_slice(sha2::Sha256::digest(key.as_bytes()).as_slice());
-        trailer(
-            &mut output,
-            HAS_CRC | HAS_KEY_SHA256,
-            crc32fast::hash(metadata),
-            metadata.len() as u32,
-        );
-        output
     }
 
     struct Directory(PathBuf);

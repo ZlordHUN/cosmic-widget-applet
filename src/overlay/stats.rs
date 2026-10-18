@@ -6,7 +6,7 @@ use crate::monitors::ai_usage::claude::ClaudeUsageMonitor;
 use crate::monitors::ai_usage::codex::CodexUsageMonitor;
 use crate::monitors::battery::{BatteryDevice, BatteryMonitor};
 use crate::monitors::disk_io::DiskIoMonitor;
-use crate::monitors::media::{MediaMonitor, MultiPlayerState, PlayerId};
+use crate::monitors::media::{MediaMonitor, MultiPlayerState, PlayerId, SubtitleTarget};
 use crate::monitors::network::NetworkMonitor;
 use crate::monitors::notifications::{Notification, NotificationMonitor};
 use crate::monitors::storage::{DiskInfo, StorageMonitor};
@@ -228,6 +228,10 @@ impl StatsSampler {
 
     pub fn seek_media(&self, progress: f64) {
         self.media_monitor.seek_to_progress(progress);
+    }
+
+    pub fn set_media_subtitle_track(&self, target: &SubtitleTarget, index: i32) -> bool {
+        self.media_monitor.set_subtitle_track(target, index)
     }
 
     pub fn media_seek_relative(&self, offset_ms: i64) {

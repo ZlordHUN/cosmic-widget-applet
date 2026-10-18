@@ -40,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 mod bandcamp;
 mod cider;
+mod emby_subtitles;
 mod mpris;
 mod video_artwork;
 mod video_title;
@@ -274,6 +275,7 @@ struct EmbyControl {
     server_url: String,
     access_token: String,
     session_id: String,
+    subtitle_target: Option<SubtitleTarget>,
 }
 
 enum MediaControlCommand {
@@ -289,6 +291,11 @@ enum MediaControlCommand {
         control: EmbyControl,
         command: &'static str,
         query: Option<(&'static str, u64)>,
+    },
+    EmbySubtitle {
+        control: EmbyControl,
+        target: SubtitleTarget,
+        index: i32,
     },
     Mpris {
         bus_name: String,
@@ -309,11 +316,16 @@ struct MediaControlWorker {
 }
 
 impl MediaControlWorker {
-    fn new(cider: cider::Client, mpris: mpris::Monitor) -> Self {
+    fn new(
+        cider: cider::Client,
+        mpris: mpris::Monitor,
+        player_state: Arc<Mutex<MultiPlayerState>>,
+        emby_control: Arc<Mutex<Option<EmbyControl>>>,
+    ) -> Self {
         let (commands, receiver) = std::sync::mpsc::sync_channel(MEDIA_CONTROL_QUEUE_CAPACITY);
         if let Err(error) = std::thread::Builder::new()
             .name("media-controls".to_string())
-            .spawn(move || Self::run(receiver, cider, mpris))
+            .spawn(move || Self::run(receiver, cider, mpris, player_state, emby_control))
         {
             log::warn!("Failed to start media control worker: {error}");
         }
@@ -338,6 +350,8 @@ impl MediaControlWorker {
         receiver: std::sync::mpsc::Receiver<MediaControlCommand>,
         cider: cider::Client,
         mpris: mpris::Monitor,
+        player_state: Arc<Mutex<MultiPlayerState>>,
+        emby_control: Arc<Mutex<Option<EmbyControl>>>,
     ) {
         let emby_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -384,6 +398,29 @@ impl MediaControlWorker {
                         .and_then(reqwest::blocking::Response::error_for_status)
                     {
                         log::warn!("Emby {command} command failed: {error}");
+                    }
+                }
+                MediaControlCommand::EmbySubtitle {
+                    control,
+                    target,
+                    index,
+                } => {
+                    let Some(client) = emby_client.as_ref() else {
+                        continue;
+                    };
+                    // Commands can wait behind earlier requests. Check again
+                    // before dispatch so an old episode/source is never reused.
+                    let valid = {
+                        let state = player_state.lock().unwrap();
+                        let current = emby_control.lock().unwrap();
+                        current.as_ref().is_some_and(|current| {
+                            current.server_url == control.server_url
+                                && current.access_token == control.access_token
+                                && emby_subtitles::valid_request(&state, current, &target, index)
+                        })
+                    };
+                    if valid && !emby_subtitles::send(client, &control, index) {
+                        log::warn!("Emby subtitle selection failed");
                     }
                 }
                 MediaControlCommand::Mpris { bus_name, action } => {
@@ -508,6 +545,8 @@ struct EmbySession {
     device_id: String,
     #[serde(default)]
     supports_remote_control: bool,
+    #[serde(default, deserialize_with = "emby_subtitles::deserialize_commands")]
+    supported_commands: Vec<String>,
     now_playing_item: Option<EmbyItem>,
     play_state: Option<EmbyPlayState>,
     playlist_index: Option<i64>,
@@ -532,6 +571,10 @@ struct EmbyItem {
     parent_thumb_item_id: Option<String>,
     parent_thumb_image_tag: Option<String>,
     series_primary_image_tag: Option<String>,
+    #[serde(default, deserialize_with = "emby_subtitles::deserialize_streams")]
+    media_streams: Option<Vec<emby_subtitles::MediaStream>>,
+    #[serde(default, deserialize_with = "emby_subtitles::deserialize_sources")]
+    media_sources: Option<Vec<emby_subtitles::MediaSource>>,
 }
 
 #[derive(Deserialize)]
@@ -540,6 +583,33 @@ struct EmbyPlayState {
     position_ticks: Option<u64>,
     is_paused: Option<bool>,
     can_seek: Option<bool>,
+    #[serde(default, deserialize_with = "emby_subtitles::deserialize_index")]
+    subtitle_stream_index: Option<i32>,
+    media_source_id: Option<String>,
+    #[serde(default, deserialize_with = "emby_subtitles::deserialize_source")]
+    media_source: Option<emby_subtitles::MediaSource>,
+}
+
+/// Playback identity attached to a subtitle action, including the exact source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTarget {
+    pub session_id: String,
+    pub item_id: String,
+    pub media_source_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTrack {
+    pub index: i32,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleState {
+    pub target: SubtitleTarget,
+    pub tracks: Vec<SubtitleTrack>,
+    /// None is unknown; Some(-1) explicitly means subtitles are disabled.
+    pub selected_index: Option<i32>,
 }
 
 // ============================================================================
@@ -587,6 +657,8 @@ pub struct MediaInfo {
     /// Whether seeking is supported
     #[allow(dead_code)]
     pub can_seek: bool,
+    /// Available only for compatible native Emby sessions with subtitle tracks.
+    pub subtitles: Option<SubtitleState>,
 }
 
 impl MediaInfo {
@@ -1130,7 +1202,12 @@ impl MediaMonitor {
         let emby_control = Arc::new(Mutex::new(None));
         let mpris = mpris::Monitor::new();
         let cider = cider::Client::new();
-        let controls = MediaControlWorker::new(cider.clone(), mpris.clone());
+        let controls = MediaControlWorker::new(
+            cider.clone(),
+            mpris.clone(),
+            Arc::clone(&player_state),
+            Arc::clone(&emby_control),
+        );
 
         // Spawn background thread to monitor all players
         let state_clone = Arc::clone(&player_state);
@@ -1185,6 +1262,7 @@ impl MediaMonitor {
         let mut emby_discovery = EmbyCredentialDiscovery::default();
         let mut emby_credentials = emby_discovery.refresh();
         let mut last_emby_discovery = Instant::now();
+        let mut subtitle_cache = emby_subtitles::Cache::default();
 
         loop {
             Self::collect_artwork_results(
@@ -1200,9 +1278,9 @@ impl MediaMonitor {
                 last_emby_discovery = Instant::now();
             }
             let emby_player = emby_client.as_ref().and_then(|client| {
-                emby_credentials
-                    .as_ref()
-                    .and_then(|credentials| Self::try_emby_player(client, credentials))
+                emby_credentials.as_ref().and_then(|credentials| {
+                    Self::try_emby_player(client, credentials, &mut subtitle_cache)
+                })
             });
             if let Some((player_id, mut info, control)) = emby_player {
                 update_tracked_position(
@@ -1457,6 +1535,7 @@ impl MediaMonitor {
     fn try_emby_player(
         client: &reqwest::blocking::Client,
         credentials: &EmbyCredentials,
+        subtitle_cache: &mut emby_subtitles::Cache,
     ) -> Option<(PlayerId, MediaInfo, EmbyControl)> {
         let host_name = sysinfo::System::host_name().unwrap_or_default();
 
@@ -1489,11 +1568,14 @@ impl MediaMonitor {
                             || session.device_id.eq_ignore_ascii_case(&host_name))
                 })
                 .or_else(|| (active_theater.len() == 1).then(|| active_theater[0]))?;
-            let (player_id, info) = Self::media_info_from_emby_session(server_url, session)?;
+            let (player_id, mut info) = Self::media_info_from_emby_session(server_url, session)?;
+            info.subtitles =
+                subtitle_cache.resolve(client, credentials, server_url, session, Instant::now());
             let control = EmbyControl {
                 server_url: server_url.clone(),
                 access_token: credentials.access_token.clone(),
                 session_id: session.id.clone(),
+                subtitle_target: info.subtitles.as_ref().map(|state| state.target.clone()),
             };
             return Some((player_id, info, control));
         }
@@ -1551,6 +1633,7 @@ impl MediaMonitor {
                 can_go_next,
                 can_go_previous,
                 can_seek: session.supports_remote_control && play_state.can_seek.unwrap_or(false),
+                subtitles: emby_subtitles::from_session(session),
             },
         ))
     }
@@ -2287,6 +2370,24 @@ impl MediaMonitor {
                 PlayerId::Mpris(bus_name) => self.mpris_previous(bus_name),
             }
         }
+    }
+
+    /// Queue a subtitle selection for the still-selected Emby item/source.
+    /// The next server session report remains authoritative for selected state.
+    pub fn set_subtitle_track(&self, target: &SubtitleTarget, index: i32) -> bool {
+        let state = self.player_state.lock().unwrap();
+        let control = self.emby_control.lock().unwrap();
+        let Some(control) = control
+            .as_ref()
+            .filter(|control| emby_subtitles::valid_request(&state, control, target, index))
+        else {
+            return false;
+        };
+        self.controls.enqueue(MediaControlCommand::EmbySubtitle {
+            control: control.clone(),
+            target: target.clone(),
+            index,
+        })
     }
 
     /// Seek to position based on progress (0.0 to 1.0).

@@ -15,11 +15,12 @@ const SETTLE_DELAY: Duration = Duration::from_millis(50);
 pub(super) struct Changes {
     pub(super) topology: bool,
     pub(super) power: bool,
+    pub(super) wolverine: bool,
 }
 
 impl Changes {
     pub(super) fn is_empty(self) -> bool {
-        !self.topology && !self.power
+        !self.topology && !self.power && !self.wolverine
     }
 }
 
@@ -136,10 +137,11 @@ impl Listener {
                     }
                     if error.raw_os_error() == Some(libc::ENOBUFS) {
                         pending_error = false;
-                        // Lost notifications require refreshing both kinds of state.
+                        // Lost notifications require refreshing every kind of state.
                         Changes {
                             topology: true,
                             power: true,
+                            wolverine: true,
                         }
                     } else {
                         self.disable_until(started, timeout);
@@ -164,6 +166,7 @@ impl Listener {
                     }
                     changes.topology |= incoming.topology;
                     changes.power |= incoming.power;
+                    changes.wolverine |= incoming.wolverine;
                 }
             }
             if nonblocking {
@@ -194,11 +197,20 @@ fn parse_event(payload: &[u8]) -> Changes {
     }
     let mut action = None;
     let mut subsystem = None;
+    let mut product = None;
+    let mut hid_id = None;
+    let mut device_path = None;
     for field in payload.split(|byte| *byte == 0) {
         if let Some(value) = field.strip_prefix(b"ACTION=") {
             action = Some(value);
         } else if let Some(value) = field.strip_prefix(b"SUBSYSTEM=") {
             subsystem = Some(value);
+        } else if let Some(value) = field.strip_prefix(b"PRODUCT=") {
+            product = Some(value);
+        } else if let Some(value) = field.strip_prefix(b"HID_ID=") {
+            hid_id = Some(value);
+        } else if let Some(value) = field.strip_prefix(b"DEVPATH=") {
+            device_path = Some(value);
         }
     }
     if !matches!(
@@ -210,7 +222,62 @@ fn parse_event(payload: &[u8]) -> Changes {
     Changes {
         topology: matches!(subsystem, Some(b"usb" | b"hidraw" | b"sound")),
         power: subsystem == Some(b"power_supply".as_slice()),
+        wolverine: matches!(subsystem, Some(b"usb" | b"hid" | b"hidraw"))
+            && (product.is_some_and(wolverine_usb_product)
+                || hid_id.is_some_and(wolverine_hid_id)
+                || device_path.is_some_and(wolverine_device_path)),
     }
+}
+
+// Match complete kernel identity fields rather than device names or arbitrary
+// path substrings. Unrelated USB traffic must not cause extra controller I/O.
+fn wolverine_usb_product(value: &[u8]) -> bool {
+    let mut fields = value.split(|byte| *byte == b'/');
+    let (Some(vendor), Some(product), Some(revision)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    fields.next().is_none()
+        && parse_hex(revision, 4).is_some()
+        && is_wolverine(parse_hex(vendor, 4), parse_hex(product, 4))
+}
+
+fn wolverine_hid_id(value: &[u8]) -> bool {
+    let mut fields = value.split(|byte| *byte == b':');
+    let (Some(bus), Some(vendor), Some(product)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    fields.next().is_none()
+        && parse_hex(bus, 4) == Some(0x0003) // USB HID, not Bluetooth.
+        && is_wolverine(parse_hex(vendor, 8), parse_hex(product, 8))
+}
+
+fn wolverine_device_path(value: &[u8]) -> bool {
+    value.split(|byte| *byte == b'/').any(|component| {
+        let mut fields = component.split(|byte| *byte == b'.');
+        let (Some(identity), Some(instance)) = (fields.next(), fields.next()) else {
+            return false;
+        };
+        fields.next().is_none()
+            && parse_hex(instance, 8).is_some()
+            && identity
+                .split(|byte| *byte == b':')
+                .all(|part| part.len() == 4)
+            && wolverine_hid_id(identity)
+    })
+}
+
+fn is_wolverine(vendor: Option<u32>, product: Option<u32>) -> bool {
+    vendor == Some(0x1532) && matches!(product, Some(0x0a57 | 0x0a59))
+}
+
+fn parse_hex(value: &[u8], max_length: usize) -> Option<u32> {
+    if value.is_empty() || value.len() > max_length || !value.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u32::from_str_radix(std::str::from_utf8(value).ok()?, 16).ok()
 }
 
 #[cfg(test)]
@@ -231,9 +298,88 @@ mod tests {
                     Changes {
                         topology: subsystem != "power_supply",
                         power: subsystem == "power_supply",
+                        wolverine: false,
                     }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn recognizes_wolverine_wired_and_dongle_hotplug_identity_fields() {
+        for action in ["add", "remove", "change", "bind", "unbind"] {
+            for product in ["a57", "0A57", "a59", "0A59"] {
+                let event = format!("ACTION={action}\0SUBSYSTEM=usb\0PRODUCT=1532/{product}/200\0");
+                let changes = parse_event(event.as_bytes());
+                assert!(changes.wolverine, "{event:?}");
+                assert!(changes.topology);
+                assert!(!changes.power);
+            }
+            for subsystem in ["hid", "hidraw"] {
+                for product in ["00000a57", "00000A59"] {
+                    let event = format!(
+                        "ACTION={action}\0SUBSYSTEM={subsystem}\0HID_ID=0003:00001532:{product}\0"
+                    );
+                    let changes = parse_event(event.as_bytes());
+                    assert!(changes.wolverine, "{event:?}");
+                    assert!(!changes.is_empty());
+                    assert_eq!(changes.topology, subsystem == "hidraw");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recognizes_wolverine_hidraw_paths_without_product_fields() {
+        for action in ["add", "remove"] {
+            for identity in ["0003:1532:0A57.001A", "0003:1532:0a59.000b"] {
+                let event = format!(
+                    "ACTION={action}\0SUBSYSTEM=hidraw\0DEVPATH=/devices/pci0000:00/usb1/1-2/1-2:1.0/{identity}/hidraw/hidraw11\0"
+                );
+                assert!(parse_event(event.as_bytes()).wolverine, "{event:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ignores_unrelated_and_malformed_wolverine_identities() {
+        for identity in [
+            "PRODUCT=1532/e05/200", // Razer webcam.
+            "PRODUCT=046d/a57/200",
+            "PRODUCT=1532/0a58/200",
+            "PRODUCT=1532/0a570/200",
+            "PRODUCT=1532/0a57/",
+            "PRODUCT=1532/0a57/xyz",
+            "PRODUCT=1532/0a57/200/1",
+            "PRODUCT=0x1532/0a57/200",
+            "PRODUCT=1532/+a57/200",
+            "HID_ID=0005:00001532:00000A57", // Bluetooth is not this device.
+            "HID_ID=0003:00001532:00000A58",
+            "HID_ID=0003:00011532:00000A57",
+            "HID_ID=0003:00001532:00000A570",
+            "HID_ID=0003:00001532:00000A57:0001",
+            "HID_ID=0003:00001532:00000A5G",
+            "DEVPATH=/devices/not-0003:1532:0A57.0001/hidraw/hidraw1",
+            "DEVPATH=/devices/0003:1532:0A57.0001-extra/hidraw/hidraw1",
+            "DEVPATH=/devices/0003:1532:0A57./hidraw/hidraw1",
+            "DEVPATH=/devices/0003:1532:0A57.0001.2/hidraw/hidraw1",
+            "DEVPATH=/devices/0003:1532:0A57/hidraw/hidraw1",
+            "DEVPATH=/devices/0003:1532:0A570.0001/hidraw/hidraw1",
+            "DEVPATH=/devices/0003:1532:0A58.0001/hidraw/hidraw1",
+            "DEVPATH=/devices/0003:046D:0A57.0001/hidraw/hidraw1",
+            "DEVPATH=/devices/0005:1532:0A57.0001/hidraw/hidraw1",
+            "DEVPATH=/devices/3:0001532:0A57.0001/hidraw/hidraw1",
+        ] {
+            let event = format!("ACTION=add\0SUBSYSTEM=hidraw\0{identity}\0");
+            assert!(!parse_event(event.as_bytes()).wolverine, "{identity}");
+        }
+        for event in [
+            b"ACTION=online\0SUBSYSTEM=usb\0PRODUCT=1532/a57/200\0".as_slice(),
+            b"ACTION=add\0SUBSYSTEM=thermal\0PRODUCT=1532/a57/200\0",
+            b"ACTION=add\0SUBSYSTEM=sound\0HID_ID=0003:00001532:00000A57\0",
+            b"ACTION=add\0SUBSYSTEM=usb\0PRODUCT=1532/a57/200",
+        ] {
+            assert!(!parse_event(event).wolverine, "{event:?}");
         }
     }
 
