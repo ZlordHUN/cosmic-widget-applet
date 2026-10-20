@@ -44,6 +44,7 @@ mod emby_subtitles;
 mod mpris;
 mod video_artwork;
 mod video_title;
+mod volume;
 
 const MAX_ARTWORK_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ARTWORK_DIMENSION: u32 = 4096;
@@ -279,6 +280,7 @@ struct EmbyControl {
 }
 
 enum MediaControlCommand {
+    Volume,
     CiderCommand {
         endpoint: &'static str,
         token: Option<String>,
@@ -313,6 +315,8 @@ enum MprisControlAction {
 #[derive(Clone)]
 struct MediaControlWorker {
     commands: std::sync::mpsc::SyncSender<MediaControlCommand>,
+    /// Keep only the newest unsent level while a player handles a prior request.
+    pending_volume: Arc<Mutex<Option<volume::Command>>>,
 }
 
 impl MediaControlWorker {
@@ -323,13 +327,48 @@ impl MediaControlWorker {
         emby_control: Arc<Mutex<Option<EmbyControl>>>,
     ) -> Self {
         let (commands, receiver) = std::sync::mpsc::sync_channel(MEDIA_CONTROL_QUEUE_CAPACITY);
+        let pending_volume = Arc::new(Mutex::new(None));
+        let worker_volume = pending_volume.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("media-controls".to_string())
-            .spawn(move || Self::run(receiver, cider, mpris, player_state, emby_control))
+            .spawn(move || {
+                Self::run(
+                    receiver,
+                    worker_volume,
+                    cider,
+                    mpris,
+                    player_state,
+                    emby_control,
+                )
+            })
         {
             log::warn!("Failed to start media control worker: {error}");
         }
-        Self { commands }
+        Self {
+            commands,
+            pending_volume,
+        }
+    }
+
+    fn enqueue_volume(&self, command: volume::Command) -> bool {
+        let mut pending = self.pending_volume.lock().unwrap();
+        let needs_wake = pending.is_none();
+        *pending = Some(command);
+        if !needs_wake {
+            return true;
+        }
+        match self.commands.try_send(MediaControlCommand::Volume) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // Every dequeued command drains the slot, so a full queue is
+                // already guaranteed to wake the worker for this latest level.
+                true
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                *pending = None;
+                log::warn!("Media control worker is unavailable");
+                false
+            }
+        }
     }
 
     fn enqueue(&self, command: MediaControlCommand) -> bool {
@@ -348,6 +387,7 @@ impl MediaControlWorker {
 
     fn run(
         receiver: std::sync::mpsc::Receiver<MediaControlCommand>,
+        pending_volume: Arc<Mutex<Option<volume::Command>>>,
         cider: cider::Client,
         mpris: mpris::Monitor,
         player_state: Arc<Mutex<MultiPlayerState>>,
@@ -360,7 +400,21 @@ impl MediaControlWorker {
             .ok();
 
         while let Ok(command) = receiver.recv() {
+            // Drain before every command, including non-volume commands when
+            // the queue had no room for a volume wake. Release the lock before
+            // network work so incoming changes can replace the next level.
+            let volume = pending_volume.lock().unwrap().take();
+            if let Some(volume) = volume {
+                volume.dispatch(
+                    &cider,
+                    &mpris,
+                    emby_client.as_ref(),
+                    &player_state,
+                    &emby_control,
+                );
+            }
             match command {
+                MediaControlCommand::Volume => {}
                 MediaControlCommand::CiderCommand { endpoint, token } => {
                     if !cider.command(endpoint, token.as_deref()) {
                         log::debug!("Cider {endpoint} command failed");
@@ -581,6 +635,8 @@ struct EmbyItem {
 #[serde(rename_all = "PascalCase")]
 struct EmbyPlayState {
     position_ticks: Option<u64>,
+    #[serde(default, deserialize_with = "volume::deserialize_number")]
+    volume_level: Option<f64>,
     is_paused: Option<bool>,
     can_seek: Option<bool>,
     #[serde(default, deserialize_with = "emby_subtitles::deserialize_index")]
@@ -657,6 +713,9 @@ pub struct MediaInfo {
     /// Whether seeking is supported
     #[allow(dead_code)]
     pub can_seek: bool,
+    /// Controllable player volume, normalized to 0..=1. None means unavailable.
+    /// Amplified MPRIS readbacks above unity are displayed at 1 without altering them.
+    pub volume: Option<f64>,
     /// Available only for compatible native Emby sessions with subtitle tracks.
     pub subtitles: Option<SubtitleState>,
 }
@@ -1633,6 +1692,7 @@ impl MediaMonitor {
                 can_go_next,
                 can_go_previous,
                 can_seek: session.supports_remote_control && play_state.can_seek.unwrap_or(false),
+                volume: volume::from_emby_session(session),
                 subtitles: emby_subtitles::from_session(session),
             },
         ))
@@ -2370,6 +2430,13 @@ impl MediaMonitor {
                 PlayerId::Mpris(bus_name) => self.mpris_previous(bus_name),
             }
         }
+    }
+
+    /// Change only the named, currently selected player's volume.
+    /// The worker validates that target again before dispatching the command.
+    pub fn set_volume(&self, target: &PlayerId, level: f64) -> bool {
+        volume::Command::prepare(self, target, level)
+            .is_some_and(|command| self.controls.enqueue_volume(command))
     }
 
     /// Queue a subtitle selection for the still-selected Emby item/source.

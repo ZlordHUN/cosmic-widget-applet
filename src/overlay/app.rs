@@ -11,8 +11,8 @@ use super::layout::{
     notification_group_visible_fraction,
 };
 use super::media_state::{
-    DismissingMedia, MEDIA_CONTROL_GRACE, PendingPlayback, PendingSubtitle,
-    advance_media_dismissal, reconcile_media_dismissal, reconcile_media_state,
+    DismissingMedia, MEDIA_CONTROL_GRACE, PendingPlayback, PendingSubtitle, VOLUME_UPDATE_INTERVAL,
+    VolumeControl, advance_media_dismissal, reconcile_media_dismissal, reconcile_media_state,
     reconcile_subtitle_state, subtitle_toggle_index,
 };
 use super::notification_state::{
@@ -81,6 +81,7 @@ struct App {
     device_list: DeviceList,
     dismissing_media: Option<DismissingMedia>,
     media_seek_preview: Option<f64>,
+    media_volume: VolumeControl,
     media_timeline_hovered: bool,
     pending_playback: Option<PendingPlayback>,
     pending_subtitle: Option<PendingSubtitle>,
@@ -109,6 +110,9 @@ pub(super) enum Message {
     MediaTimelineHoverChanged(bool),
     MediaSeekChanged(f64),
     CommitMediaSeek,
+    MediaVolumeChanged(PlayerId, f64),
+    CommitMediaVolume(PlayerId),
+    FlushMediaVolume,
     SeekMediaRelative(i64),
     ToggleMediaSubtitles(SubtitleTarget),
     SelectMediaSubtitle(SubtitleTarget, i32),
@@ -177,6 +181,7 @@ impl App {
                 device_list: DeviceList::default(),
                 dismissing_media: None,
                 media_seek_preview: None,
+                media_volume: VolumeControl::default(),
                 media_timeline_hovered: false,
                 pending_playback: None,
                 pending_subtitle: None,
@@ -217,6 +222,9 @@ impl App {
                     | Message::SelectMediaPlayer(_)
                     | Message::MediaSeekChanged(_)
                     | Message::CommitMediaSeek
+                    | Message::MediaVolumeChanged(_, _)
+                    | Message::CommitMediaVolume(_)
+                    | Message::FlushMediaVolume
                     | Message::SeekMediaRelative(_)
                     | Message::MediaTimelineHoverChanged(_)
                     | Message::ToggleMediaSubtitles(_)
@@ -564,6 +572,7 @@ impl App {
                 self.sampler.next_media();
             }
             Message::SelectMediaPlayer(player_id) => {
+                self.media_volume.clear();
                 self.media_seek_preview = None;
                 self.media_timeline_hovered = false;
                 self.pending_playback = None;
@@ -595,6 +604,17 @@ impl App {
                     self.sampler.seek_media(progress);
                     self.snapshot.media =
                         self.prepare_media_state(self.sampler.media_state(), Instant::now());
+                }
+            }
+            Message::MediaVolumeChanged(target, value) => {
+                self.media_volume
+                    .change(&self.snapshot.media, &target, value);
+                self.flush_live_volume();
+            }
+            Message::FlushMediaVolume => self.flush_live_volume(),
+            Message::CommitMediaVolume(target) => {
+                if let Some(value) = self.media_volume.take_change(&self.snapshot.media, &target) {
+                    self.submit_media_volume(target, value, Instant::now());
                 }
             }
             Message::SeekMediaRelative(offset_ms) => {
@@ -685,6 +705,7 @@ impl App {
             self.notification_scroll.translation(),
             self.dismissing_media.as_ref(),
             self.media_seek_preview,
+            self.media_volume.preview(),
             self.media_timeline_hovered,
         )
     }
@@ -702,15 +723,17 @@ impl App {
             .then_some(Message::OutputTopologyChanged)
         });
 
+        let mut subscriptions = vec![stats, output_changes];
         if self.animations_active() {
-            Subscription::batch([
-                stats,
-                output_changes,
-                iced::window::frames().map(|_| Message::AnimationTick),
-            ])
-        } else {
-            Subscription::batch([stats, output_changes])
+            subscriptions.push(iced::window::frames().map(|_| Message::AnimationTick));
         }
+        // No extra idle polling: this timer exists only while a drag has an
+        // unsent value. Moving again replaces that value instead of queuing it.
+        if self.media_volume.has_queued_change() {
+            subscriptions
+                .push(iced::time::every(VOLUME_UPDATE_INTERVAL).map(|_| Message::FlushMediaVolume));
+        }
+        Subscription::batch(subscriptions)
     }
 
     fn recreate_surface(&mut self) -> Task<Message> {
@@ -784,6 +807,23 @@ impl App {
         self.snapshot.media = self.prepare_media_state(self.sampler.media_state(), now);
     }
 
+    fn flush_live_volume(&mut self) {
+        let now = Instant::now();
+        if let Some((target, value)) = self
+            .media_volume
+            .take_live_change(&self.snapshot.media, now)
+        {
+            self.submit_media_volume(target, value, now);
+        }
+    }
+
+    fn submit_media_volume(&mut self, target: PlayerId, value: f64, now: Instant) {
+        if self.sampler.set_media_volume(&target, value) {
+            self.media_volume.submitted(target, value, now);
+            self.snapshot.media = self.prepare_media_state(self.sampler.media_state(), now);
+        }
+    }
+
     fn prepare_media_state(
         &mut self,
         mut current: MultiPlayerState,
@@ -791,6 +831,7 @@ impl App {
     ) -> MultiPlayerState {
         reconcile_media_state(&mut current, &mut self.pending_playback, now);
         reconcile_subtitle_state(&mut current, &mut self.pending_subtitle, now);
+        self.media_volume.reconcile(&mut current, now);
         reconcile_media_dismissal(
             &mut self.dismissing_media,
             &self.snapshot.media,
@@ -798,6 +839,7 @@ impl App {
             now,
         );
         if self.dismissing_media.is_some() {
+            self.media_volume.clear();
             self.media_seek_preview = None;
             self.media_timeline_hovered = false;
             self.pending_playback = None;

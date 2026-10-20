@@ -32,6 +32,7 @@ pub(super) fn widget_view<'a>(
     notification_scroll_translation: f32,
     dismissing_media: Option<&'a DismissingMedia>,
     media_seek_preview: Option<f64>,
+    media_volume_preview: Option<f64>,
     media_timeline_hovered: bool,
 ) -> Element<'a, Message> {
     let spacing = theme::system_preference().cosmic().spacing;
@@ -109,6 +110,7 @@ pub(super) fn widget_view<'a>(
                 stats,
                 dismissing_media,
                 media_seek_preview,
+                media_volume_preview,
                 spacing.space_xs,
                 spacing.space_xs,
                 spacing.space_xxs,

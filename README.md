@@ -25,6 +25,7 @@ and a frosted-glass desktop overlay.
 - YouTube thumbnails and Bandcamp album covers for browser playback
 - Local video thumbnails and readable COSMIC Player episode titles
 - Ten-second backward/forward controls for seekable media
+- Compact per-player volume control for supported Cider, Emby, and MPRIS sources
 - Emby Theater subtitle toggle and track selector for compatible active sessions
 - Bandcamp track titles in Zen/Firefox when the playing duration uniquely
   identifies a track, without a browser extension

@@ -233,6 +233,17 @@ COSMIC Player versions that leave MPRIS seeking unimplemented need the
 [`integrations/cosmic-player`](../integrations/cosmic-player/README.md) companion
 patch; the widget respects each player's advertised seeking capability.
 
+The Now Playing heading includes a compact volume slider when the selected player
+reports controllable volume. MPRIS uses its Volume property, Cider uses its playback
+volume API, and compatible Emby sessions use SetVolume. The existing monitor and
+command worker handle reads and writes. Dragging previews locally and applies the
+first change immediately, then sends the latest position at 50 ms intervals. A
+timer runs only while an update is waiting; release flushes the final value, and
+keyboard and wheel changes commit immediately. The worker keeps only the latest
+pending volume behind any in-flight request. Player-bound state prevents
+a source switch from redirecting a drag, and short pending feedback yields to the
+next confirmed volume or expires if the command fails.
+
 Emby Theater sessions that advertise `SetSubtitleStreamIndex` and report available
 subtitle tracks also show a CC toggle and compact track selector in the transport
 row. The monitor reads active-source streams from session metadata, with a bounded

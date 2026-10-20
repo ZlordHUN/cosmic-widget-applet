@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::monitors::media::{AlbumArt, MediaInfo, PlaybackStatus, SubtitleState};
+use crate::monitors::media::{AlbumArt, MediaInfo, PlaybackStatus, PlayerId, SubtitleState};
 use crate::overlay::Message;
 use crate::overlay::components::{
     button_style, marquee, media_artwork as rounded_artwork, media_slider,
@@ -38,18 +38,21 @@ const MEDIA_SUBTITLE_DROPDOWN_WIDTH: f32 = 112.0;
 // Reserve both horizontal insets, the 12px arrow, and a 4px text/arrow gap.
 const MEDIA_SUBTITLE_TEXT_WIDTH: f32 = MEDIA_SUBTITLE_DROPDOWN_WIDTH - 12.0 - 12.0 - 4.0;
 const MEDIA_TIMELINE_FOOTER_GAP: f32 = 4.0;
+const MEDIA_VOLUME_ICON_SIZE: u16 = 18;
+const MEDIA_VOLUME_SLIDER_WIDTH: f32 = 100.0;
 
 pub(in crate::overlay) fn media_view<'a>(
     stats: &'a SystemSnapshot,
     dismissing: Option<&'a DismissingMedia>,
     seek_preview: Option<f64>,
+    volume_preview: Option<f64>,
     section_spacing: u16,
     content_spacing: u16,
     detail_spacing: u16,
     timeline_hovered: bool,
 ) -> Element<'a, Message> {
     let state = dismissing.map_or(&stats.media, |outgoing| &outgoing.state);
-    if let Some((_, info)) = state.current_player().filter(|(_, info)| info.is_active()) {
+    if let Some((player_id, info)) = state.current_player().filter(|(_, info)| info.is_active()) {
         let content = media_content(
             info,
             state,
@@ -62,8 +65,16 @@ pub(in crate::overlay) fn media_view<'a>(
             Some(outgoing) => slide::left(content, outgoing.animation.progress),
             None => content,
         };
-        return section("emblem-music-symbolic", "Now Playing", section_spacing)
+        let volume = info.volume.filter(|_| dismissing.is_none()).map(|volume| {
+            volume_preview
+                .filter(|value| value.is_finite())
+                .unwrap_or(volume)
+                .clamp(0.0, 1.0)
+        });
+        return widget::column::with_capacity(2)
+            .spacing(section_spacing)
             .height(Length::Fixed(MEDIA_ACTIVE_SECTION_HEIGHT))
+            .push(media_heading(player_id, volume))
             .push(content)
             .into();
     }
@@ -71,6 +82,60 @@ pub(in crate::overlay) fn media_view<'a>(
     section("emblem-music-symbolic", "Now Playing", section_spacing)
         .push(empty_media_card())
         .into()
+}
+
+fn media_heading(player_id: &PlayerId, volume: Option<f64>) -> Element<'static, Message> {
+    let mut heading = widget::row::with_capacity(4)
+        .width(Length::Fill)
+        .align_y(Alignment::Center)
+        .spacing(8)
+        .push(widget::icon::from_name("emblem-music-symbolic").size(18))
+        .push(widget::text::heading("Now Playing"));
+    if let Some(volume) = volume {
+        heading = heading
+            .push(widget::space::horizontal())
+            .push(media_volume_control(player_id, volume));
+    }
+    heading.into()
+}
+
+fn media_volume_control(player_id: &PlayerId, volume: f64) -> Element<'static, Message> {
+    use std::hash::{Hash, Hasher};
+
+    let changed_player = player_id.clone();
+    let slider = media_slider::volume(
+        volume,
+        move |value| Message::MediaVolumeChanged(changed_player.clone(), value),
+        Message::CommitMediaVolume(player_id.clone()),
+    );
+    let volume_control = widget::row::with_capacity(2)
+        .align_y(Alignment::Center)
+        .spacing(6)
+        .push(widget::icon::from_name(volume_icon(volume)).size(MEDIA_VOLUME_ICON_SIZE))
+        .push(widget::container(slider).width(Length::Fixed(MEDIA_VOLUME_SLIDER_WIDTH)));
+    let control = widget::tooltip(
+        volume_control,
+        widget::text::caption(format!("Volume {}%", (volume * 100.0).round() as u32)),
+        widget::tooltip::Position::Top,
+    )
+    .into();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    player_id.hash(&mut hasher);
+    // Preserve a drag through normal volume polls; a source switch must cancel
+    // it before the native slider receives callbacks for the newly shown player.
+    media_control_scope::view(hasher.finish(), control)
+}
+
+fn volume_icon(volume: f64) -> &'static str {
+    if volume <= 0.0 {
+        "audio-volume-muted-symbolic"
+    } else if volume < 0.34 {
+        "audio-volume-low-symbolic"
+    } else if volume < 0.67 {
+        "audio-volume-medium-symbolic"
+    } else {
+        "audio-volume-high-symbolic"
+    }
 }
 
 fn empty_media_card() -> Element<'static, Message> {
@@ -468,13 +533,13 @@ fn subtitle_dropdown(subtitles: &SubtitleState) -> Element<'static, Message> {
     .into();
     // Polls preserve an open menu, but a new item/session or changed stream
     // mapping must discard it instead of retargeting an already open choice.
-    subtitle_dropdown_scope::view(subtitle_dropdown_key(subtitles), dropdown)
+    media_control_scope::view(subtitle_dropdown_key(subtitles), dropdown)
 }
 
 // This Iced version's keyed column preserves equal-length children even when
-// their keys differ. Explicitly reset this native menu subtree on identity
-// changes; ordinary polling still preserves its open/hover state.
-mod subtitle_dropdown_scope {
+// their keys differ. Explicitly reset native control subtrees on identity
+// changes; ordinary polling still preserves their open/hover/drag state.
+mod media_control_scope {
     use super::Message;
     use cosmic::iced::advanced::widget::Operation;
     use cosmic::iced::advanced::widget::tree::{self, Tree};
@@ -483,17 +548,17 @@ mod subtitle_dropdown_scope {
     use cosmic::{Element, Renderer, Theme};
 
     pub(super) fn view(key: u64, content: Element<'static, Message>) -> Element<'static, Message> {
-        Element::new(ScopedDropdown { key, content })
+        Element::new(ScopedMediaControl { key, content })
     }
 
-    struct ScopedDropdown {
+    struct ScopedMediaControl {
         key: u64,
         content: Element<'static, Message>,
     }
 
     struct ScopeState(u64);
 
-    impl Widget<Message, Theme, Renderer> for ScopedDropdown {
+    impl Widget<Message, Theme, Renderer> for ScopedMediaControl {
         fn tag(&self) -> tree::Tag {
             tree::Tag::of::<ScopeState>()
         }
@@ -790,6 +855,218 @@ fn format_media_time(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn volume_fits_existing_header_and_source_switch_cancels_drag() {
+        use cosmic::iced::advanced::renderer::Headless as _;
+        use cosmic::iced::advanced::{
+            Layout, Renderer as _, Shell, layout, renderer, widget::Tree,
+        };
+        use cosmic::iced::{Event, Font, Pixels, Point, Rectangle, Size, mouse};
+
+        let mut renderer = <cosmic::Renderer as renderer::Headless>::new(
+            Font::default(),
+            Pixels(14.0),
+            Some("tiny-skia"),
+        )
+        .await
+        .expect("software renderer for media volume validation");
+        let make_stats = |volume| SystemSnapshot {
+            media: crate::monitors::media::MultiPlayerState {
+                players: vec![(
+                    PlayerId::Cider,
+                    MediaInfo {
+                        player_name: "Cider".into(),
+                        title: "Bear".into(),
+                        album: "Original Motion Picture Soundtrack".into(),
+                        status: PlaybackStatus::Playing,
+                        duration: 115_000,
+                        position: 73_000,
+                        volume,
+                        can_play: true,
+                        can_pause: true,
+                        can_seek: true,
+                        ..Default::default()
+                    },
+                )],
+                current_index: 0,
+            },
+            ..Default::default()
+        };
+        let card = Rectangle::with_size(Size::new(322.0, MEDIA_ACTIVE_SECTION_HEIGHT));
+        let theme = cosmic::Theme::dark();
+        let preview = std::env::var_os("COSMIC_MEDIA_VOLUME_PREVIEW");
+        let mut gallery = preview
+            .as_ref()
+            .map(|_| image::RgbaImage::new(322 * 4, 2 * MEDIA_ACTIVE_SECTION_HEIGHT as u32));
+        let mut baseline_header_height = None;
+        for (index, volume) in [None, Some(0.0), Some(0.65), Some(1.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let stats = make_stats(volume);
+            let mut content = media_view(&stats, None, None, None, 12, 12, 4, false);
+            let mut tree = Tree::new(content.as_widget());
+            let node = content.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, card.size()),
+            );
+            let header = Layout::new(&node).children().next().unwrap();
+            let header_height = header.bounds().height;
+            assert_eq!(
+                header_height,
+                *baseline_header_height.get_or_insert(header_height)
+            );
+            assert_eq!(
+                node.size(),
+                card.size(),
+                "volume must not grow the media card"
+            );
+            fn assert_contained(node: Layout<'_>, bounds: Rectangle) {
+                let child = node.bounds();
+                assert!(
+                    child.x >= bounds.x - 0.1
+                        && child.y >= bounds.y - 0.1
+                        && child.x + child.width <= bounds.x + bounds.width + 0.1
+                        && child.y + child.height <= bounds.y + bounds.height + 0.1,
+                    "volume header child {child:?} exceeds {bounds:?}"
+                );
+                for child in node.children() {
+                    assert_contained(child, bounds);
+                }
+            }
+            assert_contained(header, header.bounds());
+            if let Some(gallery) = &mut gallery {
+                for (row, hovered) in [false, true].into_iter().enumerate() {
+                    renderer.reset(card);
+                    let cursor = if hovered && volume.is_some() {
+                        mouse::Cursor::Available(Point::new(
+                            card.width - 50.0,
+                            header.bounds().center_y(),
+                        ))
+                    } else {
+                        mouse::Cursor::Unavailable
+                    };
+                    content.as_widget().draw(
+                        &tree,
+                        &mut renderer,
+                        &theme,
+                        &renderer::Style {
+                            text_color: Color::WHITE,
+                            icon_color: Color::WHITE,
+                            scale_factor: 1.0,
+                        },
+                        Layout::new(&node),
+                        cursor,
+                        &card,
+                    );
+                    let pixels = renderer.screenshot(
+                        Size::new(322, MEDIA_ACTIVE_SECTION_HEIGHT as u32),
+                        1.0,
+                        theme.cosmic().background(false).base.into(),
+                    );
+                    let frame =
+                        image::RgbaImage::from_raw(322, MEDIA_ACTIVE_SECTION_HEIGHT as u32, pixels)
+                            .unwrap();
+                    image::imageops::replace(
+                        gallery,
+                        &frame,
+                        index as i64 * 322,
+                        row as i64 * MEDIA_ACTIVE_SECTION_HEIGHT as i64,
+                    );
+                }
+            }
+            if volume.is_some() {
+                let control = header.children().last().unwrap().bounds();
+                assert_eq!(control.x + control.width, card.width);
+                assert_eq!(control.width, 124.0);
+                let mut messages = Vec::new();
+                let cursor =
+                    mouse::Cursor::Available(Point::new(control.x + 99.0, control.center_y()));
+                for event in [
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ] {
+                    content.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        cursor,
+                        &renderer,
+                        &mut cosmic::iced::advanced::clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &card,
+                    );
+                }
+                assert!(matches!(messages.as_slice(), [
+                    Message::MediaVolumeChanged(PlayerId::Cider, value),
+                    Message::CommitMediaVolume(PlayerId::Cider)
+                ] if (*value - 0.75).abs() < 0.001));
+            }
+        }
+        if let Some((gallery, path)) = gallery.zip(preview) {
+            gallery.save(path).unwrap();
+        }
+
+        // Rebuild a captured drag as normal polling would, then as a different
+        // source. Only the same source may keep receiving the drag/release.
+        for same_player in [true, false] {
+            let mut control = media_volume_control(&PlayerId::Cider, 0.5);
+            let mut tree = Tree::new(control.as_widget());
+            let bounds = Rectangle::with_size(Size::new(124.0, 20.0));
+            let node = control.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            let mut messages = Vec::new();
+            control.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(74.0, 10.0)),
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            messages.clear();
+            let player = if same_player {
+                PlayerId::Cider
+            } else {
+                PlayerId::Emby("new-session".into())
+            };
+            let mut rebuilt = media_volume_control(&player, 0.5);
+            tree.diff(rebuilt.as_widget_mut());
+            let node = rebuilt.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            let pointer = Point::new(99.0, 10.0);
+            for event in [
+                Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ] {
+                rebuilt.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(pointer),
+                    &renderer,
+                    &mut cosmic::iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &bounds,
+                );
+            }
+            assert_eq!(
+                messages.len(),
+                if same_player { 2 } else { 0 },
+                "source switch must cancel dragging"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn transport_controls_fit_the_compact_media_card() {

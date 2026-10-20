@@ -13,6 +13,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 pub(super) struct Client {
     http: HttpClient,
+    base_url: String,
 }
 
 impl Client {
@@ -24,12 +25,15 @@ impl Client {
                 log::warn!("Failed to configure the Cider HTTP client: {error}");
                 HttpClient::new()
             });
-        Self { http }
+        Self {
+            http,
+            base_url: API_BASE_URL.into(),
+        }
     }
 
     pub(super) fn now_playing(&self, token: Option<&str>) -> Option<MediaInfo> {
         let response = self
-            .authenticated(self.http.get(Self::url("now-playing")), token)
+            .authenticated(self.http.get(self.url("now-playing")), token)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .ok()?
@@ -42,11 +46,13 @@ impl Client {
         }
 
         let is_playing = self.is_playing(token).unwrap_or(true);
-        response.info?.into_media_info(is_playing)
+        let mut info = response.info?.into_media_info(is_playing)?;
+        info.volume = self.volume(token);
+        Some(info)
     }
 
     pub(super) fn command(&self, endpoint: &str, token: Option<&str>) -> bool {
-        self.authenticated(self.http.post(Self::url(endpoint)), token)
+        self.authenticated(self.http.post(self.url(endpoint)), token)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
@@ -54,7 +60,7 @@ impl Client {
     }
 
     pub(super) fn seek(&self, position_seconds: u64, token: Option<&str>) -> bool {
-        self.authenticated(self.http.post(Self::url("seek")), token)
+        self.authenticated(self.http.post(self.url("seek")), token)
             .timeout(REQUEST_TIMEOUT)
             .json(&serde_json::json!({ "position": position_seconds }))
             .send()
@@ -62,9 +68,34 @@ impl Client {
             .is_ok()
     }
 
+    pub(super) fn volume(&self, token: Option<&str>) -> Option<f64> {
+        let response = self
+            .authenticated(self.http.get(self.url("volume")), token)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<VolumeResponse>()
+            .ok()?;
+        response.level()
+    }
+
+    pub(super) fn set_volume(&self, volume: f64, token: Option<&str>) -> bool {
+        if !super::volume::valid_level(volume) {
+            return false;
+        }
+        self.authenticated(self.http.post(self.url("volume")), token)
+            .timeout(REQUEST_TIMEOUT)
+            .json(&serde_json::json!({ "volume": volume }))
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .is_ok()
+    }
+
     fn is_playing(&self, token: Option<&str>) -> Option<bool> {
         let response = self
-            .authenticated(self.http.get(Self::url("is-playing")), token)
+            .authenticated(self.http.get(self.url("is-playing")), token)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .ok()?
@@ -83,8 +114,24 @@ impl Client {
         }
     }
 
-    fn url(endpoint: &str) -> String {
-        format!("{API_BASE_URL}/{endpoint}")
+    fn url(&self, endpoint: &str) -> String {
+        format!("{}/{endpoint}", self.base_url)
+    }
+}
+
+#[derive(Deserialize)]
+struct VolumeResponse {
+    status: String,
+    #[serde(default, deserialize_with = "super::volume::deserialize_number")]
+    volume: Option<f64>,
+}
+
+impl VolumeResponse {
+    fn level(self) -> Option<f64> {
+        (self.status == "ok")
+            .then_some(self.volume)
+            .flatten()
+            .filter(|level| super::volume::valid_level(*level))
     }
 }
 
@@ -191,6 +238,68 @@ mod tests {
             serde_json::from_str(r#"{"status":"ok","is_playing":false}"#).unwrap();
         assert_eq!(response.status, "ok");
         assert!(!response.is_playing);
+    }
+
+    #[test]
+    fn volume_readback_requires_a_valid_successful_response() {
+        for (json, expected) in [
+            (r#"{"status":"ok","volume":0.37}"#, Some(0.37)),
+            (r#"{"status":"ok","volume":0}"#, Some(0.0)),
+            (r#"{"status":"ok","volume":1}"#, Some(1.0)),
+            (r#"{"status":"error","volume":0.5}"#, None),
+            (r#"{"status":"ok","volume":1.01}"#, None),
+            (r#"{"status":"ok","volume":-1}"#, None),
+            (r#"{"status":"ok","volume":"0.5"}"#, None),
+            (r#"{"status":"ok","volume":null}"#, None),
+            (r#"{"status":"ok"}"#, None),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<VolumeResponse>(json)
+                    .unwrap()
+                    .level(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn volume_api_uses_authenticated_normalized_get_and_post() {
+        use super::super::volume::tests::http_fixture;
+        let (url, request) = http_fixture(200, r#"{"status":"ok","volume":0.42}"#);
+        let client = Client {
+            http: HttpClient::new(),
+            base_url: format!("{url}/api/v1/playback"),
+        };
+        assert_eq!(client.volume(Some("fixture-token")), Some(0.42));
+        let (headers, body) = request.join().unwrap();
+        assert!(headers.starts_with("GET /api/v1/playback/volume HTTP/1.1"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("apptoken: fixture-token")
+        );
+        assert!(body.is_empty());
+
+        let (url, request) = http_fixture(200, r#"{"status":"ok"}"#);
+        let client = Client {
+            http: HttpClient::new(),
+            base_url: format!("{url}/api/v1/playback"),
+        };
+        for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            assert!(!client.set_volume(invalid, Some("fixture-token")));
+        }
+        assert!(client.set_volume(0.27, Some("fixture-token")));
+        let (headers, body) = request.join().unwrap();
+        assert!(headers.starts_with("POST /api/v1/playback/volume HTTP/1.1"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("apptoken: fixture-token")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"volume":0.27})
+        );
     }
 
     #[test]

@@ -142,6 +142,27 @@ impl Monitor {
         self.call_no_args(bus_name, "Previous")
     }
 
+    pub(super) fn set_volume(&self, bus_name: &str, volume: f64) -> bool {
+        if !super::volume::valid_level(volume) {
+            return false;
+        }
+        let Some(connection) = self.connection() else {
+            return false;
+        };
+        let Ok(proxy) = Proxy::new(&connection, bus_name, MPRIS_PATH, PLAYER_INTERFACE) else {
+            return false;
+        };
+        if proxy.set_property("Volume", volume).is_err() {
+            return false;
+        }
+        // Preserve the actual result, including players that clamp, quantize,
+        // or ignore volume writes. The usual PropertiesChanged path also updates it.
+        if let Ok(Some(info)) = self.query_player(&connection, bus_name) {
+            self.upsert(bus_name, info);
+        }
+        true
+    }
+
     pub(super) fn seek(&self, bus_name: &str, position_us: u64) -> bool {
         let Some(connection) = self.connection() else {
             return false;
@@ -530,6 +551,15 @@ fn media_info_from_properties(
         can_go_next: can_control && property_bool(properties, "CanGoNext").unwrap_or(true),
         can_go_previous: can_control && property_bool(properties, "CanGoPrevious").unwrap_or(true),
         can_seek: can_control && property_bool(properties, "CanSeek").unwrap_or(false),
+        volume: can_control
+            .then(|| {
+                properties
+                    .get("Volume")
+                    .and_then(|value| f64::try_from(value).ok())
+            })
+            .flatten()
+            .filter(|level| level.is_finite() && *level >= 0.0)
+            .map(|level| level.min(1.0)),
         subtitles: None,
     })
 }
@@ -722,6 +752,35 @@ mod tests {
         }
         metadata.insert("xesam:url".to_string(), owned(Value::from(url)));
         HashMap::from([("Metadata".to_string(), OwnedValue::from(metadata))])
+    }
+
+    #[test]
+    fn volume_readback_requires_capability_and_finite_nonnegative_double() {
+        let bus = "org.mpris.MediaPlayer2.test";
+        let mut properties = video_properties(Some("Track"), "file:///tmp/track.flac");
+        let level = |properties: &HashMap<String, OwnedValue>| {
+            media_info_from_properties(bus, properties).unwrap().volume
+        };
+        assert_eq!(level(&properties), None);
+        for (raw, expected) in [
+            (0.0, Some(0.0)),
+            (0.34, Some(0.34)),
+            (1.0, Some(1.0)),
+            (1.5, Some(1.0)),
+            (-0.1, None),
+            (f64::NAN, None),
+            (f64::INFINITY, None),
+        ] {
+            properties.insert("Volume".into(), OwnedValue::from(raw));
+            assert_eq!(level(&properties), expected);
+        }
+        properties.insert("Volume".into(), OwnedValue::from(0.5));
+        properties.insert("CanControl".into(), OwnedValue::from(false));
+        assert_eq!(level(&properties), None);
+        properties.insert("CanControl".into(), OwnedValue::from(true));
+        assert_eq!(level(&properties), Some(0.5));
+        properties.insert("Volume".into(), OwnedValue::from(50_i64));
+        assert_eq!(level(&properties), None);
     }
 
     #[test]

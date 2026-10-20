@@ -226,6 +226,10 @@ impl StatsSampler {
         self.media_monitor.select_player_by_id(player_id);
     }
 
+    pub fn set_media_volume(&self, target: &PlayerId, volume: f64) -> bool {
+        self.media_monitor.set_volume(target, volume)
+    }
+
     pub fn seek_media(&self, progress: f64) {
         self.media_monitor.seek_to_progress(progress);
     }

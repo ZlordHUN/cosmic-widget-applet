@@ -151,10 +151,15 @@ fn battery_visuals(device: &BatteryDevice) -> (String, String, BatteryBand, f32)
             0.6,
         )
     } else if let Some(level) = device.level {
+        let charging = is_charging(device.status.as_deref());
         (
-            battery_icon_name(level, is_charging(device.status.as_deref())),
+            battery_icon_name(level, charging),
             format!("{level}%"),
-            battery_band(level),
+            if charging {
+                BatteryBand::Success
+            } else {
+                battery_band(level)
+            },
             1.0,
         )
     } else {

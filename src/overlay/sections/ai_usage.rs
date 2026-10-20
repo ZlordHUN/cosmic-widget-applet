@@ -796,6 +796,7 @@ mod tests {
                         &media_stats,
                         None,
                         None,
+                        None,
                         8,
                         8,
                         4,

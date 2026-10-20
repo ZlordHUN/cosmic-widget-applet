@@ -20,7 +20,7 @@ fn media(status: PlaybackStatus, position: u64, title: &str) -> MediaInfo {
     }
 }
 
-fn seek_monitor(
+pub(super) fn seek_monitor(
     position: u64,
     duration: u64,
 ) -> (
@@ -52,7 +52,10 @@ fn seek_monitor(
         cider_token: Arc::new(Mutex::new(None)),
         selected_player: Arc::new(Mutex::new(None)),
         emby_control: Arc::new(Mutex::new(None)),
-        controls: super::MediaControlWorker { commands },
+        controls: super::MediaControlWorker {
+            commands,
+            pending_volume: Arc::new(Mutex::new(None)),
+        },
     };
     (monitor, receiver)
 }
@@ -1128,7 +1131,7 @@ fn manual_source_selection_persists_without_playback_transition() {
     );
 }
 
-fn subtitle_monitor() -> (
+pub(super) fn subtitle_monitor() -> (
     MediaMonitor,
     std::sync::mpsc::Receiver<super::MediaControlCommand>,
     super::SubtitleTarget,
