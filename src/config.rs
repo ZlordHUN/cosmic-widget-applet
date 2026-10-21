@@ -226,6 +226,12 @@ pub struct Config {
     /// When true, displays "XX%" next to each bar.
     pub show_percentages: bool,
 
+    /// Use a custom overlay background opacity instead of the COSMIC theme.
+    pub override_overlay_opacity: bool,
+
+    /// Custom overlay background opacity as a percentage, retained when disabled.
+    pub overlay_opacity: u8,
+
     // ========================================================================
     // Widget Position & Behavior
     // ========================================================================
@@ -275,6 +281,12 @@ impl Config {
         WidgetSection::Media,
         WidgetSection::CodexUsage,
     ];
+
+    /// Custom background alpha, or `None` to follow the system theme.
+    pub fn overlay_background_opacity(&self) -> Option<f32> {
+        self.override_overlay_opacity
+            .then_some(f32::from(self.overlay_opacity.min(100)) / 100.0)
+    }
 
     /// Add every current overlay section while retaining the user's existing order.
     pub fn ensure_all_sections(&mut self) -> bool {
@@ -379,6 +391,8 @@ impl Default for Config {
 
             // Display: Show percentages
             show_percentages: true,
+            override_overlay_opacity: false,
+            overlay_opacity: 80,
 
             // Position: 50 px from the top and right on a 7680 px-wide display
             widget_x: 7260,
@@ -412,6 +426,20 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::{Config, TemperatureGaugeStyle, WidgetSection};
+
+    #[test]
+    fn overlay_opacity_follows_system_unless_overridden() {
+        let mut config = Config::default();
+        assert_eq!(config.overlay_background_opacity(), None);
+        assert_eq!(config.overlay_opacity, 80);
+
+        config.override_overlay_opacity = true;
+        assert_eq!(config.overlay_background_opacity(), Some(0.8));
+        config.overlay_opacity = 0;
+        assert_eq!(config.overlay_background_opacity(), Some(0.0));
+        config.overlay_opacity = 255;
+        assert_eq!(config.overlay_background_opacity(), Some(1.0));
+    }
 
     #[test]
     fn arc_is_the_backward_compatible_temperature_style() {

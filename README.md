@@ -32,6 +32,7 @@ and a frosted-glass desktop overlay.
 - AI Usage below Now Playing, with Codex and Claude remaining allowances,
   compact provider cards with horizontal meters, reset times, and report
   details on hover
+- Optional custom overlay background opacity in Display settings
 - Reorderable and individually configurable sections
 - COSMIC theming, accent colors, blur, rounded corners, and drag-to-position
 - Cached weather, notification, storage, and battery state for fast startup

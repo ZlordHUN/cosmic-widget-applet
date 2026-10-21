@@ -4,7 +4,7 @@ use crate::monitors::weather::WeatherData;
 use crate::overlay::Message;
 use crate::overlay::components::{section::section, weather_icon::weather_icon};
 use crate::overlay::stats::SystemSnapshot;
-use cosmic::iced::{Alignment, Background, Border, Color, Length};
+use cosmic::iced::{Alignment, Background, Border, Color, Length, Padding};
 use cosmic::{Element, theme, widget};
 
 pub(in crate::overlay) fn weather_view<'a>(
@@ -31,6 +31,7 @@ fn weather_content<'a>(
 ) -> Element<'a, Message> {
     let temperature = widget::row::with_capacity(3)
         .align_y(Alignment::Center)
+        .padding(Padding::ZERO.right(8))
         .spacing(detail_spacing)
         .push(widget::text::title4(format_weather_temperature(
             data.temperature,

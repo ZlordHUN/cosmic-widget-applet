@@ -12,7 +12,7 @@ use super::stats::SystemSnapshot;
 use super::surface::SURFACE_WIDTH;
 use crate::config::{Config, WidgetSection};
 use chrono::{DateTime, Local};
-use cosmic::iced::{Length, Padding, mouse};
+use cosmic::iced::{Background, Length, Padding, mouse};
 use cosmic::{Element, theme, widget};
 
 pub(super) fn widget_view<'a>(
@@ -130,6 +130,7 @@ pub(super) fn widget_view<'a>(
         }
     }
 
+    let background_opacity = config.overlay_background_opacity();
     let overlay: Element<'a, Message> = widget::container(content)
         .padding(Padding {
             top: f32::from(spacing.space_m),
@@ -139,11 +140,8 @@ pub(super) fn widget_view<'a>(
         })
         .width(Length::Fill)
         .height(Length::Shrink)
-        .class(theme::Container::custom(|theme| {
-            let cosmic = theme.cosmic();
-            let mut style = theme::Container::background(cosmic, theme.transparent);
-            style.border.radius = cosmic.corner_radii.radius_l.into();
-            style
+        .class(theme::Container::custom(move |theme| {
+            overlay_background_style(theme, background_opacity)
         }))
         .into();
     // Measure the actual cards, including wrapping and animated content. The
@@ -185,4 +183,76 @@ pub(super) fn widget_view<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn overlay_background_style(
+    theme: &cosmic::Theme,
+    opacity: Option<f32>,
+) -> cosmic::iced::widget::container::Style {
+    let cosmic = theme.cosmic();
+    let mut style = theme::Container::background(cosmic, theme.transparent);
+    // Set an absolute background alpha; multiplying the system alpha would
+    // still let system opacity changes affect the custom setting. Foreground
+    // colors, section card tints, and the compositor's blur stay independent.
+    if let Some(opacity) = opacity
+        && let Some(Background::Color(color)) = &mut style.background
+    {
+        color.a = opacity;
+    }
+    style.border.radius = cosmic.corner_radii.radius_l.into();
+    style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::cosmic_theme::ThemeBuilder;
+    use std::sync::Arc;
+
+    #[test]
+    fn opacity_override_replaces_system_alpha_without_fading_content() {
+        for dark in [false, true] {
+            for system_alpha in [0.2, 0.9] {
+                let mut builder = if dark {
+                    ThemeBuilder::dark()
+                } else {
+                    ThemeBuilder::light()
+                };
+                builder.frosted_system_interface = true;
+                builder.alpha_map.medium = system_alpha;
+                let mut theme = cosmic::Theme::custom(Arc::new(builder.build()));
+                for frosted in [false, true] {
+                    theme.transparent = frosted;
+                    let mut config = Config::default();
+                    let inherited =
+                        overlay_background_style(&theme, config.overlay_background_opacity());
+                    let Background::Color(original) = inherited.background.unwrap() else {
+                        panic!("overlay background should be a solid theme color");
+                    };
+                    assert!((original.a - if frosted { system_alpha } else { 1.0 }).abs() < 0.001);
+                    config.override_overlay_opacity = true;
+                    for percentage in [0, 40, 100] {
+                        config.overlay_opacity = percentage;
+                        let custom =
+                            overlay_background_style(&theme, config.overlay_background_opacity());
+                        let Background::Color(color) = custom.background.unwrap() else {
+                            panic!("overlay background should remain a solid theme color");
+                        };
+                        assert_eq!(color.a, f32::from(percentage) / 100.0);
+                        assert_eq!(
+                            (color.r, color.g, color.b),
+                            (original.r, original.g, original.b)
+                        );
+                        assert_eq!(custom.text_color, inherited.text_color);
+                        assert_eq!(custom.icon_color, inherited.icon_color);
+                        assert_eq!(custom.border, inherited.border);
+                    }
+                    config.override_overlay_opacity = false;
+                    let restored =
+                        overlay_background_style(&theme, config.overlay_background_opacity());
+                    assert_eq!(restored.background, inherited.background);
+                }
+            }
+        }
+    }
 }

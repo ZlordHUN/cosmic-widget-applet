@@ -363,6 +363,7 @@ installed processes. It controls:
 - section order;
 - temperature presentation;
 - time and percentage display;
+- optional overlay background opacity override;
 - weather location;
 - notification and media visibility;
 - optional Solaar fallback and debug logging;
@@ -371,6 +372,13 @@ installed processes. It controls:
 The settings application writes changes directly. Most visual changes apply
 live; surface placement is committed when the user pins the overlay or resets
 its position.
+
+Display settings can override the system's overlay background opacity with a
+saved 0–100% value. The override defaults to off, and disabling it restores the
+current system opacity while retaining the custom percentage. Only the outer
+background alpha changes; text, icons, section cards, and the system's frosted
+blur preference remain independent. The existing config refresh applies changes
+without restarting the overlay.
 
 ## Caches
 

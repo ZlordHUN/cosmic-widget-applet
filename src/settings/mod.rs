@@ -8,7 +8,7 @@ mod views;
 
 use crate::config::{Config, TemperatureGaugeStyle, WidgetSection};
 use cache::{CachedBatteryDevice, WidgetCache};
-use cosmic::cosmic_config::{self, CosmicConfigEntry};
+use cosmic::cosmic_config::{self, ConfigGet, CosmicConfigEntry};
 use cosmic::iced::Subscription;
 use cosmic::prelude::*;
 use cosmic::widget::{self, nav_bar};
@@ -85,6 +85,8 @@ pub enum Message {
     ToggleDate(bool),
     Toggle24HourTime(bool),
     TogglePercentages(bool),
+    ToggleOverlayOpacityOverride(bool),
+    SetOverlayOpacity(u8),
     ToggleDevices(bool),
     ToggleSolaarIntegration(bool),
     ToggleNotifications(bool),
@@ -240,6 +242,17 @@ impl Application for SettingsApp {
             Message::UpdateConfig(mut config) => {
                 config.ensure_all_sections();
                 config.ensure_position_defaults();
+                // Slider writes are synchronous, but watcher snapshots can queue up
+                // behind newer edits. Read the current appearance keys so an older
+                // snapshot cannot pull the slider back during a drag.
+                if let Some(handler) = &self.config_handler {
+                    if let Ok(value) = handler.get("override_overlay_opacity") {
+                        config.override_overlay_opacity = value;
+                    }
+                    if let Ok(value) = handler.get::<u8>("overlay_opacity") {
+                        config.overlay_opacity = value.min(100);
+                    }
+                }
                 if config != self.config {
                     self.config = config;
                     self.sync_inputs();
@@ -264,6 +277,27 @@ impl Application for SettingsApp {
             Message::ToggleDate(value) => self.config.show_date = value,
             Message::Toggle24HourTime(value) => self.config.use_24hour_time = value,
             Message::TogglePercentages(value) => self.config.show_percentages = value,
+            Message::ToggleOverlayOpacityOverride(value) => {
+                if let Some(handler) = &self.config_handler {
+                    if let Err(error) = self.config.set_override_overlay_opacity(handler, value) {
+                        log::error!("Failed to save overlay opacity override: {error}");
+                    }
+                } else {
+                    self.config.override_overlay_opacity = value;
+                }
+                return Task::none();
+            }
+            Message::SetOverlayOpacity(value) => {
+                let value = value.min(100);
+                if let Some(handler) = &self.config_handler {
+                    if let Err(error) = self.config.set_overlay_opacity(handler, value) {
+                        log::error!("Failed to save overlay opacity: {error}");
+                    }
+                } else {
+                    self.config.overlay_opacity = value;
+                }
+                return Task::none();
+            }
             Message::ToggleDevices(value) => self.config.show_battery = value,
             Message::ToggleSolaarIntegration(value) => {
                 self.config.enable_solaar_integration = value;
@@ -400,6 +434,78 @@ fn parse_bounded_usize(value: &str, minimum: usize, maximum: usize) -> Option<us
 mod tests {
     use super::{move_enabled_section, parse_bounded_usize, section_enabled};
     use crate::config::{Config, WidgetSection};
+
+    #[test]
+    fn opacity_edits_preserve_other_keys_and_ignore_stale_watcher_snapshots() {
+        use super::{Message, SettingsApp, nav_bar};
+        use cosmic::Application;
+        use cosmic::cosmic_config::{self, ConfigGet, ConfigSet, CosmicConfigEntry};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let directory = std::env::temp_dir().join(format!(
+            "cosmic-widget-opacity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let handler = cosmic_config::Config::with_custom_path(
+            "opacity-test",
+            Config::VERSION,
+            directory.clone(),
+        )
+        .unwrap();
+        // An older installation has no appearance keys. Existing settings still
+        // load, while the new controls use their backward-compatible defaults.
+        handler.set("widget_x", 123_i32).unwrap();
+        assert!(handler.get::<bool>("override_overlay_opacity").is_err());
+        assert!(handler.get::<u8>("overlay_opacity").is_err());
+        let config = Config::get_entry(&handler).unwrap_or_else(|(_, config)| config);
+        assert_eq!(config.widget_x, 123);
+        assert!(!config.override_overlay_opacity);
+        assert_eq!(config.overlay_opacity, 80);
+        config.write_entry(&handler).unwrap();
+        let mut app = SettingsApp {
+            core: Default::default(),
+            nav_model: nav_bar::Model::default(),
+            config,
+            config_handler: Some(handler),
+            x_input: String::new(),
+            y_input: String::new(),
+            weather_location_input: String::new(),
+            max_notifications_input: String::new(),
+            cider_api_token_input: String::new(),
+            cider_token_hidden: true,
+            cached_devices: Vec::new(),
+        };
+        let stale = app.config.clone();
+        // A concurrent position update must survive all slider writes.
+        app.config_handler
+            .as_ref()
+            .unwrap()
+            .set("widget_x", 456_i32)
+            .unwrap();
+        let _ = app.update(Message::ToggleOverlayOpacityOverride(true));
+        let _ = app.update(Message::SetOverlayOpacity(35));
+        let _ = app.update(Message::UpdateConfig(stale.clone()));
+        assert_eq!(app.config.overlay_background_opacity(), Some(0.35));
+        let _ = app.update(Message::ToggleOverlayOpacityOverride(false));
+        let _ = app.update(Message::UpdateConfig(stale));
+        assert_eq!(app.config.overlay_background_opacity(), None);
+        assert_eq!(app.config.overlay_opacity, 35);
+        let _ = app.update(Message::ToggleOverlayOpacityOverride(true));
+        assert_eq!(app.config.overlay_background_opacity(), Some(0.35));
+        let _ = app.update(Message::SetOverlayOpacity(255));
+        assert_eq!(app.config.overlay_opacity, 100);
+        let handler = app.config_handler.as_ref().unwrap();
+        assert_eq!(handler.get::<u8>("overlay_opacity").unwrap(), 100);
+        assert_eq!(handler.get::<i32>("widget_x").unwrap(), 456);
+        let reloaded = Config::get_entry(handler).unwrap();
+        assert_eq!(reloaded.overlay_background_opacity(), Some(1.0));
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn accepts_only_supported_notification_limits() {

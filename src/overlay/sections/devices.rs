@@ -10,6 +10,7 @@ use cosmic::{Element, Theme, theme, widget};
 
 // COSMIC body text defines the 21-pixel row; icons and monospace labels fit inside.
 const DEVICE_ROW_HEIGHT: f32 = 21.0;
+const BATTERY_LABEL_WIDTH: f32 = 40.0;
 
 pub(in crate::overlay) fn reveal_row_height(section_spacing: u16) -> f32 {
     DEVICE_ROW_HEIGHT + f32::from(section_spacing)
@@ -123,7 +124,12 @@ fn battery_status(device: &BatteryDevice, spacing: u16) -> Element<'static, Mess
         .align_y(Alignment::Center)
         .spacing(spacing / 2)
         .push(widget::container(battery_icon).center_x(battery_icon::width(METRIC_ICON_SIZE)))
-        .push(widget::text::monotext(label))
+        .push(
+            widget::text::monotext(label)
+                .width(Length::Fixed(BATTERY_LABEL_WIDTH))
+                .align_x(Alignment::End)
+                .wrapping(cosmic::iced::widget::text::Wrapping::None),
+        )
         .into()
 }
 
@@ -260,16 +266,16 @@ mod tests {
         .await
         .expect("software renderer for device animation validation");
         let devices: Vec<_> = [
-            ("G309 LIGHTSPEED", "mouse"),
-            ("MX Mechanical Mini", "keyboard"),
-            ("Audeze Maxwell", "headset"),
-            ("Razer Wolverine V3 Pro 8K PC", "controller"),
+            ("G309 LIGHTSPEED", "mouse", 100),
+            ("MX Mechanical Mini", "keyboard", 75),
+            ("Audeze Maxwell", "headset", 8),
+            ("Razer Wolverine V3 Pro 8K PC", "controller", 95),
         ]
         .into_iter()
-        .map(|(name, kind)| BatteryDevice {
+        .map(|(name, kind, level)| BatteryDevice {
             name: name.into(),
             kind: Some(kind.into()),
-            level: Some(75),
+            level: Some(level),
             status: Some("discharging".into()),
             codename: None,
             is_loading: false,

@@ -3,6 +3,7 @@
 //! Settings page layouts and controls.
 
 use super::{Message, SettingsApp, section_enabled};
+use crate::config::Config;
 use cosmic::Element;
 use cosmic::iced::{Alignment, Length};
 use cosmic::widget;
@@ -114,6 +115,7 @@ impl SettingsApp {
             );
 
         self.page(widget::settings::view_column(vec![
+            overlay_appearance(&self.config),
             clock.into(),
             metrics.into(),
             temperatures.into(),
@@ -289,5 +291,138 @@ impl SettingsApp {
             );
 
         self.page(widget::settings::view_column(vec![general.into()]))
+    }
+}
+
+fn overlay_appearance(config: &Config) -> Element<'_, Message> {
+    let mut appearance = widget::settings::section().title("Overlay appearance").add(
+        widget::settings::item::builder("Override system opacity")
+            .description("Choose a custom background opacity for the overlay")
+            .toggler(
+                config.override_overlay_opacity,
+                Message::ToggleOverlayOpacityOverride,
+            ),
+    );
+
+    if config.override_overlay_opacity {
+        let opacity = config.overlay_opacity.min(100);
+        let control = widget::row::with_capacity(2)
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .push(
+                widget::slider(0..=100, opacity, Message::SetOverlayOpacity)
+                    .step(1_u8)
+                    .width(Length::Fixed(240.0)),
+            )
+            .push(
+                widget::text::body(format!("{opacity}%"))
+                    .width(Length::Fixed(48.0))
+                    .align_x(Alignment::End),
+            );
+        appearance =
+            appearance.add(widget::settings::item::builder("Background opacity").control(control));
+    }
+
+    appearance.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn opacity_slider_is_shown_only_for_override_and_changes_live() {
+        use cosmic::iced::advanced::renderer::Headless as _;
+        use cosmic::iced::advanced::{
+            Layout, Renderer as _, Shell, layout, renderer, widget::Tree,
+        };
+        use cosmic::iced::{Color, Event, Font, Pixels, Point, Rectangle, Size, mouse};
+
+        fn slider_bounds(layout: Layout<'_>) -> Option<Rectangle> {
+            let bounds = layout.bounds();
+            if bounds.width == 240.0 && layout.children().next().is_none() {
+                Some(bounds)
+            } else {
+                layout.children().find_map(slider_bounds)
+            }
+        }
+
+        let mut renderer = <cosmic::Renderer as renderer::Headless>::new(
+            Font::default(),
+            Pixels(14.0),
+            Some("tiny-skia"),
+        )
+        .await
+        .expect("software renderer for opacity settings validation");
+        let theme = cosmic::Theme::dark();
+        let viewport = Rectangle::with_size(Size::new(704.0, 220.0));
+        let preview = std::env::var_os("COSMIC_OVERLAY_OPACITY_SETTINGS_PREVIEW");
+        let mut gallery = preview.as_ref().map(|_| image::RgbaImage::new(1408, 220));
+        for (index, enabled) in [false, true].into_iter().enumerate() {
+            let config = Config {
+                override_overlay_opacity: enabled,
+                ..Config::default()
+            };
+            let mut content: Element<'_, Message> = widget::container(overlay_appearance(&config))
+                .padding(24)
+                .width(Length::Fill)
+                .into();
+            let mut tree = Tree::new(content.as_widget());
+            let node = content.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            assert!(node.size().height <= viewport.height);
+            let slider = slider_bounds(Layout::new(&node));
+            assert_eq!(slider.is_some(), enabled);
+            if let Some(gallery) = &mut gallery {
+                renderer.reset(viewport);
+                content.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &theme,
+                    &renderer::Style {
+                        text_color: Color::WHITE,
+                        icon_color: Color::WHITE,
+                        scale_factor: 1.0,
+                    },
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let pixels = renderer.screenshot(
+                    Size::new(704, 220),
+                    1.0,
+                    theme.cosmic().background(false).base.into(),
+                );
+                let frame = image::RgbaImage::from_raw(704, 220, pixels).unwrap();
+                image::imageops::replace(gallery, &frame, index as i64 * 704, 0);
+            }
+            if let Some(slider) = slider {
+                assert!(slider.x >= 0.0 && slider.x + slider.width <= viewport.width);
+                let cursor =
+                    mouse::Cursor::Available(Point::new(slider.center_x(), slider.center_y()));
+                let mut messages = Vec::new();
+                content.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut cosmic::iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| matches!(message, Message::SetOverlayOpacity(50)))
+                );
+            }
+        }
+        if let (Some(path), Some(gallery)) = (preview, gallery) {
+            gallery.save(path).unwrap();
+        }
     }
 }
